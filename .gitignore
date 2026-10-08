@@ -1,0 +1,10 @@
+/target
+/examples/*/target
+*.key
+checkpoint*.json
+logs/
+.env
+
+# local node (devnet/run.sh): binary, chain data, generated configs, logs
+/devnet/*
+!/devnet/run.sh

@@ -1,0 +1,4 @@
+# Same channel as logos-blockchain/rust-toolchain.toml at the pinned submodule tag.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]

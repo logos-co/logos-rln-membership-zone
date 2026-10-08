@@ -1,0 +1,35 @@
+[workspace]
+members  = ["examples/demo"]
+# The submodule is its own workspace; keep Cargo from treating its crates as ours.
+exclude  = ["logos-blockchain"]
+resolver = "2"
+
+[workspace.package]
+edition    = "2024"
+license    = "MIT OR Apache-2.0"
+repository = "https://github.com/logos-co/logos-rln-membership-zone"
+version    = "0.1.0"
+
+[workspace.dependencies]
+# logos-blockchain crates, pinned through the git submodule (tag 0.3.0 = node release in use)
+lb-common-http-client            = { default-features = false, package = "logos-blockchain-common-http-client", path = "./logos-blockchain/nodes/node/http-client" }
+lb-core                          = { default-features = false, package = "logos-blockchain-core", path = "./logos-blockchain/core" }
+lb-key-management-system-service = { default-features = false, package = "logos-blockchain-key-management-system-service", path = "./logos-blockchain/services/key-management-system" }
+lb-zone-sdk                      = { default-features = false, package = "logos-blockchain-zone-sdk", path = "./logos-blockchain/zone-sdk" }
+
+# RLN (Zerokit, published 3.0.0: Poseidon BN254, Merkle trees, identity keys)
+rln           = { default-features = false, version = "3.0.0" }
+zerokit_utils = { default-features = false, version = "3.0.0" }
+
+# third party
+anyhow             = "1"
+clap               = { features = ["derive", "env", "std"], version = "4" }
+hex                = "0.4"
+prost              = "0.13"
+rand               = "0.8"
+reqwest            = { default-features = false, features = ["json", "rustls-tls"], version = "0.12" }
+serde              = { features = ["derive"], version = "1" }
+serde_json         = "1"
+tokio              = { features = ["macros", "rt-multi-thread", "signal", "sync", "time"], version = "1" }
+tracing            = "0.1"
+tracing-subscriber = { features = ["env-filter"], version = "0.3" }

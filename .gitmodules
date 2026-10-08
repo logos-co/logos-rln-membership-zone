@@ -1,0 +1,3 @@
+[submodule "logos-blockchain"]
+	path = logos-blockchain
+	url = https://github.com/logos-blockchain/logos-blockchain.git
