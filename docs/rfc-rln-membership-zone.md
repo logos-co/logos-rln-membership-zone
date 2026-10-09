@@ -178,8 +178,8 @@ Blue is a user's node, green LEZ, orange Bedrock, purple the membership Zone.
 ### Registration (steps 1-9)
 
 ```mermaid
-%%{init: {"theme": "base", "flowchart": {"nodeSpacing": 45, "rankSpacing": 60}, "themeVariables": {"lineColor": "#9aa0a6", "primaryTextColor": "#111111", "edgeLabelBackground": "#fff4c2", "fontSize": "15px"}}}%%
-flowchart TB
+%%{init: {"theme": "base", "flowchart": {"nodeSpacing": 35, "rankSpacing": 50}, "themeVariables": {"lineColor": "#9aa0a6", "primaryTextColor": "#111111", "edgeLabelBackground": "#fff4c2", "fontSize": "15px"}}}%%
+flowchart LR
     APP["Consumer<br/>(user node)"] -->|"1 register"| MOD["RLN Module<br/>(user node)"]
     MOD -->|"2 Register"| LSEQ["LEZ Sequencer<br/>(LEZ)"]
     LSEQ -->|"3 execute"| PROG["Registration program<br/>(LEZ)"]
