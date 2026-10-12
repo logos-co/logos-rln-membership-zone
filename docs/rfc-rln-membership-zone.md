@@ -43,7 +43,7 @@ and compares with it where that helps a design decision.
 The comparisons are temporary.
 Once the design decisions are settled and the specification is aligned with RLN-API,
 they will be removed, and each repository will implement only its own part.
-They appear only in the [Open Questions](#open-questions).
+They appear in this section and in the [Open Questions](#open-questions).
 
 lez-rln keeps the membership set inside LEZ accounts.
 Every registration recomputes the rate commitment and every level of the tree
@@ -91,13 +91,13 @@ This document adds:
 | Batch | The payload of one `CHANNEL_INSCRIBE` in the Zone channel, carrying the membership-set changes of a contiguous range of LEZ blocks, the batch range `[from_lez_block_id, to_lez_block_id]`. |
 | Empty batch | A batch without changes. |
 | Zone indexer | Any party that reads every batch of the Zone channel, verifies it against LEZ and serves the registry view; distinct from the LEZ Indexer. |
-| Zone operator | The party that holds the accredited keys of the Zone channel, runs the Zone sequencers, pays their Mantle Transaction fees and receives `registration_fee` at `operator_account_id` ([LEZ Requirements](#lez-requirements)); one party in this draft ([Q14](#q14-funding-the-zone-m)). |
+| Zone operator | The party that holds the accredited keys of the Zone channel, runs the Zone sequencers, pays their Mantle Transaction fees and receives `registration_fee` at `operator_account_id` ([LEZ Requirements](#lez-requirements)); one party in this draft ([Q11](#q11-funding-the-zone-m)). |
 | LEZ order | The order of LEZ transactions by `block_id`, then by position in the LEZ block. |
 | Module clock | The `timestamp` of the latest LEZ block in the Module's view; the clock of membership status. |
 | Zone lag | How far the Zone runs behind LEZ: the `timestamp` of the latest finalized LEZ block minus the `timestamp` of LEZ block `to_lez_block_id` of the latest finalized batch. It includes batch finality. |
 | Removal lag | How long a removed leaf keeps backing proofs: from the expiry or the double-signal, through the `Slash` when slashing, LEZ finality and the Zone lag, until the last root containing the leaf leaves the valid-root window. |
-| Clock jump | A LEZ block whose `timestamp` moves backwards, or forwards by far more than the LEZ block interval. It is possible because the LEZ Sequencer sets each `timestamp` from its own clock and LEZ checks neither order nor step size ([Q10](#q10-clock-jumps-m)). |
-| Fail-open, fail-closed | The two Module policies for a Zone sequencer outage: keep every root in the valid-root window (fail-open), or drop roots older than `withdrawal_delay_ms` (fail-closed) ([Q13](#q13-root-age-and-the-removal-lag-m)). |
+| Clock jump | A LEZ block whose `timestamp` moves backwards, or forwards by far more than the LEZ block interval. It is possible because the LEZ Sequencer sets each `timestamp` from its own clock and LEZ checks neither order nor step size ([Q8](#q8-clock-jumps-m)). |
+| Fail-open, fail-closed | The two Module policies for a Zone sequencer outage: keep every root in the valid-root window (fail-open), or drop roots older than `withdrawal_delay_ms` (fail-closed) ([Q10](#q10-root-age-and-the-removal-lag-m)). |
 
 ## Overview
 
@@ -112,12 +112,11 @@ the following sections specify each part.
 - Each LEZ block carries a `timestamp` in Unix-epoch milliseconds,
   which the clock program writes to the clock accounts.
   This is the registry's time base, as the `logos` namespace binding (RLN-API Appendix A) requires.
-- Rate commitments are `poseidon(identity_commitment, rate_limit)`,
+- Rate commitments are `poseidon(id_commitment, rate_limit)`,
   with Poseidon over BN254 as in the Zerokit-API.
 - The membership set is a Merkle tree of depth 20, append-only in leaf indices:
   a removed leaf is set to the empty value and its index is never reused,
   so the leaf capacity is 2^20 memberships over the registry's lifetime.
-  The registration program assigns leaf indices and enforces the leaf capacity.
 - Only accredited keys write to the Zone channel
   ([Mantle channel operations](https://lip.logos.co/blockchain/raw/bedrock-v1.1-mantle-specification.html));
   anyone reads it.
@@ -130,9 +129,9 @@ the following sections specify each part.
 | Module | inside the user's node | keystore, membership records, registry view (valid-root window, Merkle proof paths, statuses), nullifier log, message-id allocation, a funded account on LEZ (or a membership provider registers on its behalf, see [Module](#module)) | sends `Register`, `Extend` and `Erase` to LEZ and reads its membership account there; reads its registry view from a Zone indexer, or from the Zone channel on Bedrock directly ([Module](#module)) |
 | LEZ Sequencer | LEZ | LEZ state and mempool | receives transactions from the Module and the slasher; inscribes each LEZ block in the LEZ channel on Bedrock |
 | LEZ Indexer | any host | finalized LEZ blocks, events and accounts | serves finalized LEZ blocks, events and accounts to Zone sequencers, Zone indexers and the Module |
-| Registration program | LEZ | configuration account, escrow, treasury, membership accounts | runs when the LEZ Sequencer executes a transaction that calls it, directly or through a chained call |
+| Registration program | LEZ | configuration account, escrow, membership accounts | runs when the LEZ Sequencer executes a transaction that calls it, directly or through a chained call |
 | Bedrock | Logos Blockchain nodes | the LEZ channel (LEZ blocks) and the Zone channel (batches), totally ordered and finalized up to the latest immutable block (LIB); the notes that pay Mantle Transaction fees | lets anyone read every channel; lets only accredited keys write to their channel |
-| Zone sequencer | the Zone operator's hosts, one per accredited key (2-3 keys) | its replica of the membership set, node wallet notes, the batch in flight | reads finalized LEZ blocks; publishes batches to the Zone channel on Bedrock; takes no input from any Module |
+| Zone sequencer | the Zone operator's hosts, one per accredited key | its replica of the membership set, node wallet notes, the batch in flight | reads finalized LEZ blocks; publishes batches to the Zone channel on Bedrock; takes no input from any Module |
 | Zone indexer | any host; holds no accredited key | verified membership set, root history `(root_after, to_lez_block_id)` | reads finalized batches from Bedrock and checks each batch range against LEZ; serves the registry view to the Module |
 | Slasher | any host | a funded account on LEZ | gets `recovered_secret` from its Module; sends `Slash` to LEZ |
 
@@ -222,19 +221,19 @@ flowchart LR
 | 6 | The Zone sequencer turns their registration-program transactions into changes and publishes a batch to the Zone channel. | On its turn to write, covering every finalized LEZ block not yet covered. |
 | 7 | The Zone indexer reads the finalized batch from the Zone channel. | Once the batch is finalized, about another 60 min on testnet ([Q1](#q1-two-finalities-h)). |
 | 8 | The Zone indexer reads the same LEZ blocks, recomputes the changes and the root, and compares them with the batch. | For every batch. |
-| 9 | The Zone indexer serves the new roots, Merkle proof paths and statuses; the Module updates its registry view. | In the background, never while validating a message ([Q11](#q11-registry-view-local-tree-and-computing-from-lez-h)). |
+| 9 | The Zone indexer serves the new roots, Merkle proof paths and statuses; the Module updates its registry view. | In the background, never while validating a message ([Q9](#q9-registry-view-local-tree-and-computing-from-lez-h)). |
 | 10 | The sender's Module, as proof generator, sends a message with its RLN proof; another node's Module, as validator, checks it. | Every message. |
 | 11 | The validator detects a double-signal and hands `recovered_secret`, the identity secret, to a slasher, or sends the `Slash` itself. | When a nullifier repeats with a different `share_x`. |
 | 12 | The slasher sends `Slash{identity_secret}`; the registration program slashes the deposit to the treasury. | As soon as the slasher has the identity secret. |
 | 13 | Steps 4-8 run again: the next batch carries `Remove{leaf_index}` for the slashed leaf. | In the next batch. |
-| 14 | The Zone indexer serves the new roots to the validator; old roots that still contain the leaf stay valid until they leave the valid-root window ([Q13](#q13-root-age-and-the-removal-lag-m)). | Once that batch is finalized. |
+| 14 | The Zone indexer serves the new roots to the validator; old roots that still contain the leaf stay valid until they leave the valid-root window ([Q10](#q10-root-age-and-the-removal-lag-m)). | Once that batch is finalized. |
 | 15 | The Zone indexer serves the new roots and `MEMBERSHIP_SLASHED` to the violator's Module. | Once that batch is finalized. |
 
 The following sections specify the [Zone Sequencer](#zone-sequencer) (steps 5-6)
 and the [Zone Indexer](#zone-indexer) (steps 7-9),
 then what the Zone requires from LEZ ([LEZ Requirements](#lez-requirements), steps 2-4)
-and what the Module reads ([Module](#module), steps 1 and 9-15).
-The [Open Questions](#open-questions) close the document.
+and what the Module reads ([Module](#module), steps 1, 9-11 and 14-15).
+The [Open Questions](#open-questions) follow.
 
 ## Zone Sequencer
 
@@ -263,8 +262,9 @@ message Remove { uint64 leaf_index = 1; }
 ```
 
 One batch per `CHANNEL_INSCRIBE`, carried by one Mantle Transaction.
-`Insert` and `Remove` are the two tree operations of lez-rln's Merkle program;
-a batch carries only what changes the tree.
+`Insert` and `Remove` are the two operations the current LEZ Merkle program performs;
+this design moves them from LEZ into the Zone,
+and a batch carries only what changes the tree.
 Why a leaf was removed, and each leaf's expiry, are read from LEZ.
 
 ### Derivation rules
@@ -278,14 +278,15 @@ and every successful registration-program transaction in that LEZ block, in LEZ 
 - `Slash` produces `Remove{leaf_index}`, if the leaf is live.
   A `Slash` after the leaf expired produces no change,
   but the Module still reports `MEMBERSHIP_SLASHED` ([Membership status](#membership-status)).
-- `Extend` produces no change; the Zone only records the new `expiry_timestamp_ms`.
+- `Extend` produces no change; the Zone reads the new `expiry_timestamp_ms` from the transaction
+  and keeps it for the expiry step below.
 - `Erase` produces no change:
   it needs `now >= expiry_timestamp_ms + withdrawal_delay_ms`,
   so the expiry step of an earlier LEZ block has already removed the leaf.
 
 After the transactions of a LEZ block, every live leaf whose `expiry_timestamp_ms` is at or below
 that LEZ block's `timestamp` produces `Remove{leaf_index}`, in increasing leaf index.
-A leaf expires at most once ([Q10](#q10-clock-jumps-m)).
+A leaf expires at most once ([Q8](#q8-clock-jumps-m)).
 
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {"lineColor": "#9aa0a6", "primaryTextColor": "#111111", "edgeLabelBackground": "#fff4c2", "fontSize": "15px"}}}%%
@@ -303,36 +304,46 @@ flowchart LR
 
 ### Publishing
 
-- A Zone sequencer SHOULD publish one batch per turn to write,
-  covering every finalized LEZ block not yet covered ([Q4](#q4-empty-batches-and-zone-sequencer-delay-m)).
+- The accredited keys of the Zone channel take turns to write in Mantle's round-robin;
+  `posting_timeout` passes a missed turn to the next key.
+  On its turn, a Zone sequencer SHOULD publish one batch covering every finalized LEZ block
+  not yet covered when there are changes,
+  and an empty batch once `heartbeat_ms` have passed without a batch ([Q4](#q4-zone-sequencer-delay-m)).
 - A batch covers whole LEZ blocks.
-  It MAY end at an earlier LEZ block boundary when the changes would exceed one inscription
-  (1,835,008 bytes); the next batch continues from there ([Q10](#q10-clock-jumps-m)).
-- An empty batch is valid; it advances `to_lez_block_id`.
-- Each batch in flight holds one node wallet note until its Mantle Transaction is in a Bedrock block.
-  A Zone sequencer SHOULD therefore keep at most one batch in flight,
-  or split its node wallet into one note per batch it keeps in flight.
-- A Zone sequencer MUST keep driving the Zone SDK between publishes
-  and MUST NOT send several publishes back to back.
-- Recovery after a restart, a dropped batch, a switch to the next Zone sequencer
-  or a lost key is open ([Q5](#q5-zone-sequencer-recovery-m)).
+  When their changes would exceed one inscription (1,835,008 bytes),
+  the batch MAY stop before the latest finalized LEZ block and the next batch continues from there;
+  a single LEZ block that does not fit is open ([Q8](#q8-clock-jumps-m)).
+- A batch with no changes is still valid: it states that the LEZ blocks in its range left the tree unchanged,
+  and moves `to_lez_block_id` forward so Zone indexers can tell how far the Zone has followed LEZ.
+- A batch is in flight (queued or in the mempool) until its Mantle Transaction is in a Bedrock block.
+  The Zone operator's node wallet pays each publish with one whole note and holds it until then,
+  so a wallet with `n` notes allows at most `n` batches in flight.
+  A Zone sequencer SHOULD keep at most one batch in flight,
+  since the next batch covers every LEZ block finalized in the meantime,
+  or split the wallet into one note per batch it wants in flight.
 
-A batch moves through the Zone SDK `TxStatus` values plus four states of this document
+A batch moves through the Zone SDK `TxStatus` values plus four states defined here
 (Built, Verified, Rejected, Dropped).
-Zone indexers act only on `Finalized` batches.
+On `Orphaned` the Zone sequencer publishes the same batch again; on `Dropped` it builds it again.
+`Verified` and `Rejected` are set by Zone indexers, which act only on `Finalized` batches.
+After a restart, a dropped batch or a switch to another accredited key,
+a Zone sequencer continues from the last batch on the Zone channel, which it reads as a Zone indexer does.
+An outage stops insertions and removals but loses no data or funds:
+existing memberships keep backing proofs, and the membership set can be rebuilt from Bedrock at any time.
+The loss of all accredited keys is open ([Q7](#q7-governance-of-configstate-m)).
 
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {"lineColor": "#9aa0a6", "primaryTextColor": "#111111", "edgeLabelBackground": "#fff4c2", "fontSize": "15px"}}}%%
 flowchart LR
     DER["Built"] -->|"publish"| ACL["AcceptedLocally"]
-    ACL -->|"drive loop"| PEN["PendingMempool"]
+    ACL -->|"posted"| PEN["PendingMempool"]
     PEN -->|"adopted"| ONC["OnChain"]
     ONC -->|"at or below LIB"| FIN["Finalized"]
     FIN -->|"matches"| VER["Verified"]
     FIN -->|"mismatch"| REJ["Rejected"]
     PEN -->|"dropped"| DRO["Dropped"]
     ONC -->|"reorg"| ORP["Orphaned"]
-    ORP -->|"re-included"| ONC
+    ORP -->|"published again"| ACL
     DRO -->|"rebuild"| DER
 
     classDef step fill:#d6e4ff,stroke:#3b6fd8,color:#111111
@@ -347,9 +358,10 @@ flowchart LR
 
 This section specifies how anyone checks the batches, and what a Zone indexer serves.
 
-A Zone indexer MUST reject a batch that violates check 3, 4, 5 or 7,
+The registry rests on the invariants below.
+A Zone indexer MUST reject a batch that violates Invariant 3, 4 or 5,
 and every batch after it ([Q2](#q2-a-rejected-batch-halts-every-zone-indexer-h)).
-Items 1, 2 and 6 hold by design and configuration.
+Invariants 1, 2, 6 and 7 hold by design and configuration.
 
 1. **No funds.** The Zone holds no funds and keeps no ledger.
 2. **Derived from LEZ.** The membership set is determined only by the
@@ -362,8 +374,9 @@ Items 1, 2 and 6 hold by design and configuration.
 6. **Withdrawal delay.** `withdrawal_delay_ms` is at least LEZ finality,
    plus the maximum tolerated Zone lag,
    plus the longest time a root stays in the valid-root window,
-   so a rate commitment is never usable after its deposit has left the escrow ([Q13](#q13-root-age-and-the-removal-lag-m)).
-7. **Uniqueness.** At most one live leaf per identity commitment.
+   so a rate commitment is never usable after its deposit has left the escrow ([Q10](#q10-root-age-and-the-removal-lag-m)).
+7. **Uniqueness.** At most one live leaf per identity commitment,
+   since a membership account is used once ([LEZ Requirements](#lez-requirements)).
 
 For each finalized batch, a Zone indexer:
 
@@ -375,10 +388,8 @@ For each finalized batch, a Zone indexer:
 - applies them, compares the root with `root_after`,
   and appends `(root_after, to_lez_block_id)` to its root history.
 
-An empty batch repeats the current root with a newer `to_lez_block_id`,
-which refreshes the root's age.
 A Zone indexer serves the root history, the Merkle proof path of a leaf and whether a leaf is live.
-The API is open ([Q11](#q11-registry-view-local-tree-and-computing-from-lez-h)).
+The API is open ([Q9](#q9-registry-view-local-tree-and-computing-from-lez-h)).
 
 ## LEZ Requirements
 
@@ -388,19 +399,19 @@ This document does not specify that program; it requires the following.
 - **Finality.** LEZ blocks are inscribed in the LEZ channel and finalized with their inscription.
 - **Time.** Every LEZ block carries a `timestamp` in Unix-epoch milliseconds.
   The registration program reads `now` from the clock account `CLOCK_01`,
-  which holds the `timestamp` of the previous LEZ block ([Q10](#q10-clock-jumps-m)).
+  which holds the `timestamp` of the previous LEZ block ([Q8](#q8-clock-jumps-m)).
 - **Custody, no tree.** The registration program holds every deposit in an escrow that only it can spend,
   and keeps no Merkle tree.
 - **Configuration.** A configuration account, `ConfigState`, is the anchor of the registry.
   It holds `zone_channel_id`, `treasury_account_id`, `operator_account_id`, the next free leaf index
   and the parameters: rate-limit bounds, `price_per_unit`, `registration_fee`, active-duration bounds,
   `grace_period_duration_ms`, `withdrawal_delay_ms` (at least the bound in [Invariant 6](#zone-indexer))
-  and `epoch_size_sec` ([Q8](#q8-governance-of-configstate-m)).
+  and `epoch_size_sec` ([Q7](#q7-governance-of-configstate-m)).
 - **Memberships.** One membership account per identity commitment holds
   `leaf_index`, `rate_limit`, `expiry_timestamp_ms`, `holder` and `deposit_amount`.
   A closed membership account never opens again, so an identity commitment registers at most once.
 - **Leaf indices.** `Register` assigns the next free leaf index; indices are never reused,
-  and `Register` fails once 2^20 are used ([Q6](#q6-capacity-h)).
+  and `Register` fails once 2^20 are used ([Q5](#q5-capacity-h)).
 - **Visibility.** Every successful action, with the fields the derivation rules use,
   can be read from finalized LEZ blocks ([Q3](#q3-chained-calls-in-the-derivation-rules-h)).
 
@@ -422,10 +433,10 @@ flowchart LR
 
 | Action | Signer | Allowed when | Effect |
 | --- | --- | --- | --- |
-| `Register{id_commitment, rate_limit, expiry_timestamp_ms}` | funded account | within the `ConfigState` bounds; membership account default; leaf capacity left | deposit `rate_limit × price_per_unit` to the escrow, `registration_fee` to `operator_account_id` ([Q14](#q14-funding-the-zone-m)); `holder` = signer; next leaf index |
+| `Register{id_commitment, rate_limit, expiry_timestamp_ms}` | funded account | within the `ConfigState` bounds; membership account default; leaf capacity left | deposit `rate_limit × price_per_unit` to the escrow, `registration_fee` to `operator_account_id` ([Q11](#q11-funding-the-zone-m)); `holder` = signer; next leaf index |
 | `Extend{id_commitment, expiry_timestamp_ms}` | `holder` | open; `now` in the grace period; new expiry later and within `max_active_duration_ms` of `now` | new expiry |
-| `Erase{id_commitment}` | `holder` ([Q7](#q7-only-the-holder-can-send-erase-h)) | open; `now >= expiry_timestamp_ms + withdrawal_delay_ms` | deposit refunded to `holder`; closed |
-| `Slash{identity_secret}` | anyone | membership account for `poseidon(identity_secret)` open | deposit to `treasury_account_id` ([Q14](#q14-funding-the-zone-m)); closed |
+| `Erase{id_commitment}` | `holder` ([Q6](#q6-only-the-holder-can-send-erase-h)) | open; `now >= expiry_timestamp_ms + withdrawal_delay_ms` | deposit refunded to `holder`; closed |
+| `Slash{identity_secret}` | anyone | membership account for `poseidon(identity_secret)` open | deposit to `treasury_account_id` ([Q11](#q11-funding-the-zone-m)); closed |
 
 ## Module
 
@@ -437,12 +448,12 @@ Everything not stated here is as in RLN-API and its `logos` namespace binding (R
 | From | Reads | Used for |
 | --- | --- | --- |
 | LEZ | its membership account (open or closed, `leaf_index`, `expiry_timestamp_ms`, `holder`), `ConfigState`, the clock | membership status, when to send `Extend` and `Erase`, checking `register` arguments |
-| A Zone indexer, or the Zone channel on Bedrock | Verified roots with their `to_lez_block_id`, its Merkle proof path, whether its leaf is live | valid-root window, `generate_proof` |
+| A Zone indexer, or the Zone channel on Bedrock | the roots of finalized batches with their `to_lez_block_id`, its Merkle proof path, whether its leaf is live | valid-root window, `generate_proof` |
 
 The Module chooses how far it trusts the second row:
 it runs a Zone indexer itself;
 or it reads batch roots from the Zone channel and trusts only that an accredited key signed them;
-or it queries one Zone indexer ([Q11](#q11-registry-view-local-tree-and-computing-from-lez-h)).
+or it queries one Zone indexer ([Q9](#q9-registry-view-local-tree-and-computing-from-lez-h)).
 
 For the `logos` binding:
 the anchor account is `ConfigState`, and there are no tree accounts;
@@ -451,9 +462,10 @@ the registry-specific option `active_duration_ms` defaults to `max_active_durati
 the Module configuration names LEZ access and one or more Zone indexer endpoints.
 
 Under direct registration the Module sends `Register` with
-`expiry_timestamp_ms` = Module clock + `active_duration_ms`, plus a margin for the inclusion delay.
+`expiry_timestamp_ms` = Module clock + `active_duration_ms`, less a margin for the inclusion delay,
+so the active duration still passes the `ConfigState` bounds once the transaction is included.
 Under delegated registration the membership provider sends an ordinary `Register`
-from its own funded account and becomes `holder`; the Zone does not distinguish it ([Q15](#q15-smaller-points-l)).
+from its own funded account and becomes `holder`; the Zone does not distinguish it ([Q12](#q12-smaller-points-l)).
 
 ### Membership status
 
@@ -467,48 +479,49 @@ The grace period is `[expiry_timestamp_ms - grace_period_duration_ms, expiry_tim
 | S4 | default after the confirmation window | not in tree | | `MEMBERSHIP_FAILED` |
 | S5 | open | live | before the grace period | `MEMBERSHIP_ACTIVE` |
 | S6 | open | live | in the grace period | `MEMBERSHIP_GRACE_PERIOD` |
-| S7 | open | live or removed `EXPIRED` | from `expiry_timestamp_ms` until `expiry_timestamp_ms + withdrawal_delay_ms` | `MEMBERSHIP_EXPIRED` |
-| S8 | open | removed `EXPIRED` | from `expiry_timestamp_ms + withdrawal_delay_ms` | `MEMBERSHIP_ERASED_AWAITS_WITHDRAWAL` |
+| S7 | open | live or removed | from `expiry_timestamp_ms` until `expiry_timestamp_ms + withdrawal_delay_ms` | `MEMBERSHIP_EXPIRED` |
+| S8 | open | removed | from `expiry_timestamp_ms + withdrawal_delay_ms` | `MEMBERSHIP_ERASED_AWAITS_WITHDRAWAL` |
 | S9 | closed by `Erase` | removed | | `MEMBERSHIP_ERASED` |
 | S10 | closed by `Slash` | live (Zone lag) or removed | | `MEMBERSHIP_SLASHED` |
-| S11 | open, `holder` is neither its funded account nor its membership provider's | any | | not covered ([Q9](#q9-foreign-holder-m)) |
+| S11 | open, `holder` is neither its funded account nor its membership provider's | any | after the confirmation window | `MEMBERSHIP_FAILED` |
 
-The Module generates proofs only in S5 and S6.
+The Module generates proofs only in S5 and S6:
+a membership is usable only while LEZ and the Zone agree
+(membership account open, Module clock before `expiry_timestamp_ms`, leaf live in a root of the valid-root window),
+and stops being usable as soon as either side says otherwise (S7, S10),
+which protects an honest Module only ([Q10](#q10-root-age-and-the-removal-lag-m)).
 An open membership account without a leaf yet stays `MEMBERSHIP_PENDING`,
-so the confirmation window only needs to cover LEZ inclusion and LEZ finality ([Q1](#q1-two-finalities-h)).
+so the confirmation window MUST cover LEZ inclusion and LEZ finality ([Q1](#q1-two-finalities-h)).
+A membership account held by someone else (S11) counts as absent:
+the Module reports `MEMBERSHIP_FAILED` and registers again with a new identity credential.
 The Module tells S9 from S10 by the LEZ transaction that closed the account; batches do not carry it.
 
 ## Open Questions
 
 Questions are grouped by the part they concern, not by severity.
 H blocks a sound deployment, M must be settled before implementation, L is minor.
-Edge cases whose handling is not settled are listed here too.
 
 | # | Part | Sev | Question |
 | --- | --- | --- | --- |
 | [Q1](#q1-two-finalities-h) | Zone | H | Two finalities make registration take about 2 h |
 | [Q2](#q2-a-rejected-batch-halts-every-zone-indexer-h) | Zone | H | One Rejected batch halts every Zone indexer forever |
 | [Q3](#q3-chained-calls-in-the-derivation-rules-h) | Zone | H | The derivation rules are ambiguous for chained calls |
-| [Q4](#q4-empty-batches-and-zone-sequencer-delay-m) | Zone | M | Empty batches every turn; no bound on Zone sequencer delay |
-| [Q5](#q5-zone-sequencer-recovery-m) | Zone | M | Zone sequencer outage, recovery and key loss |
-| [Q6](#q6-capacity-h) | LEZ | H | No total rate limit, and a cheap way to exhaust the leaf capacity |
-| [Q7](#q7-only-the-holder-can-send-erase-h) | LEZ | H | Only the holder can send `Erase` |
-| [Q8](#q8-governance-of-configstate-m) | LEZ | M | No governance of `ConfigState` |
-| [Q9](#q9-foreign-holder-m) | LEZ | M | A foreign `holder` registers a victim's identity commitment first |
-| [Q10](#q10-clock-jumps-m) | LEZ | M | LEZ timestamps can jump backwards or far forwards |
-| [Q11](#q11-registry-view-local-tree-and-computing-from-lez-h) | Module | H | No Zone indexer API; the Module could keep its own tree and compute it from LEZ |
-| [Q12](#q12-clock-and-sides-of-membership-status-m) | Module | M | Which clock and which side decide membership status |
-| [Q13](#q13-root-age-and-the-removal-lag-m) | Module | M | A removed leaf keeps backing proofs; long outages force fail-open or fail-closed |
-| [Q14](#q14-funding-the-zone-m) | Funding | M | Who pays the Mantle Transaction fees, and where slashed deposits go |
-| [Q15](#q15-smaller-points-l) | All | L | Smaller points |
+| [Q4](#q4-zone-sequencer-delay-m) | Zone | M | Nothing bounds how long a Zone sequencer may delay a change |
+| [Q5](#q5-capacity-h) | LEZ | H | No total rate limit, and a cheap way to exhaust the leaf capacity |
+| [Q6](#q6-only-the-holder-can-send-erase-h) | LEZ | H | Only the holder can send `Erase` |
+| [Q7](#q7-governance-of-configstate-m) | LEZ | M | No governance of `ConfigState`, no recovery from losing the accredited keys |
+| [Q8](#q8-clock-jumps-m) | LEZ | M | LEZ timestamps can jump backwards or far forwards |
+| [Q9](#q9-registry-view-local-tree-and-computing-from-lez-h) | Module | H | No Zone indexer API; the Module could keep its own tree and compute it from LEZ |
+| [Q10](#q10-root-age-and-the-removal-lag-m) | Module | M | A removed leaf keeps backing proofs; long outages force fail-open or fail-closed |
+| [Q11](#q11-funding-the-zone-m) | Funding | M | Who pays the Mantle Transaction fees, and where slashed deposits go |
+| [Q12](#q12-smaller-points-l) | All | L | Smaller points |
 
 ### Q1. Two finalities (H)
 
 **Problem.** Registration waits for LEZ finality and then batch finality,
 each about 60 min on testnet (LIB is about 120 Bedrock blocks of 30 s behind the tip),
 so `register` to `MEMBERSHIP_ACTIVE` takes about 2 h; lez-rln takes one LEZ block.
-The confirmation window of logos-rln-modules is 300 s,
-so a Module reading only finalized LEZ state would report every registration `MEMBERSHIP_FAILED`.
+The confirmation window of logos-rln-modules is 300 s today, far below LEZ finality.
 
 **Proposal.** Replace [Invariant 4](#zone-indexer):
 a batch MAY cover a LEZ block once that LEZ block's inscription precedes the batch on the same Bedrock chain,
@@ -535,31 +548,17 @@ A `Register` reached through a chained call from another program is ambiguous.
 (`Registered{id_commitment, rate_limit, expiry_timestamp_ms, leaf_index}`, `Extended`, `Erased`, `Slashed`)
 in LEZ order, emitted as `ProgramEvent`s, as the bridge program does (`bridge::Deposit`).
 
-### Q4. Empty batches and Zone sequencer delay (M)
+### Q4. Zone sequencer delay (M)
 
-**Problem.** An empty batch every turn to write costs a Mantle Transaction fee each time.
-A Zone sequencer can delay a change for as long as it likes;
+**Problem.** A Zone sequencer can delay a change for as long as it likes;
 the Zone lag is public, but nothing bounds it.
+Each empty batch costs a Mantle Transaction fee, so `heartbeat_ms` trades cost against freshness.
 
-**Proposal.** Publish a batch when there are changes,
-and an empty batch only after `heartbeat_ms` without one
-(below `withdrawal_delay_ms` under fail-closed, [Q13](#q13-root-age-and-the-removal-lag-m)).
-A Zone sequencer SHOULD publish within `max_delay_ms` of the first unpublished change.
+**Proposal.** A Zone sequencer SHOULD publish within `max_delay_ms` of the first unpublished change.
+Choose `heartbeat_ms` with [Q10](#q10-root-age-and-the-removal-lag-m):
+under fail-closed it must stay below `withdrawal_delay_ms`.
 
-### Q5. Zone sequencer recovery (M)
-
-**Problem.** A Zone sequencer outage stops insertions and removals,
-but loses no data or funds, and existing memberships keep backing proofs.
-Unspecified: recovery after a restart or a dropped batch,
-the switch to the next Zone sequencer in round-robin,
-and the loss of all accredited keys, which needs a new Zone channel and a new `zone_channel_id` ([Q8](#q8-governance-of-configstate-m)).
-
-**Proposal.** Run 2-3 accredited keys on separate hosts with round-robin and `posting_timeout` for failover.
-`from_lez_block_id` always follows from the last batch on the Zone channel,
-which a Zone sequencer reads as a Zone indexer does.
-After a key loss, anyone rebuilds the membership set from Bedrock and the registry restarts on a new Zone channel.
-
-### Q6. Capacity (H)
+### Q5. Capacity (H)
 
 **Problem.** There is no total rate limit, so network load is unbounded;
 lez-rln has one (`max_total_rate_limit`).
@@ -571,37 +570,28 @@ checked by `Register` and decremented by `Erase` and `Slash`.
 Price `registration_fee` against the leaf capacity,
 and deploy a new registry when the leaf capacity is reached.
 
-### Q7. Only the holder can send `Erase` (H)
+### Q6. Only the holder can send `Erase` (H)
 
 **Problem.** A deposit whose holder never sends `Erase` stays in the escrow forever,
-with its share of the total rate limit ([Q6](#q6-capacity-h)).
+with its share of the total rate limit ([Q5](#q5-capacity-h)).
 lez-rln's `Erase` is permissionless and refunds the recorded `holder`.
 
 **Proposal.** Make `Erase` permissionless, still refunding `holder`,
 and require a public account as `holder`,
 since a refund to a private account id goes to a public account that no key can spend.
 
-### Q8. Governance of `ConfigState` (M)
+### Q7. Governance of `ConfigState` (M)
 
 **Problem.** Nobody is named to set or change `ConfigState`,
 to control `treasury_account_id` and `operator_account_id`,
-or to replace `zone_channel_id` after the accredited keys are lost.
+or to replace `zone_channel_id` after all accredited keys are lost,
+when the registry must restart on a new Zone channel from the membership set rebuilt from Bedrock.
 Open memberships follow the current durations.
 
 **Proposal.** Store `grace_period_duration_ms` and `withdrawal_delay_ms` in each membership account at `Register`.
 Either name an admin, or make `ConfigState` immutable and deploy a new registry on change.
 
-### Q9. Foreign holder (M)
-
-**Problem.** Anyone can `Register` a victim's identity commitment first.
-The victim's `Register` then reverts permanently, and the attacker is `holder`.
-
-**Proposal.** The victim's Module treats a membership account whose `holder`
-is neither its funded account nor its membership provider's account as absent,
-reports `MEMBERSHIP_FAILED` after the confirmation window,
-and registers again with a new identity credential.
-
-### Q10. Clock jumps (M)
+### Q8. Clock jumps (M)
 
 **Problem.** The LEZ Sequencer sets each `timestamp` from its own clock,
 and LEZ checks neither order nor step size.
@@ -615,7 +605,7 @@ which a batch cannot split.
 In the Zone, cap the expiry `Remove`s per LEZ block and carry the rest forward,
 or let a batch continue a LEZ block.
 
-### Q11. Registry view: local tree and computing from LEZ (H)
+### Q9. Registry view: local tree and computing from LEZ (H)
 
 **Problem.**
 
@@ -639,18 +629,7 @@ honest proofs on a dropped root must be generated again;
 whether insertions should be computed this way too ([Q1](#q1-two-finalities-h));
 how much of the Zone is still needed.
 
-### Q12. Clock and sides of membership status (M)
-
-**Problem.** Membership status uses the Module clock, which lags behind LEZ,
-and LEZ and the Zone can disagree for a while after any change.
-
-**Proposal.** A membership becomes usable only when both sides agree
-(membership account open, Module clock before `expiry_timestamp_ms`, leaf live in a root of the valid-root window),
-and stops being usable as soon as either side says so.
-The [membership status](#membership-status) table already follows this rule (S7, S10).
-The open point is RLN-API's wording, which describes `MEMBERSHIP_SLASHED` as "removed by slashing".
-
-### Q13. Root age and the removal lag (M)
+### Q10. Root age and the removal lag (M)
 
 **Problem.**
 
@@ -667,12 +646,13 @@ The open point is RLN-API's wording, which describes `MEMBERSHIP_SLASHED` as "re
   Fail-closed never backs a proof with a withdrawn deposit, but a longer outage stops all proofs.
   A deny list at validators is impossible, since proofs hide the rate commitment.
 
-**Proposal.** Bound the valid-root window by root age (`max_root_age_ms`) as well as by length,
-and choose the window length, `heartbeat_ms` and `withdrawal_delay_ms` from the removal lag.
-[Q11](#q11-registry-view-local-tree-and-computing-from-lez-h) describes how validators could remove the lag.
+**Proposal.** Bound the valid-root window by root age (`max_root_age_ms`) as well as by length;
+every batch, empty or not, then refreshes the age of the current root.
+Choose the window length, `heartbeat_ms` and `withdrawal_delay_ms` from the removal lag.
+[Q9](#q9-registry-view-local-tree-and-computing-from-lez-h) describes how validators could remove the lag.
 The choice between fail-open and fail-closed is open.
 
-### Q14. Funding the Zone (M)
+### Q11. Funding the Zone (M)
 
 **Problem.**
 
@@ -688,7 +668,7 @@ The choice between fail-open and fail-closed is open.
   the bridge `Withdraw` from LEZ to Bedrock is disabled,
   and LEZ counts 10^9 atomic units per LGO while Bedrock prices gas in LGO with no sub-unit.
 - Removals cost Bedrock bytes but pay nothing,
-  and fees above the Zone SDK's `max_tx_fee` stall batches.
+  and fees above the Zone sequencer's fee cap stall batches.
 - Slashed deposits go to `treasury_account_id`, which nobody is named to hold (LEZ cannot burn).
 - There is no slasher reward. With one, slashers would compete,
   and the LEZ Sequencer could copy a pending `Slash` and send it first.
@@ -701,13 +681,15 @@ as in the [Logos Oracle Zone](https://lip.logos.co/anoncomms/raw/logos-oracle-zo
 
 **Open points.** Whether to charge a fee at all;
 one operator account or a share per Zone sequencer;
-who sets `operator_account_id` and `treasury_account_id` ([Q8](#q8-governance-of-configstate-m)).
+who sets `operator_account_id` and `treasury_account_id` ([Q7](#q7-governance-of-configstate-m)).
 
-### Q15. Smaller points (L)
+### Q12. Smaller points (L)
 
 | Point | Proposal |
 | --- | --- |
 | A reverted `Register` is visible immediately, but RLN-API allows `MEMBERSHIP_FAILED` only after the confirmation window. | Propose an RLN-API change allowing `MEMBERSHIP_FAILED` on an observed revert. |
+| The Module reports `MEMBERSHIP_SLASHED` as soon as LEZ shows the `Slash` (S10), while RLN-API describes it as "removed by slashing". | Align the RLN-API wording. |
+| A membership account held by someone else (S11) is reported `MEMBERSHIP_FAILED`, which RLN-API defines as observed absence. | Decide whether RLN-API needs a distinct status. |
 | RLN-API names the identity commitment the only credential-derived value in the registry, but its `register` text says only the rate commitment is submitted. | Align the RLN-API text with the `logos` binding. |
 | Under delegated registration the membership provider is `holder`, so the client cannot send `Extend` or `Erase`. | Leave to RLN Membership Allocation. |
 | lez-rln's `ForceExpire` (start the grace period now) has no counterpart. | Decide whether it is needed. |
