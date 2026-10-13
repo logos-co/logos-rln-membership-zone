@@ -168,15 +168,14 @@ Registration (steps 1-9): a user action reaches the registration program on LEZ;
 %%{init: {"theme": "base", "flowchart": {"curve": "basis", "nodeSpacing": 40, "rankSpacing": 70, "padding": 6}, "themeVariables": {"lineColor": "#9aa0a6", "primaryTextColor": "#111111", "edgeLabelBackground": "#ffffff", "fontSize": "15px"}, "themeCSS": "marker { overflow: visible; } .arrowMarkerPath { transform: scale(1.7); transform-origin: 5px 5px; } .edgeLabel, .edgeLabel p, .edgeLabel span { font-size: 12px; line-height: 1.2; }"}}%%
 flowchart LR
     APP["Basecamp UI,<br/>CLI, app<br/>(user interface)"] -->|"#nbsp;1. interact#nbsp;"| MOD["Module<br/>(user node)"]
-    MOD -->|"#nbsp;2. Register /#nbsp;<br/>#nbsp;Extend / Erase#nbsp;"| LSEQ["LEZ<br/>Sequencer<br/>(LEZ)"]
+    MOD <-->|"#nbsp;2. Register / Extend / Erase →#nbsp;<br/>#nbsp;← 5. LEZ blocks#nbsp;"| LSEQ["LEZ<br/>Sequencer<br/>(LEZ)"]
     LSEQ -->|"#nbsp;3. execute#nbsp;"| PROG["Registration<br/>program<br/>(LEZ)"]
     LSEQ -->|"#nbsp;4. inscribe#nbsp;"| LCH["LEZ channel<br/>(Bedrock)"]
     LSEQ -->|"#nbsp;5. LEZ blocks#nbsp;"| ZSEQ["Zone<br/>sequencer<br/>(Zone)"]
-    LSEQ -->|"#nbsp;5. LEZ blocks#nbsp;"| MOD
     LSEQ -->|"#nbsp;5. LEZ blocks#nbsp;"| IDX["Zone indexer<br/>(Zone)"]
     ZSEQ -->|"#nbsp;6. publish#nbsp;<br/>#nbsp;batch#nbsp;"| ZCH["Zone channel<br/>(Bedrock)"]
-    ZCH -->|"#nbsp;7. batches#nbsp;<br/>#nbsp;to check#nbsp;"| IDX
-    ZCH -->|"#nbsp;8. batch roots#nbsp;<br/>#nbsp;to compare#nbsp;"| MOD
+    IDX -->|"#nbsp;7. check#nbsp;<br/>#nbsp;batches#nbsp;"| ZCH
+    MOD -->|"#nbsp;8. compare#nbsp;<br/>#nbsp;batch roots#nbsp;"| ZCH
     IDX -.->|"#nbsp;9. snapshot#nbsp;<br/>#nbsp;to sync#nbsp;"| MOD
     linkStyle default stroke-width:2.5px
 
@@ -464,10 +463,9 @@ Everything not stated here is as in RLN-API; this document requires the followin
 ```mermaid
 %%{init: {"theme": "base", "flowchart": {"curve": "basis", "nodeSpacing": 40, "rankSpacing": 70, "padding": 6, "wrappingWidth": 400}, "themeVariables": {"lineColor": "#9aa0a6", "primaryTextColor": "#111111", "edgeLabelBackground": "#ffffff", "fontSize": "15px"}, "themeCSS": "marker { overflow: visible; } .arrowMarkerPath { transform: scale(1.7); transform-origin: 5px 5px; } .edgeLabel, .edgeLabel p, .edgeLabel span { font-size: 12px; line-height: 1.2; }"}}%%
 flowchart LR
-    LSEQ["LEZ Sequencer<br/>(LEZ)"] -->|"#nbsp;every LEZ block; membership account, ConfigState, clock#nbsp;<br/>#nbsp;trust: the LEZ Sequencer#nbsp;"| MOD["Module<br/>(user node)"]
+    LSEQ["LEZ Sequencer<br/>(LEZ)"] <-->|"#nbsp;every LEZ block; membership account, ConfigState, clock →#nbsp;<br/>#nbsp;← Register, Extend, Erase#nbsp;<br/>#nbsp;trust: the LEZ Sequencer#nbsp;"| MOD["Module<br/>(user node)"]
     ZCH["Zone channel<br/>(Bedrock)"] -->|"#nbsp;batch roots to compare with#nbsp;<br/>#nbsp;trust: the Zone sequencer that signed#nbsp;"| MOD
     IDX["Zone indexer<br/>(self-hosted or any service)"] -.->|"#nbsp;snapshot to sync from#nbsp;<br/>#nbsp;trust: none, checked against a batch root#nbsp;"| MOD
-    MOD -->|"#nbsp;Register, Extend, Erase#nbsp;"| LSEQ
     MOD -->|"#nbsp;RLN-API#nbsp;"| APP["User interface"]
     linkStyle default stroke-width:2.5px
 
