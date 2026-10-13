@@ -2,14 +2,14 @@
 //!
 //! One process plays every role:
 //! - a mock LEZ with the registration program (`lez.rs`), producing one block per tick;
-//! - the Zone sequencer: derives changes from new LEZ blocks (`membership_set.rs`) and publishes
+//! - the Zone sequencer: turns new LEZ blocks into changes (`membership_set.rs`) and publishes
 //!   one batch (`batch.rs`) per tick on the real local chain through the Zone SDK;
 //! - a Zone indexer (`indexer.rs`): re-checks every finalized batch against LEZ and keeps the
 //!   registry view a Module would read.
 //!
 //! The scripted scenario: alice and bob register, alice extends, bob double-signals and is
-//! slashed by carol, alice expires and erases. `--censor` makes the Zone sequencer drop the
-//! slash from its batch, which the Zone indexer detects (Invariant 3).
+//! slashed by carol, alice expires and erases. `--dishonest-sequencer` makes the Zone sequencer
+//! leave bob's slash out of its batch, which the Zone indexer detects (Zone Indexer check 2).
 
 mod batch;
 mod indexer;
@@ -65,10 +65,10 @@ struct Args {
     max_tx_fee: u64,
     /// Seconds between ticks (one LEZ block and one batch per tick).
     #[arg(long, default_value_t = 3)]
-    tick_secs: u64,
-    /// Make the Zone sequencer omit the slash from its batch.
+    tick_sec: u64,
+    /// Play a dishonest Zone sequencer: leave the slash out of the batch.
     #[arg(long)]
-    censor: bool,
+    dishonest_sequencer: bool,
 }
 
 /// One scripted registration-program action.
@@ -187,26 +187,29 @@ fn parse_funding_pk(hex_str: &str) -> Result<ZkPublicKey> {
     ))
 }
 
-/// Build the next batch from every LEZ block after `zone.lez_to`, ending early at a block
-/// boundary when the encoded batch would not fit in one inscription (RFC "Cadence").
+/// Build the next batch from every LEZ block after `zone.to_lez_block_id`, ending early at a block
+/// boundary when the encoded batch would not fit in one inscription (RFC "Zone Sequencer").
 /// Returns the batch, its inscription and the Zone sequencer's view after it.
 fn build_batch(
     zone: &MembershipSet,
     lez: &MockLez,
-    censor: bool,
+    dishonest: bool,
 ) -> Result<(Batch, Inscription, MembershipSet)> {
-    let from = zone.lez_to + 1;
+    let from = zone.to_lez_block_id + 1;
     let mut next = zone.clone();
     let mut changes = vec![];
     let mut fitted = None;
     for block in lez.blocks(from, lez.last_finalized_block_id()) {
+        let slashed = if dishonest {
+            next.slash_targets(block)
+        } else {
+            vec![]
+        };
         changes.extend(next.apply_block(block));
-        if censor {
-            changes.retain(|c| !c.is_slash());
-        }
+        changes.retain(|c| c.removed_leaf().is_none_or(|leaf| !slashed.contains(&leaf)));
         let batch = Batch {
-            lez_from: from,
-            lez_to: block.block_id,
+            from_lez_block_id: from,
+            to_lez_block_id: block.block_id,
             changes: changes.clone(),
             root_after: fr_to_bytes_le(&next.root()).to_vec(),
         };
@@ -273,7 +276,7 @@ async fn main() -> Result<()> {
         min_rate_limit: 100,
         max_rate_limit: 600,
         price_per_unit: 10,
-        reg_fee: 5,
+        registration_fee: 5,
         min_active_duration_ms: 4_000,
         max_active_duration_ms: 60_000,
         grace_period_duration_ms: 4_000,
@@ -296,13 +299,13 @@ async fn main() -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    println!("  censor   {}", args.censor);
+    println!("  dishonest sequencer {}", args.dishonest_sequencer);
     println!("waiting for the Zone sequencer to be ready...");
 
     let mut ready = false;
     // The batch waiting to land in a block, if any.
     let mut in_flight: Option<MsgId> = None;
-    let mut tick = tokio::time::interval(Duration::from_secs(args.tick_secs));
+    let mut tick = tokio::time::interval(Duration::from_secs(args.tick_sec));
     // Backfilling a fresh channel takes a while; do not fire the missed ticks in a burst.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -329,7 +332,7 @@ async fn main() -> Result<()> {
                         }
                         match indexer.on_batch(&info.payload, &lez) {
                             Ok(b) => {
-                                println!("  zone indexer: finalized batch [{}..{}] verified, root {}..", b.lez_from, b.lez_to, hex::encode(&b.root_after[..4]));
+                                println!("  zone indexer: finalized batch [{}..{}] verified, root {}..", b.from_lez_block_id, b.to_lez_block_id, hex::encode(&b.root_after[..4]));
                                 print_view(&indexer, &members, &lez);
                             }
                             Err(reason) => println!("  zone indexer: REJECTED: {reason}"),
@@ -354,13 +357,13 @@ async fn main() -> Result<()> {
                 }
                 // 2. Zone sequencer: one batch covering the LEZ blocks not covered yet, with at
                 //    most one batch in flight (each in-flight transaction holds one fee note).
-                if in_flight.is_none() && zone.lez_to < lez.last_finalized_block_id() {
-                    let (batch, inscription, next) = build_batch(&zone, &lez, args.censor)?;
+                if in_flight.is_none() && zone.to_lez_block_id < lez.last_finalized_block_id() {
+                    let (batch, inscription, next) = build_batch(&zone, &lez, args.dishonest_sequencer)?;
                     match sequencer.handle().publish(inscription).await {
                         Ok((result, _checkpoint)) => {
                             in_flight = Some(result.tx.inscription().this_msg);
                             let described: Vec<_> = batch.changes.iter().map(|c| c.describe()).collect();
-                            println!("zone sequencer: batch [{}..{}] published: {}", batch.lez_from, batch.lez_to, if described.is_empty() { "no changes".into() } else { described.join("; ") });
+                            println!("zone sequencer: batch [{}..{}] published: {}", batch.from_lez_block_id, batch.to_lez_block_id, if described.is_empty() { "no changes".into() } else { described.join("; ") });
                             zone = next;
                         }
                         Err(SeqError::Unavailable { reason }) => println!("zone sequencer: not ready ({reason}), retry next tick"),
@@ -370,7 +373,9 @@ async fn main() -> Result<()> {
             },
             _ = tokio::signal::ctrl_c() => break,
         }
-        if indexer.membership_set.lez_to >= LAST_BLOCK || indexer.halted().is_some() {
+        // The demo stops at the first rejection: the dishonest sequencer never publishes a
+        // correct batch, so the Zone indexer would wait forever.
+        if indexer.membership_set.to_lez_block_id >= LAST_BLOCK || !indexer.rejected().is_empty() {
             break;
         }
     }
@@ -388,8 +393,8 @@ async fn main() -> Result<()> {
         lez.balance("treasury"),
         lez.balance("operator")
     );
-    if let Some(reason) = indexer.halted() {
-        println!("zone indexer halted: {reason}");
+    for reason in indexer.rejected() {
+        println!("zone indexer rejected a batch and waits for a correct one: {reason}");
     }
     Ok(())
 }

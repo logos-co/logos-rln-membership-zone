@@ -1,9 +1,9 @@
-//! In-memory stand-in for LEZ and the registration program (RFC "Registration Program").
+//! In-memory stand-in for LEZ and the registration program (RFC "LEZ Requirements").
 //!
 //! Only what the Zone needs is modelled: blocks with a timestamp, the successful
-//! registration-program transactions of each block, membership accounts and balances. Every
-//! block is treated as finalized as soon as it is produced; a real deployment follows only
-//! finalized LEZ blocks (Invariant 4).
+//! registration-program transactions of each block, membership accounts and balances. A block
+//! is readable as soon as it is produced, as the RFC trusts the LEZ Sequencer to serve closed
+//! blocks without ever changing them.
 
 use std::collections::HashMap;
 
@@ -11,16 +11,13 @@ use rln::prelude::{Fr, Hasher, PoseidonHash};
 
 use crate::membership_set::{TREE_DEPTH, fr_to_bytes_le};
 
-/// Share of a forfeited deposit paid to the slasher, in percent (RFC Q13 `reward_portion`).
-const REWARD_PORTION: u128 = 10;
-
 /// `ConfigState`, the configuration account of the registry (durations in milliseconds).
 #[derive(Debug, Clone)]
 pub struct ConfigState {
     pub min_rate_limit: u64,
     pub max_rate_limit: u64,
     pub price_per_unit: u128,
-    pub reg_fee: u128,
+    pub registration_fee: u128,
     pub min_active_duration_ms: u64,
     pub max_active_duration_ms: u64,
     pub grace_period_duration_ms: u64,
@@ -43,12 +40,12 @@ pub struct MembershipState {
 }
 
 /// A membership account as LEZ shows it. A LEZ account never returns to its default
-/// state, so `Erase` and `Slash` leave it `Emptied`.
+/// state, so `Erase` and `Slash` leave it `Closed`.
 #[derive(Debug, Clone, Copy)]
 pub enum MembershipAccount<'a> {
     Default,
     Open(&'a MembershipState),
-    Emptied,
+    Closed,
 }
 
 /// A registration-program instruction. Only successful ones are recorded in blocks.
@@ -72,6 +69,8 @@ pub enum Instruction {
         id_commitment: Fr,
     },
     Slash {
+        /// Signer; pays its LEZ transaction fee and receives nothing (slasher reward: RFC Q5).
+        #[allow(dead_code)]
         slasher: String,
         identity_secret: Fr,
     },
@@ -93,7 +92,7 @@ pub struct MockLez {
     timestamp: u64,
     /// `ConfigState.next_index`: next free leaf index.
     next_index: u64,
-    /// `None` once emptied by `Erase` or `Slash`.
+    /// `None` once closed by `Erase` or `Slash`.
     memberships: HashMap<[u8; 32], Option<MembershipState>>,
     balances: HashMap<String, u128>,
 }
@@ -129,7 +128,7 @@ impl MockLez {
         match self.memberships.get(&fr_to_bytes_le(id_commitment)) {
             None => MembershipAccount::Default,
             Some(Some(membership)) => MembershipAccount::Open(membership),
-            Some(None) => MembershipAccount::Emptied,
+            Some(None) => MembershipAccount::Closed,
         }
     }
 
@@ -148,7 +147,7 @@ impl MockLez {
         &self.blocks[(from - 1) as usize..to as usize]
     }
 
-    /// Execute a transaction against the registration program, with the RFC checks in order.
+    /// Execute a transaction against the registration program, per the RFC "LEZ Requirements".
     /// On success it is queued for the next block.
     pub fn submit(&mut self, mut instruction: Instruction) -> Result<(), String> {
         let config = self.config.clone();
@@ -182,8 +181,8 @@ impl MockLez {
                 }
                 // Payment.
                 let deposit_amount = u128::from(*rate_limit) * config.price_per_unit;
-                self.debit(payer, deposit_amount + config.reg_fee)?;
-                self.credit(&config.operator_account_id, config.reg_fee);
+                self.debit(payer, deposit_amount + config.registration_fee)?;
+                self.credit(&config.operator_account_id, config.registration_fee);
                 // Accept.
                 let membership = MembershipState {
                     leaf_index: self.next_index,
@@ -236,21 +235,15 @@ impl MockLez {
                 self.credit(&membership.holder, membership.deposit_amount);
             }
             Instruction::Slash {
-                slasher,
-                identity_secret,
+                identity_secret, ..
             } => {
                 // Membership.
                 let id_commitment = Hasher::<PoseidonHash>::hash_single(*identity_secret);
                 let membership = self.open_membership(&id_commitment, None)?;
-                // Accept: `reward_portion` to the slasher, the rest to the treasury.
-                let reward = membership.deposit_amount * REWARD_PORTION / 100;
+                // Accept: the whole deposit to the treasury (a slasher reward is RFC Q5).
                 self.memberships
                     .insert(fr_to_bytes_le(&id_commitment), None);
-                self.credit(slasher, reward);
-                self.credit(
-                    &config.treasury_account_id,
-                    membership.deposit_amount - reward,
-                );
+                self.credit(&config.treasury_account_id, membership.deposit_amount);
             }
         }
         // Record the assigned leaf index in the executed transaction, where the Zone reads it.
@@ -315,7 +308,7 @@ pub(crate) mod test {
             min_rate_limit: 100,
             max_rate_limit: 600,
             price_per_unit: 10,
-            reg_fee: 5,
+            registration_fee: 5,
             min_active_duration_ms: 4_000,
             max_active_duration_ms: 60_000,
             grace_period_duration_ms: 4_000,
@@ -389,7 +382,7 @@ pub(crate) mod test {
         .unwrap();
         assert!(matches!(
             lez.membership_account(&keys.id_commitment()),
-            MembershipAccount::Emptied
+            MembershipAccount::Closed
         ));
         let err = lez.submit(register("alice", &keys, 20_000)).unwrap_err();
         assert_eq!(err, "membership account already used");
