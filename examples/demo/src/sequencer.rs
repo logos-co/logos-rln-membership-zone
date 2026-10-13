@@ -8,13 +8,13 @@ use prost::Message;
 
 use crate::{
     batch::Batch,
-    lez::MockLez,
+    lez::{Action, Block, MockLez},
     reader::{Reader, fr_to_bytes_le},
 };
 
 pub struct ZoneSequencer {
     reader: Reader,
-    /// Leave every `Slash` out of the batches: the dishonest Zone sequencer of the demo.
+    /// Omit every `Slash` from the tree and the batches: provable censorship.
     dishonest: bool,
 }
 
@@ -40,13 +40,24 @@ impl ZoneSequencer {
         let mut changes = vec![];
         let mut fitted = None;
         for block in lez.blocks(from, lez.last_block_id()) {
-            let slashed = if self.dishonest {
-                next.slash_targets(block)
+            // The dishonest Zone sequencer censors every `Slash`: it applies the block without
+            // them, so both its changes and its root leave the slashed leaf in the tree.
+            let censored;
+            let block = if self.dishonest {
+                censored = Block {
+                    actions: block
+                        .actions
+                        .iter()
+                        .filter(|action| !matches!(action, Action::Slash { .. }))
+                        .cloned()
+                        .collect(),
+                    ..block.clone()
+                };
+                &censored
             } else {
-                vec![]
+                block
             };
             changes.extend(next.apply_block(block));
-            changes.retain(|c| c.removed_leaf().is_none_or(|leaf| !slashed.contains(&leaf)));
             let batch = Batch {
                 from_lez_block_id: from,
                 to_lez_block_id: block.block_id,

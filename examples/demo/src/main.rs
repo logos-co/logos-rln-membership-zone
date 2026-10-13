@@ -10,9 +10,10 @@
 //!   report their membership status and compare their roots with the verified batches.
 //!
 //! The scripted scenario: alice and bob register, bob double-signals and is slashed by carol,
-//! alice extends, expires and erases. `--dishonest-sequencer` makes the Zone sequencer leave
-//! bob's slash out of its batch: the Zone indexer rejects it, while the Modules, which read LEZ
-//! themselves, are unaffected.
+//! alice extends, expires and erases. `--dishonest-sequencer` makes the Zone sequencer omit
+//! bob's slash from its tree and its batch: the Zone indexer marks the batch Rejected (an
+//! omission is provable censorship) and every Module, which reads LEZ itself, sees its own root
+//! diverge from the batch.
 
 mod batch;
 mod indexer;
@@ -38,11 +39,13 @@ use lb_zone_sdk::{
         Error as SeqError, Event, FinalizedOp, FundingConfig, ZoneSequencer as SdkSequencer,
     },
 };
+use prost::Message;
 use rand::{RngCore, rngs::ThreadRng, thread_rng};
 use reqwest::Url;
 use rln::prelude::{IdentityKeys, PoseidonHash};
 
 use crate::{
+    batch::Batch,
     indexer::ZoneIndexer,
     lez::{Action, ConfigState, MockLez},
     module::Module,
@@ -73,7 +76,7 @@ struct Args {
     /// Seconds between ticks (one LEZ block and one batch per tick).
     #[arg(long, default_value_t = 3)]
     tick_sec: u64,
-    /// Play a dishonest Zone sequencer: leave the slash out of the batch.
+    /// Play a Zone sequencer that omits the slash from its tree and its batch.
     #[arg(long)]
     dishonest_sequencer: bool,
 }
@@ -297,19 +300,19 @@ async fn main() -> Result<()> {
                         if in_flight == Some(info.this_msg) {
                             in_flight = None;
                         }
-                        // The Zone indexer checks the batch; the Modules compare their roots with it.
-                        match indexer.on_batch(&info.payload, &lez) {
-                            Ok(batch) => {
-                                println!("zone indexer: batch [{}..{}] Verified, root {}..", batch.from_lez_block_id, batch.to_lez_block_id, hex::encode(&batch.root_after[..4]));
-                                for m in &modules {
-                                    match m.compare(&batch) {
-                                        Ok(Some(())) => println!("  module {:5} root at LEZ block {} matches the batch", m.name, batch.to_lez_block_id),
-                                        Ok(None) => println!("  module {:5} has not applied LEZ block {} yet", m.name, batch.to_lez_block_id),
-                                        Err(reason) => println!("  module {:5} DIVERGES from the Zone: {reason}", m.name),
-                                    }
-                                }
-                            }
+                        // The Zone indexer checks the batch against LEZ and says what is wrong;
+                        // every Module reads the same batch and only compares its own root.
+                        match indexer.on_batch(&info.payload) {
+                            Ok(batch) => println!("zone indexer: batch [{}..{}] Verified, root {}..", batch.from_lez_block_id, batch.to_lez_block_id, hex::encode(&batch.root_after[..4])),
                             Err(reason) => println!("zone indexer: batch REJECTED: {reason}"),
+                        }
+                        let Ok(batch) = Batch::decode(info.payload.as_slice()) else { continue };
+                        for m in &modules {
+                            match m.compare(&batch) {
+                                Ok(Some(())) => println!("  module {:5} root at LEZ block {} matches the batch", m.name, batch.to_lez_block_id),
+                                Ok(None) => println!("  module {:5} has not applied LEZ block {} yet", m.name, batch.to_lez_block_id),
+                                Err(reason) => println!("  module {:5} DIVERGES from the Zone: {reason}", m.name),
+                            }
                         }
                     }
                 }
@@ -328,7 +331,8 @@ async fn main() -> Result<()> {
                         }
                     }
                     let block = lez.produce_block(BLOCK_MS).clone();
-                    // 2. Modules: every reader applies the closed block to its own tree.
+                    // 2. Every reader applies the closed block to its own tree.
+                    indexer.apply_block(&block);
                     let before: Vec<_> = modules.iter().map(|m| m.status(&lez)).collect();
                     for m in &mut modules {
                         m.apply_block(&block);
@@ -358,14 +362,14 @@ async fn main() -> Result<()> {
         }
         // The demo stops at the first rejection: the dishonest sequencer never publishes a
         // correct batch, so the Zone indexer would wait forever.
-        if indexer.reader.applied_block_id >= LAST_BLOCK || !indexer.rejected().is_empty() {
+        if indexer.verified_to >= LAST_BLOCK || !indexer.rejected().is_empty() {
             break;
         }
     }
 
     println!(
-        "\nfinal state (Zone indexer: {} batches Verified, LEZ block {} covered):",
-        indexer.verified, indexer.reader.applied_block_id
+        "\nfinal state (Zone indexer: {} batches Verified, up to LEZ block {}):",
+        indexer.verified, indexer.verified_to
     );
     print_modules(&modules, &lez);
     println!(

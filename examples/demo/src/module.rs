@@ -203,11 +203,11 @@ mod test {
             root_after: module.reader.root_at(1).unwrap().to_vec(),
         };
         assert_eq!(module.compare(&honest), Ok(Some(())));
-        let forged = Batch {
+        let wrong_root = Batch {
             root_after: vec![0; 32],
             ..honest.clone()
         };
-        assert!(module.compare(&forged).is_err());
+        assert!(module.compare(&wrong_root).is_err());
         let future = Batch {
             to_lez_block_id: 2,
             ..honest

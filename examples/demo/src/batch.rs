@@ -60,14 +60,6 @@ impl Change {
         }
     }
 
-    /// Leaf index of a `Remove`, `None` for an `Insert`.
-    pub fn removed_leaf(&self) -> Option<u64> {
-        match &self.kind {
-            Some(Kind::Remove(r)) => Some(r.leaf_index),
-            _ => None,
-        }
-    }
-
     /// One-line description for logs.
     pub fn describe(&self) -> String {
         match &self.kind {

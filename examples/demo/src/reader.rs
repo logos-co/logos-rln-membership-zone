@@ -40,13 +40,21 @@ pub enum Removed {
     Slashed,
 }
 
+/// What one LEZ block did to the tree: the changes it produced and the root after it.
+#[derive(Debug, Clone)]
+struct Applied {
+    block_id: u64,
+    root: [u8; 32],
+    changes: Vec<Change>,
+}
+
 #[derive(Clone)]
 pub struct Reader {
     tree: OptimalMerkleTree<PoseidonHash>,
     live: HashMap<[u8; 32], Leaf>,
     removed: HashMap<[u8; 32], Removed>,
-    /// Every root this reader produced, tagged with the LEZ `block_id` that produced it.
-    roots: Vec<(u64, [u8; 32])>,
+    /// One entry per LEZ block applied, in order: the root history and the changes.
+    history: Vec<Applied>,
     /// Last LEZ `block_id` applied.
     pub applied_block_id: u64,
 }
@@ -57,7 +65,7 @@ impl Reader {
             tree: OptimalMerkleTree::default(TREE_DEPTH).expect("depth 20 tree"),
             live: HashMap::new(),
             removed: HashMap::new(),
-            roots: Vec::new(),
+            history: Vec::new(),
             applied_block_id: 0,
         }
     }
@@ -68,10 +76,25 @@ impl Reader {
 
     /// The root this reader held right after applying `block_id`, if it has applied it.
     pub fn root_at(&self, block_id: u64) -> Option<[u8; 32]> {
-        self.roots
+        self.history
             .iter()
-            .find(|(id, _)| *id == block_id)
-            .map(|(_, root)| *root)
+            .find(|applied| applied.block_id == block_id)
+            .map(|applied| applied.root)
+    }
+
+    /// The changes the LEZ blocks `from..=to` produced, in order, if this reader has applied
+    /// them all.
+    pub fn changes_in(&self, from: u64, to: u64) -> Option<Vec<Change>> {
+        if from == 0 || from > to || to > self.applied_block_id {
+            return None;
+        }
+        Some(
+            self.history
+                .iter()
+                .filter(|applied| (from..=to).contains(&applied.block_id))
+                .flat_map(|applied| applied.changes.iter().cloned())
+                .collect(),
+        )
     }
 
     /// Apply the derivation rules to one LEZ block and return the changes, in order.
@@ -147,8 +170,11 @@ impl Reader {
             changes.extend(self.remove(key, Removed::Expired));
         }
         self.applied_block_id = block.block_id;
-        self.roots
-            .push((block.block_id, fr_to_bytes_le(&self.tree.root())));
+        self.history.push(Applied {
+            block_id: block.block_id,
+            root: fr_to_bytes_le(&self.tree.root()),
+            changes: changes.clone(),
+        });
         changes
     }
 
@@ -159,21 +185,6 @@ impl Reader {
             .expect("index in range");
         self.removed.insert(key, cause);
         Some(Change::remove(leaf.leaf_index))
-    }
-
-    /// Live leaves that the `Slash` actions of `block` target (for the demo's
-    /// `--dishonest-sequencer`).
-    pub fn slash_targets(&self, block: &Block) -> Vec<u64> {
-        block
-            .actions
-            .iter()
-            .filter_map(|action| match action {
-                Action::Slash {
-                    identity_secret, ..
-                } => self.leaf_index(&Hasher::<PoseidonHash>::hash_single(*identity_secret)),
-                _ => None,
-            })
-            .collect()
     }
 
     pub fn leaf_index(&self, id_commitment: &Fr) -> Option<u64> {
@@ -274,5 +285,11 @@ pub(crate) mod test {
         assert_eq!(reader.root_at(1), reader.root_at(2));
         assert_eq!(reader.root_at(2), Some(fr_to_bytes_le(&reader.root())));
         assert_eq!(reader.root_at(3), None);
+        assert_eq!(
+            reader.changes_in(1, 2).map(|c| c.len()),
+            Some(1),
+            "one Insert over both blocks"
+        );
+        assert_eq!(reader.changes_in(1, 3), None);
     }
 }

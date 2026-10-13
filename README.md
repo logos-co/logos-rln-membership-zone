@@ -57,8 +57,8 @@ Module --Register--> LEZ registration program            (deposit, leaf index)
    A Module that starts syncs from a Zone indexer's snapshot, checked against a batch root.
 
 The Zone holds no funds.
-A dishonest Zone sequencer can delay a change but cannot forge one,
-and anyone can prove an omission from public data.
+A Zone sequencer can omit a change, which is provable censorship,
+but it cannot change what any Module derives from LEZ.
 
 ## Repository layout
 
@@ -69,7 +69,7 @@ examples/demo/                    end-to-end demo: mock LEZ, Zone sequencer, Zon
   src/reader.rs                   a reader: derivation rules and the tree, one root per LEZ block
   src/sequencer.rs                Zone sequencer: builds the batches
   src/batch.rs                    batch wire format (protobuf)
-  src/indexer.rs                  Zone indexer: checks the batches (range, changes, root), snapshot
+  src/indexer.rs                  Zone indexer: follows LEZ, checks the batches (range, changes, root), snapshot
   src/module.rs                   Module: own tree, membership status, root comparison
   src/main.rs                     scripted scenario, published through the Zone SDK
 devnet/run.sh                     local single-node Logos Blockchain (start, fund, status, stop, reset)
@@ -133,7 +133,7 @@ zone indexer: batch [4..4] Verified, root 7b1e52a0..
   module alice root at LEZ block 4 matches the batch
   module bob   root at LEZ block 4 matches the batch
 ...
-final state (Zone indexer: 9 batches Verified, LEZ block 13 covered):
+final state (Zone indexer: 9 batches Verified, up to LEZ block 13):
   module alice 2c8d0a91.. leaf  -  MEMBERSHIP_ERASED   (applied LEZ block 13, root 3e1f1922..)
   module bob   d4e67f13.. leaf  -  MEMBERSHIP_SLASHED  (applied LEZ block 13, root 3e1f1922..)
 LEZ balances: alice 9995, bob 6995, carol 0, treasury 3000, operator 10
@@ -141,11 +141,14 @@ LEZ balances: alice 9995, bob 6995, carol 0, treasury 3000, operator 10
 
 Identity commitments and roots differ per run; the balances do not.
 
-With `--dishonest-sequencer`, the Zone sequencer leaves bob's slash out of its batch.
+With `--dishonest-sequencer`, the Zone sequencer censors bob's slash:
+it keeps the leaf in its own tree, so its batch has neither the `Remove` nor the right root.
 The Zone indexer rejects that batch with
-`changes differ from LEZ (provable censorship or forgery): Remove leaf 1`
+`changes differ from LEZ: Remove leaf 1 omitted (provable censorship)`
 and waits for a correct batch continuing from the last verified one.
-The Modules read LEZ themselves, so bob is `MEMBERSHIP_SLASHED` in both trees all the same.
+The Modules read LEZ themselves, so bob is `MEMBERSHIP_SLASHED` in both trees all the same;
+each one only sees that its root differs from the batch (`DIVERGES from the Zone`),
+while the Zone indexer names the missing change.
 
 ### Tests
 
@@ -158,7 +161,8 @@ The unit tests cover:
 - the registration-program checks: tree capacity, grace period, single-use membership accounts;
 - the derivation rules: expiry order, `Extend`, slashing after expiry, one root per LEZ block;
 - the Module: the membership status cases of the RFC, also on a tree behind LEZ,
-  and the root comparison with a batch.
+  and the root comparison with a batch;
+- the Zone indexer: a Rejected batch changes nothing, the next batch continues from the last Verified one.
 
 ## References
 
