@@ -1,20 +1,25 @@
 //! End-to-end demo of the RLN Membership Zone RFC (`docs/rfc-rln-membership-zone.md`).
 //!
-//! One process plays every role:
+//! One process plays every role, named as in the RFC:
 //! - a mock LEZ with the registration program (`lez.rs`), producing one block per tick;
-//! - the Zone sequencer: turns new LEZ blocks into changes (`membership_set.rs`) and publishes
-//!   one batch (`batch.rs`) per tick on the real local chain through the Zone SDK;
-//! - a Zone indexer (`indexer.rs`): re-checks every finalized batch against LEZ and keeps the
-//!   registry view a Module would read.
+//! - a reader (`reader.rs`): the derivation rules and the tree, shared by the three roles below;
+//! - the Zone sequencer (`sequencer.rs`): builds one batch (`batch.rs`) per tick from the LEZ
+//!   blocks not covered yet and publishes it on the real local chain through the Zone SDK;
+//! - a Zone indexer (`indexer.rs`): checks every finalized batch against LEZ;
+//! - two Modules (`module.rs`), alice's and bob's: apply every LEZ block to their own tree,
+//!   report their membership status and compare their roots with the verified batches.
 //!
-//! The scripted scenario: alice and bob register, alice extends, bob double-signals and is
-//! slashed by carol, alice expires and erases. `--dishonest-sequencer` makes the Zone sequencer
-//! leave bob's slash out of its batch, which the Zone indexer detects (Zone Indexer check 2).
+//! The scripted scenario: alice and bob register, bob double-signals and is slashed by carol,
+//! alice extends, expires and erases. `--dishonest-sequencer` makes the Zone sequencer leave
+//! bob's slash out of its batch: the Zone indexer rejects it, while the Modules, which read LEZ
+//! themselves, are unaffected.
 
 mod batch;
 mod indexer;
 mod lez;
-mod membership_set;
+mod module;
+mod reader;
+mod sequencer;
 
 use std::time::Duration;
 
@@ -23,24 +28,26 @@ use clap::Parser;
 use lb_common_http_client::BasicAuthCredentials;
 use lb_core::mantle::{
     gas::GasCost,
-    ops::channel::{ChannelId, MsgId, inscribe::Inscription},
+    ops::channel::{ChannelId, MsgId},
 };
 use lb_key_management_system_service::keys::{ED25519_SECRET_KEY_SIZE, Ed25519Key, ZkPublicKey};
 use lb_zone_sdk::{
     CommonHttpClient,
     adapter::NodeHttpClient,
-    sequencer::{Error as SeqError, Event, FinalizedOp, FundingConfig, ZoneSequencer},
+    sequencer::{
+        Error as SeqError, Event, FinalizedOp, FundingConfig, ZoneSequencer as SdkSequencer,
+    },
 };
-use prost::Message;
 use rand::{RngCore, rngs::ThreadRng, thread_rng};
 use reqwest::Url;
-use rln::prelude::{Fr, IdentityKeys, PoseidonHash};
+use rln::prelude::{IdentityKeys, PoseidonHash};
 
 use crate::{
-    batch::Batch,
     indexer::ZoneIndexer,
-    lez::{ConfigState, Instruction, MockLez},
-    membership_set::{MembershipSet, fr_to_bytes_le, short},
+    lez::{Action, ConfigState, MockLez},
+    module::Module,
+    reader::short,
+    sequencer::ZoneSequencer,
 };
 
 /// LEZ timestamp advance per mock block.
@@ -105,35 +112,24 @@ fn script(block_id: u64) -> Vec<Step> {
                 active_duration_ms: 30_000,
             },
         ],
+        4 => vec![Step::Slash {
+            who: "bob",
+            by: "carol",
+        }],
         // Extend is accepted only in the grace period: alice's expires at 12000 ms, grace 4000 ms.
         5 => vec![Step::Extend {
             who: "alice",
             extra_ms: 4_000,
-        }],
-        4 => vec![Step::Slash {
-            who: "bob",
-            by: "carol",
         }],
         12 => vec![Step::Erase { who: "alice" }],
         _ => vec![],
     }
 }
 
-struct Member {
-    name: &'static str,
-    keys: IdentityKeys,
-}
-
-impl Member {
-    fn id_commitment(&self) -> Fr {
-        self.keys.id_commitment()
-    }
-}
-
-/// Build the registration-program instruction for a scripted step.
-fn to_instruction(step: &Step, members: &[Member], lez: &MockLez) -> Instruction {
-    let member = |name: &str| {
-        members
+/// Build the registration-program action for a scripted step.
+fn to_action(step: &Step, modules: &[Module], lez: &MockLez) -> Action {
+    let module = |name: &str| {
+        modules
             .iter()
             .find(|m| m.name == name)
             .expect("scripted member")
@@ -143,19 +139,19 @@ fn to_instruction(step: &Step, members: &[Member], lez: &MockLez) -> Instruction
             who,
             rate_limit,
             active_duration_ms,
-        } => Instruction::Register {
+        } => Action::Register {
             payer: (*who).into(),
-            id_commitment: member(who).id_commitment(),
+            id_commitment: module(who).id_commitment(),
             rate_limit: *rate_limit,
             expiry_timestamp_ms: lez.now() + active_duration_ms,
             leaf_index: 0,
         },
         Step::Extend { who, extra_ms } => {
-            let id_commitment = member(who).id_commitment();
+            let id_commitment = module(who).id_commitment();
             let expiry = lez
                 .membership(&id_commitment)
                 .map_or(0, |m| m.expiry_timestamp_ms);
-            Instruction::Extend {
+            Action::Extend {
                 holder: (*who).into(),
                 id_commitment,
                 expiry_timestamp_ms: expiry + extra_ms,
@@ -163,13 +159,13 @@ fn to_instruction(step: &Step, members: &[Member], lez: &MockLez) -> Instruction
         }
         // In reality the slasher learns the secret from `validate_proof`
         // (PROOF_RATE_LIMIT_VIOLATION, `recovered_secret`); here we take it directly.
-        Step::Slash { who, by } => Instruction::Slash {
+        Step::Slash { who, by } => Action::Slash {
             slasher: (*by).into(),
-            identity_secret: *member(who).keys.identity_secret(),
+            identity_secret: *module(who).keys.identity_secret(),
         },
-        Step::Erase { who } => Instruction::Erase {
+        Step::Erase { who } => Action::Erase {
             holder: (*who).into(),
-            id_commitment: member(who).id_commitment(),
+            id_commitment: module(who).id_commitment(),
         },
     }
 }
@@ -187,52 +183,21 @@ fn parse_funding_pk(hex_str: &str) -> Result<ZkPublicKey> {
     ))
 }
 
-/// Build the next batch from every LEZ block after `zone.to_lez_block_id`, ending early at a block
-/// boundary when the encoded batch would not fit in one inscription (RFC "Zone Sequencer").
-/// Returns the batch, its inscription and the Zone sequencer's view after it.
-fn build_batch(
-    zone: &MembershipSet,
-    lez: &MockLez,
-    dishonest: bool,
-) -> Result<(Batch, Inscription, MembershipSet)> {
-    let from = zone.to_lez_block_id + 1;
-    let mut next = zone.clone();
-    let mut changes = vec![];
-    let mut fitted = None;
-    for block in lez.blocks(from, lez.last_finalized_block_id()) {
-        let slashed = if dishonest {
-            next.slash_targets(block)
-        } else {
-            vec![]
-        };
-        changes.extend(next.apply_block(block));
-        changes.retain(|c| c.removed_leaf().is_none_or(|leaf| !slashed.contains(&leaf)));
-        let batch = Batch {
-            from_lez_block_id: from,
-            to_lez_block_id: block.block_id,
-            changes: changes.clone(),
-            root_after: fr_to_bytes_le(&next.root()).to_vec(),
-        };
-        match Inscription::try_from(batch.encode_to_vec()) {
-            Ok(inscription) => fitted = Some((batch, inscription, next.clone())),
-            Err(_) => break,
-        }
-    }
-    fitted.ok_or_else(|| anyhow!("LEZ block {from} alone exceeds one inscription"))
-}
-
-fn print_view(indexer: &ZoneIndexer, members: &[Member], lez: &MockLez) {
-    for m in members {
-        let leaf = indexer
-            .membership_set
+/// One line per Module: its leaf in its own tree and its membership status.
+fn print_modules(modules: &[Module], lez: &MockLez) {
+    for m in modules {
+        let leaf = m
+            .reader
             .leaf_index(&m.id_commitment())
             .map_or("-".into(), |i| i.to_string());
         println!(
-            "      {:5} {}.. leaf {:>2}  {}",
+            "  module {:5} {}.. leaf {:>2}  {}  (applied LEZ block {}, root {}..)",
             m.name,
             short(&m.id_commitment()),
             leaf,
-            indexer.membership_set.status(&m.id_commitment(), lez)
+            m.status(lez),
+            m.reader.applied_block_id,
+            short(&m.reader.root())
         );
     }
 }
@@ -263,13 +228,15 @@ async fn main() -> Result<()> {
         .map(|u| BasicAuthCredentials::new(u, args.node_auth_password));
     let node_url: Url = args.node_url.parse().context("invalid NODE_URL")?;
     let node = NodeHttpClient::new(CommonHttpClient::new(auth), node_url.clone());
-    let mut sequencer = ZoneSequencer::init(channel_id, signing_key, node, funding, None);
+    let mut sdk = SdkSequencer::init(channel_id, signing_key, node, funding, None);
 
-    let members: Vec<Member> = ["alice", "bob"]
+    let mut modules: Vec<Module> = ["alice", "bob"]
         .into_iter()
-        .map(|name| Member {
-            name,
-            keys: IdentityKeys::generate::<PoseidonHash, ThreadRng>(&mut thread_rng()),
+        .map(|name| {
+            Module::new(
+                name,
+                IdentityKeys::generate::<PoseidonHash, ThreadRng>(&mut thread_rng()),
+            )
         })
         .collect();
     let config = ConfigState {
@@ -285,15 +252,15 @@ async fn main() -> Result<()> {
         operator_account_id: "operator".into(),
     };
     let mut lez = MockLez::new(config, &[("alice", 10_000), ("bob", 10_000)]);
-    let mut zone = MembershipSet::new(); // the Zone sequencer's own view
+    let mut zone_sequencer = ZoneSequencer::new(args.dishonest_sequencer);
     let mut indexer = ZoneIndexer::new();
 
     println!("RLN Membership Zone demo");
     println!("  node     {node_url}");
     println!("  channel  {}", hex::encode(channel_id.as_ref()));
     println!(
-        "  members  {}",
-        members
+        "  modules  {}",
+        modules
             .iter()
             .map(|m| format!("{} {}..", m.name, short(&m.id_commitment())))
             .collect::<Vec<_>>()
@@ -310,7 +277,7 @@ async fn main() -> Result<()> {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            event = sequencer.next_event() => match event {
+            event = sdk.next_event() => match event {
                 Event::Ready => {
                     if !ready { println!("ready\n"); }
                     ready = true;
@@ -330,41 +297,57 @@ async fn main() -> Result<()> {
                         if in_flight == Some(info.this_msg) {
                             in_flight = None;
                         }
+                        // The Zone indexer checks the batch; the Modules compare their roots with it.
                         match indexer.on_batch(&info.payload, &lez) {
-                            Ok(b) => {
-                                println!("  zone indexer: finalized batch [{}..{}] verified, root {}..", b.from_lez_block_id, b.to_lez_block_id, hex::encode(&b.root_after[..4]));
-                                print_view(&indexer, &members, &lez);
+                            Ok(batch) => {
+                                println!("zone indexer: batch [{}..{}] Verified, root {}..", batch.from_lez_block_id, batch.to_lez_block_id, hex::encode(&batch.root_after[..4]));
+                                for m in &modules {
+                                    match m.compare(&batch) {
+                                        Ok(Some(())) => println!("  module {:5} root at LEZ block {} matches the batch", m.name, batch.to_lez_block_id),
+                                        Ok(None) => println!("  module {:5} has not applied LEZ block {} yet", m.name, batch.to_lez_block_id),
+                                        Err(reason) => println!("  module {:5} DIVERGES from the Zone: {reason}", m.name),
+                                    }
+                                }
                             }
-                            Err(reason) => println!("  zone indexer: REJECTED: {reason}"),
+                            Err(reason) => println!("zone indexer: batch REJECTED: {reason}"),
                         }
                     }
                 }
                 _ => {}
             },
             _ = tick.tick(), if ready => {
-                // 1. LEZ: run this block's scripted transactions, then close the block.
-                if lez.last_finalized_block_id() < LAST_BLOCK {
-                    let block_id = lez.last_finalized_block_id() + 1;
+                // 1. LEZ: run this block's scripted actions, then close the block.
+                if lez.last_block_id() < LAST_BLOCK {
+                    let block_id = lez.last_block_id() + 1;
                     for step in script(block_id) {
-                        let instruction = to_instruction(&step, &members, &lez);
-                        let label = format!("{instruction:?}").split_whitespace().next().unwrap_or("").to_owned();
-                        match lez.submit(instruction) {
+                        let action = to_action(&step, &modules, &lez);
+                        let label = format!("{action:?}").split_whitespace().next().unwrap_or("").to_owned();
+                        match lez.submit(action) {
                             Ok(()) => println!("LEZ block {block_id}: {label} ok"),
                             Err(e) => println!("LEZ block {block_id}: {label} REVERTED: {e}"),
                         }
                     }
-                    lez.produce_block(BLOCK_MS);
+                    let block = lez.produce_block(BLOCK_MS).clone();
+                    // 2. Modules: every reader applies the closed block to its own tree.
+                    let before: Vec<_> = modules.iter().map(|m| m.status(&lez)).collect();
+                    for m in &mut modules {
+                        m.apply_block(&block);
+                    }
+                    let after: Vec<_> = modules.iter().map(|m| m.status(&lez)).collect();
+                    if before != after || !block.actions.is_empty() {
+                        print_modules(&modules, &lez);
+                    }
                 }
-                // 2. Zone sequencer: one batch covering the LEZ blocks not covered yet, with at
+                // 3. Zone sequencer: one batch covering the LEZ blocks not covered yet, with at
                 //    most one batch in flight (each in-flight transaction holds one fee note).
-                if in_flight.is_none() && zone.to_lez_block_id < lez.last_finalized_block_id() {
-                    let (batch, inscription, next) = build_batch(&zone, &lez, args.dishonest_sequencer)?;
-                    match sequencer.handle().publish(inscription).await {
+                if in_flight.is_none() && zone_sequencer.covered_block_id() < lez.last_block_id() {
+                    let (batch, inscription, next) = zone_sequencer.build_batch(&lez)?;
+                    match sdk.handle().publish(inscription).await {
                         Ok((result, _checkpoint)) => {
                             in_flight = Some(result.tx.inscription().this_msg);
                             let described: Vec<_> = batch.changes.iter().map(|c| c.describe()).collect();
                             println!("zone sequencer: batch [{}..{}] published: {}", batch.from_lez_block_id, batch.to_lez_block_id, if described.is_empty() { "no changes".into() } else { described.join("; ") });
-                            zone = next;
+                            zone_sequencer.commit(next);
                         }
                         Err(SeqError::Unavailable { reason }) => println!("zone sequencer: not ready ({reason}), retry next tick"),
                         Err(e) => return Err(anyhow!("publish failed: {e}")),
@@ -375,16 +358,16 @@ async fn main() -> Result<()> {
         }
         // The demo stops at the first rejection: the dishonest sequencer never publishes a
         // correct batch, so the Zone indexer would wait forever.
-        if indexer.membership_set.to_lez_block_id >= LAST_BLOCK || !indexer.rejected().is_empty() {
+        if indexer.reader.applied_block_id >= LAST_BLOCK || !indexer.rejected().is_empty() {
             break;
         }
     }
 
     println!(
-        "\nfinal registry view (Zone indexer, {} batches verified):",
-        indexer.verified
+        "\nfinal state (Zone indexer: {} batches Verified, LEZ block {} covered):",
+        indexer.verified, indexer.reader.applied_block_id
     );
-    print_view(&indexer, &members, &lez);
+    print_modules(&modules, &lez);
     println!(
         "LEZ balances: alice {}, bob {}, carol {}, treasury {}, operator {}",
         lez.balance("alice"),

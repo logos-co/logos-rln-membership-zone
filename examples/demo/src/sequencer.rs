@@ -1,0 +1,68 @@
+//! The Zone sequencer (RFC "Zone Sequencer"): a reader that turns the LEZ blocks it has not
+//! covered yet into one batch and publishes it on Bedrock. Publishing itself goes through the
+//! Zone SDK in `main.rs`; this is the batch building.
+
+use anyhow::{Result, anyhow};
+use lb_core::mantle::ops::channel::inscribe::Inscription;
+use prost::Message;
+
+use crate::{
+    batch::Batch,
+    lez::MockLez,
+    reader::{Reader, fr_to_bytes_le},
+};
+
+pub struct ZoneSequencer {
+    reader: Reader,
+    /// Leave every `Slash` out of the batches: the dishonest Zone sequencer of the demo.
+    dishonest: bool,
+}
+
+impl ZoneSequencer {
+    pub fn new(dishonest: bool) -> Self {
+        Self {
+            reader: Reader::new(),
+            dishonest,
+        }
+    }
+
+    /// Last LEZ block covered by a batch this sequencer published.
+    pub fn covered_block_id(&self) -> u64 {
+        self.reader.applied_block_id
+    }
+
+    /// Build the next batch from every LEZ block after the last covered one, ending early at a
+    /// block boundary when the encoded batch would not fit in one inscription. Returns the
+    /// batch, its inscription and the reader state to commit once the batch is published.
+    pub fn build_batch(&self, lez: &MockLez) -> Result<(Batch, Inscription, Reader)> {
+        let from = self.reader.applied_block_id + 1;
+        let mut next = self.reader.clone();
+        let mut changes = vec![];
+        let mut fitted = None;
+        for block in lez.blocks(from, lez.last_block_id()) {
+            let slashed = if self.dishonest {
+                next.slash_targets(block)
+            } else {
+                vec![]
+            };
+            changes.extend(next.apply_block(block));
+            changes.retain(|c| c.removed_leaf().is_none_or(|leaf| !slashed.contains(&leaf)));
+            let batch = Batch {
+                from_lez_block_id: from,
+                to_lez_block_id: block.block_id,
+                changes: changes.clone(),
+                root_after: fr_to_bytes_le(&next.root()).to_vec(),
+            };
+            match Inscription::try_from(batch.encode_to_vec()) {
+                Ok(inscription) => fitted = Some((batch, inscription, next.clone())),
+                Err(_) => break,
+            }
+        }
+        fitted.ok_or_else(|| anyhow!("LEZ block {from} alone exceeds one inscription"))
+    }
+
+    /// The batch is published: adopt the reader state it was built from.
+    pub fn commit(&mut self, next: Reader) {
+        self.reader = next;
+    }
+}

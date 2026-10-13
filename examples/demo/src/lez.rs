@@ -1,7 +1,7 @@
 //! In-memory stand-in for LEZ and the registration program (RFC "LEZ Requirements").
 //!
 //! Only what the Zone needs is modelled: blocks with a timestamp, the successful
-//! registration-program transactions of each block, membership accounts and balances. A block
+//! registration-program actions of each block, membership accounts and balances. A block
 //! is readable as soon as it is produced, as the RFC trusts the LEZ Sequencer to serve closed
 //! blocks without ever changing them.
 
@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use rln::prelude::{Fr, Hasher, PoseidonHash};
 
-use crate::membership_set::{TREE_DEPTH, fr_to_bytes_le};
+use crate::reader::{TREE_DEPTH, fr_to_bytes_le};
 
 /// `ConfigState`, the configuration account of the registry (durations in milliseconds).
 #[derive(Debug, Clone)]
@@ -40,17 +40,27 @@ pub struct MembershipState {
 }
 
 /// A membership account as LEZ shows it. A LEZ account never returns to its default
-/// state, so `Erase` and `Slash` leave it `Closed`.
+/// state, so `Erase` and `Slash` leave it closed; which one closed it is read from LEZ.
 #[derive(Debug, Clone, Copy)]
 pub enum MembershipAccount<'a> {
     Default,
     Open(&'a MembershipState),
-    Closed,
+    ClosedByErase,
+    ClosedBySlash,
 }
 
-/// A registration-program instruction. Only successful ones are recorded in blocks.
+/// What a membership account holds once it exists.
 #[derive(Debug, Clone)]
-pub enum Instruction {
+enum Slot {
+    Open(MembershipState),
+    ClosedByErase,
+    ClosedBySlash,
+}
+
+/// A registration-program action (RFC "LEZ Requirements / Actions"). Only successful ones are
+/// recorded in blocks.
+#[derive(Debug, Clone)]
+pub enum Action {
     Register {
         payer: String,
         id_commitment: Fr,
@@ -76,24 +86,23 @@ pub enum Instruction {
     },
 }
 
-/// A LEZ block as the Zone sees it: `block_id`, `timestamp`, registration-program transactions.
+/// A LEZ block as the Zone sees it: `block_id`, `timestamp`, registration-program actions.
 #[derive(Debug, Clone)]
 pub struct Block {
     pub block_id: u64,
     pub timestamp: u64,
-    pub transactions: Vec<Instruction>,
+    pub actions: Vec<Action>,
 }
 
 pub struct MockLez {
     pub config: ConfigState,
     blocks: Vec<Block>,
-    pending: Vec<Instruction>,
+    pending: Vec<Action>,
     /// `CLOCK_01` timestamp: the timestamp of the last block.
     timestamp: u64,
     /// `ConfigState.next_index`: next free leaf index.
     next_index: u64,
-    /// `None` once closed by `Erase` or `Slash`.
-    memberships: HashMap<[u8; 32], Option<MembershipState>>,
+    memberships: HashMap<[u8; 32], Slot>,
     balances: HashMap<String, u128>,
 }
 
@@ -116,7 +125,7 @@ impl MockLez {
         self.timestamp
     }
 
-    pub fn last_finalized_block_id(&self) -> u64 {
+    pub fn last_block_id(&self) -> u64 {
         self.blocks.last().map_or(0, |b| b.block_id)
     }
 
@@ -127,8 +136,9 @@ impl MockLez {
     pub fn membership_account(&self, id_commitment: &Fr) -> MembershipAccount<'_> {
         match self.memberships.get(&fr_to_bytes_le(id_commitment)) {
             None => MembershipAccount::Default,
-            Some(Some(membership)) => MembershipAccount::Open(membership),
-            Some(None) => MembershipAccount::Closed,
+            Some(Slot::Open(membership)) => MembershipAccount::Open(membership),
+            Some(Slot::ClosedByErase) => MembershipAccount::ClosedByErase,
+            Some(Slot::ClosedBySlash) => MembershipAccount::ClosedBySlash,
         }
     }
 
@@ -147,13 +157,13 @@ impl MockLez {
         &self.blocks[(from - 1) as usize..to as usize]
     }
 
-    /// Execute a transaction against the registration program, per the RFC "LEZ Requirements".
+    /// Execute an action against the registration program, per the RFC "LEZ Requirements".
     /// On success it is queued for the next block.
-    pub fn submit(&mut self, mut instruction: Instruction) -> Result<(), String> {
+    pub fn submit(&mut self, mut action: Action) -> Result<(), String> {
         let config = self.config.clone();
         let now = self.timestamp;
-        match &instruction {
-            Instruction::Register {
+        match &action {
+            Action::Register {
                 payer,
                 id_commitment,
                 rate_limit,
@@ -191,9 +201,9 @@ impl MockLez {
                     holder: payer.clone(),
                     deposit_amount,
                 };
-                self.memberships.insert(key, Some(membership));
+                self.memberships.insert(key, Slot::Open(membership));
             }
-            Instruction::Extend {
+            Action::Extend {
                 holder,
                 id_commitment,
                 expiry_timestamp_ms,
@@ -215,13 +225,13 @@ impl MockLez {
                     );
                 }
                 // Accept.
-                self.memberships
-                    .get_mut(&fr_to_bytes_le(id_commitment))
-                    .and_then(Option::as_mut)
-                    .expect("checked")
-                    .expiry_timestamp_ms = *expiry_timestamp_ms;
+                if let Some(Slot::Open(membership)) =
+                    self.memberships.get_mut(&fr_to_bytes_le(id_commitment))
+                {
+                    membership.expiry_timestamp_ms = *expiry_timestamp_ms;
+                }
             }
-            Instruction::Erase {
+            Action::Erase {
                 holder,
                 id_commitment,
             } => {
@@ -231,10 +241,11 @@ impl MockLez {
                     return Err("withdrawal delay not elapsed".into());
                 }
                 // Accept: refund the holder and empty the membership account.
-                self.memberships.insert(fr_to_bytes_le(id_commitment), None);
+                self.memberships
+                    .insert(fr_to_bytes_le(id_commitment), Slot::ClosedByErase);
                 self.credit(&membership.holder, membership.deposit_amount);
             }
-            Instruction::Slash {
+            Action::Slash {
                 identity_secret, ..
             } => {
                 // Membership.
@@ -242,27 +253,27 @@ impl MockLez {
                 let membership = self.open_membership(&id_commitment, None)?;
                 // Accept: the whole deposit to the treasury (a slasher reward is RFC Q5).
                 self.memberships
-                    .insert(fr_to_bytes_le(&id_commitment), None);
+                    .insert(fr_to_bytes_le(&id_commitment), Slot::ClosedBySlash);
                 self.credit(&config.treasury_account_id, membership.deposit_amount);
             }
         }
-        // Record the assigned leaf index in the executed transaction, where the Zone reads it.
-        if let Instruction::Register { leaf_index, .. } = &mut instruction {
+        // Record the assigned leaf index in the executed action, where readers read it.
+        if let Action::Register { leaf_index, .. } = &mut action {
             *leaf_index = self.next_index;
             self.next_index += 1;
         }
-        self.pending.push(instruction);
+        self.pending.push(action);
         Ok(())
     }
 
-    /// Close the current block: advance the timestamp and record the queued transactions.
-    /// The clock program runs last, so transactions in a block see the previous timestamp.
+    /// Close the current block: advance the timestamp and record the queued actions.
+    /// The clock program runs last, so actions in a block see the previous timestamp.
     pub fn produce_block(&mut self, step_ms: u64) -> &Block {
         self.timestamp += step_ms;
         let block = Block {
-            block_id: self.last_finalized_block_id() + 1,
+            block_id: self.last_block_id() + 1,
             timestamp: self.timestamp,
-            transactions: std::mem::take(&mut self.pending),
+            actions: std::mem::take(&mut self.pending),
         };
         self.blocks.push(block);
         self.blocks.last().expect("just pushed")
@@ -323,12 +334,8 @@ pub(crate) mod test {
         IdentityKeys::generate::<PoseidonHash, ThreadRng>(&mut thread_rng())
     }
 
-    pub(crate) fn register(
-        payer: &str,
-        keys: &IdentityKeys,
-        expiry_timestamp_ms: u64,
-    ) -> Instruction {
-        Instruction::Register {
+    pub(crate) fn register(payer: &str, keys: &IdentityKeys, expiry_timestamp_ms: u64) -> Action {
+        Action::Register {
             payer: payer.into(),
             id_commitment: keys.id_commitment(),
             rate_limit: 100,
@@ -352,7 +359,7 @@ pub(crate) mod test {
         let mut lez = new_lez();
         let keys = new_keys();
         lez.submit(register("alice", &keys, 8_000)).unwrap();
-        let extend = |expiry_timestamp_ms| Instruction::Extend {
+        let extend = |expiry_timestamp_ms| Action::Extend {
             holder: "alice".into(),
             id_commitment: keys.id_commitment(),
             expiry_timestamp_ms,
@@ -375,14 +382,14 @@ pub(crate) mod test {
         let keys = new_keys();
         lez.submit(register("alice", &keys, 4_000)).unwrap();
         lez.produce_block(10_000);
-        lez.submit(Instruction::Erase {
+        lez.submit(Action::Erase {
             holder: "alice".into(),
             id_commitment: keys.id_commitment(),
         })
         .unwrap();
         assert!(matches!(
             lez.membership_account(&keys.id_commitment()),
-            MembershipAccount::Closed
+            MembershipAccount::ClosedByErase
         ));
         let err = lez.submit(register("alice", &keys, 20_000)).unwrap_err();
         assert_eq!(err, "membership account already used");

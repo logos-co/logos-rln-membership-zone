@@ -64,11 +64,13 @@ and anyone can prove an omission from public data.
 
 ```text
 docs/rfc-rln-membership-zone.md   the specification (raw LIP draft)
-examples/demo/                    end-to-end demo: mock LEZ, Zone sequencer, Zone indexer
-  src/lez.rs                      mock LEZ and registration program (ConfigState, MembershipState)
-  src/membership_set.rs           membership set, derivation rules, membership status
+examples/demo/                    end-to-end demo: mock LEZ, Zone sequencer, Zone indexer, Modules
+  src/lez.rs                      mock LEZ and registration program (ConfigState, MembershipState, Action)
+  src/reader.rs                   a reader: derivation rules and the tree, one root per LEZ block
+  src/sequencer.rs                Zone sequencer: builds the batches
   src/batch.rs                    batch wire format (protobuf)
-  src/indexer.rs                  Zone indexer verification (range, changes, root)
+  src/indexer.rs                  Zone indexer: checks the batches (range, changes, root), snapshot
+  src/module.rs                   Module: own tree, membership status, root comparison
   src/main.rs                     scripted scenario, published through the Zone SDK
 devnet/run.sh                     local single-node Logos Blockchain (start, fund, status, stop, reset)
 logos-blockchain/                 git submodule pinned to node release 0.3.0 (Zone SDK path dependencies)
@@ -117,21 +119,33 @@ The demo runs a short script:
 3. Bob double-signals and carol slashes him; his whole deposit goes to the treasury.
 4. Alice's membership expires and she erases it.
 
-On each tick LEZ produces one block and the Zone sequencer publishes one batch.
-After every finalized batch, the Zone indexer prints the registry view:
+On each tick LEZ produces one block, alice's and bob's Modules apply it to their own trees
+and print their membership status when it changes, and the Zone sequencer publishes one batch.
+After every finalized batch the Zone indexer prints its verdict,
+and each Module compares its root at the batch's last LEZ block with the batch:
 
 ```text
-zone sequencer: batch [2..12] published: Remove leaf 1; Remove leaf 0
-  zone indexer: finalized batch [2..12] verified, root 3e1f1922..
-      alice a5f54b28.. leaf  -  MEMBERSHIP_ERASED
-      bob   54f94d5e.. leaf  -  MEMBERSHIP_SLASHED
+LEZ block 4: Slash ok
+  module alice 2c8d0a91.. leaf  0  MEMBERSHIP_ACTIVE   (applied LEZ block 4, root 7b1e52a0..)
+  module bob   d4e67f13.. leaf  -  MEMBERSHIP_SLASHED  (applied LEZ block 4, root 7b1e52a0..)
+zone sequencer: batch [4..4] published: Remove leaf 1
+zone indexer: batch [4..4] Verified, root 7b1e52a0..
+  module alice root at LEZ block 4 matches the batch
+  module bob   root at LEZ block 4 matches the batch
+...
+final state (Zone indexer: 9 batches Verified, LEZ block 13 covered):
+  module alice 2c8d0a91.. leaf  -  MEMBERSHIP_ERASED   (applied LEZ block 13, root 3e1f1922..)
+  module bob   d4e67f13.. leaf  -  MEMBERSHIP_SLASHED  (applied LEZ block 13, root 3e1f1922..)
 LEZ balances: alice 9995, bob 6995, carol 0, treasury 3000, operator 10
 ```
+
+Identity commitments and roots differ per run; the balances do not.
 
 With `--dishonest-sequencer`, the Zone sequencer leaves bob's slash out of its batch.
 The Zone indexer rejects that batch with
 `changes differ from LEZ (provable censorship or forgery): Remove leaf 1`
 and waits for a correct batch continuing from the last verified one.
+The Modules read LEZ themselves, so bob is `MEMBERSHIP_SLASHED` in both trees all the same.
 
 ### Tests
 
@@ -142,8 +156,9 @@ cargo test -p demo
 The unit tests cover:
 
 - the registration-program checks: tree capacity, grace period, single-use membership accounts;
-- the derivation rules: expiry order, `Extend`, slashing after expiry;
-- the membership status table of the RFC.
+- the derivation rules: expiry order, `Extend`, slashing after expiry, one root per LEZ block;
+- the Module: the membership status cases of the RFC, also on a tree behind LEZ,
+  and the root comparison with a batch.
 
 ## References
 
