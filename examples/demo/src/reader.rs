@@ -4,12 +4,12 @@
 
 use std::collections::HashMap;
 
-use rln::prelude::{CanonicalSerialize, Fr, Hasher, PoseidonHash};
+use rln::prelude::{CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, PoseidonHash};
 use zerokit_utils::merkle_tree::{OptimalMerkleTree, ZerokitMerkleTree};
 
 use crate::{
     batch::Change,
-    lez::{Action, Block},
+    lez::{Action, Block, MockLez},
 };
 
 pub const TREE_DEPTH: usize = 20;
@@ -57,6 +57,8 @@ pub struct Reader {
     history: Vec<Applied>,
     /// Last LEZ `block_id` applied.
     pub applied_block_id: u64,
+    /// `timestamp` of the last LEZ block applied: the clock this reader's tree is at.
+    pub applied_timestamp: u64,
 }
 
 impl Reader {
@@ -67,6 +69,7 @@ impl Reader {
             removed: HashMap::new(),
             history: Vec::new(),
             applied_block_id: 0,
+            applied_timestamp: 0,
         }
     }
 
@@ -170,6 +173,7 @@ impl Reader {
             changes.extend(self.remove(key, Removed::Expired));
         }
         self.applied_block_id = block.block_id;
+        self.applied_timestamp = block.timestamp;
         self.history.push(Applied {
             block_id: block.block_id,
             root: fr_to_bytes_le(&self.tree.root()),
@@ -185,6 +189,44 @@ impl Reader {
             .expect("index in range");
         self.removed.insert(key, cause);
         Some(Change::remove(leaf.leaf_index))
+    }
+
+    /// Check a snapshot's leaves against LEZ (RFC "Module Requirements / Sync"). The root
+    /// commits the leaves but not whose they are or when they expire, so every non-empty leaf
+    /// must come with an identity commitment whose open membership account reproduces it
+    /// (`leaf_index`, `poseidon(id_commitment, rate_limit)`), and its expiry is taken from that
+    /// account.
+    pub fn check_against_lez(&mut self, lez: &MockLez) -> Result<(), String> {
+        for index in 0..self.tree.leaves_set() {
+            let leaf = self.tree.get(index).map_err(|e| e.to_string())?;
+            if leaf == Fr::default() {
+                continue;
+            }
+            let (key, _) = self
+                .live
+                .iter()
+                .find(|(_, tracked)| tracked.leaf_index == index as u64)
+                .map(|(key, tracked)| (*key, *tracked))
+                .ok_or(format!(
+                    "leaf {index} has no identity commitment in the snapshot"
+                ))?;
+            let id_commitment = Fr::deserialize_compressed(&key[..]).map_err(|e| e.to_string())?;
+            let membership = lez.membership(&id_commitment).ok_or(format!(
+                "leaf {index} has no open membership account on LEZ"
+            ))?;
+            if membership.leaf_index != index as u64
+                || Hasher::<PoseidonHash>::hash_pair(id_commitment, Fr::from(membership.rate_limit))
+                    != leaf
+            {
+                return Err(format!(
+                    "leaf {index} does not match its membership account"
+                ));
+            }
+            if let Some(tracked) = self.live.get_mut(&key) {
+                tracked.expiry_timestamp_ms = membership.expiry_timestamp_ms;
+            }
+        }
+        Ok(())
     }
 
     pub fn leaf_index(&self, id_commitment: &Fr) -> Option<u64> {

@@ -5,13 +5,21 @@
 
 use prost::Message;
 
-use crate::{batch::Batch, lez::Block, reader::Reader};
+use crate::{
+    batch::Batch,
+    lez::{Block, FIRST_LEZ_BLOCK_ID},
+    reader::Reader,
+};
 
 pub struct ZoneIndexer {
     pub reader: Reader,
     /// `to_lez_block_id` of the last Verified batch: where the next batch must start.
     pub verified_to: u64,
     pub verified: u64,
+    /// The tree at `verified_to`: what a snapshot may hand out, since a Module can check it.
+    verified_reader: Reader,
+    /// LEZ blocks applied after `verified_to`, to bring `verified_reader` forward.
+    unverified_blocks: Vec<Block>,
     /// Rejected batches, kept as evidence.
     rejected: Vec<String>,
 }
@@ -20,8 +28,10 @@ impl ZoneIndexer {
     pub fn new() -> Self {
         Self {
             reader: Reader::new(),
-            verified_to: 0,
+            verified_to: FIRST_LEZ_BLOCK_ID - 1,
             verified: 0,
+            verified_reader: Reader::new(),
+            unverified_blocks: Vec::new(),
             rejected: Vec::new(),
         }
     }
@@ -33,14 +43,15 @@ impl ZoneIndexer {
     /// Apply a LEZ block, as every reader does, as soon as it is closed.
     pub fn apply_block(&mut self, block: &Block) {
         self.reader.apply_block(block);
+        self.unverified_blocks.push(block.clone());
     }
 
-    /// A snapshot for a syncing Module, tagged with the last Verified batch: the Module checks
-    /// the snapshot's root at that LEZ block against the batch's `root_after` before using it
-    /// (RFC "Module Requirements / Sync").
+    /// A snapshot for a syncing Module: the tree at the last Verified batch's
+    /// `to_lez_block_id`, so the Module can check its root against that batch before applying
+    /// the LEZ blocks since (RFC "Module Requirements / Sync").
     #[allow(dead_code)]
     pub fn snapshot(&self) -> (u64, Reader) {
-        (self.verified_to, self.reader.clone())
+        (self.verified_to, self.verified_reader.clone())
     }
 
     /// Check one batch. A Rejected batch is recorded and skipped; `verified_to` stays where the
@@ -92,13 +103,26 @@ impl ZoneIndexer {
         }
 
         // Root: the root after the changes.
-        if self.reader.root_at(batch.to_lez_block_id) != batch.root_after.as_slice().try_into().ok()
-        {
+        let root_after: [u8; 32] = batch
+            .root_after
+            .as_slice()
+            .try_into()
+            .map_err(|_| "root_after is not 32 bytes")?;
+        if self.reader.root_at(batch.to_lez_block_id) != Some(root_after) {
             return Err("root_after does not match the derived root".into());
         }
 
         self.verified_to = batch.to_lez_block_id;
         self.verified += 1;
+        // Bring the snapshot tree up to the Verified batch.
+        let still_unverified = self
+            .unverified_blocks
+            .iter()
+            .position(|b| b.block_id > self.verified_to)
+            .unwrap_or(self.unverified_blocks.len());
+        for block in self.unverified_blocks.drain(..still_unverified) {
+            self.verified_reader.apply_block(&block);
+        }
         Ok(batch)
     }
 }
@@ -149,9 +173,12 @@ mod test {
         let mut indexer = synced(&lez);
         let reader = indexer.reader.clone();
         let honest = |from, to| batch(&reader, from, to, reader.changes_in(from, to).unwrap());
-        // Block 1 Verified.
+        // Block 1 Verified; the snapshot stops there even though the tree is at block 3.
         assert!(indexer.on_batch(&honest(1, 1)).is_ok());
         assert_eq!(indexer.verified_to, 1);
+        let (tag, snapshot) = indexer.snapshot();
+        assert_eq!((tag, snapshot.applied_block_id), (1, 1));
+        assert_eq!(snapshot.root_at(1), reader.root_at(1));
         // Block 2 without the Remove: Rejected, the mark stays.
         let censored = batch(&reader, 2, 2, vec![]);
         let err = indexer.on_batch(&censored).unwrap_err();
@@ -162,6 +189,7 @@ mod test {
         // The correct block 2 batch is Verified.
         assert!(indexer.on_batch(&honest(2, 2)).is_ok());
         assert_eq!((indexer.verified_to, indexer.verified), (2, 2));
+        assert_eq!(indexer.snapshot().1.applied_block_id, 2);
         assert_eq!(indexer.rejected().len(), 2);
     }
 }

@@ -6,8 +6,9 @@
 //! - the Zone sequencer (`sequencer.rs`): builds one batch (`batch.rs`) per tick from the LEZ
 //!   blocks not covered yet and publishes it on the real local chain through the Zone SDK;
 //! - a Zone indexer (`indexer.rs`): checks every finalized batch against LEZ;
-//! - two Modules (`module.rs`), alice's and bob's: apply every LEZ block to their own tree,
-//!   report their membership status and compare their roots with the verified batches.
+//! - three Modules (`module.rs`): alice's and bob's apply every LEZ block to their own tree,
+//!   report their membership status and compare their roots with the batches; carol's starts
+//!   late and syncs from the Zone indexer's snapshot, checked against a batch and against LEZ.
 //!
 //! The scripted scenario: alice and bob register, bob double-signals and is slashed by carol,
 //! alice extends, expires and erases. `--dishonest-sequencer` makes the Zone sequencer omit
@@ -57,6 +58,8 @@ use crate::{
 const BLOCK_MS: u64 = 2_000;
 /// Last scripted LEZ block; the demo ends once the Zone indexer has verified it.
 const LAST_BLOCK: u64 = 13;
+/// LEZ block at which carol's Module starts, with no tree yet.
+const LATE_MODULE_BLOCK: u64 = 6;
 
 #[derive(Parser, Debug)]
 #[command(about = "RLN Membership Zone end-to-end demo")]
@@ -257,6 +260,8 @@ async fn main() -> Result<()> {
     let mut lez = MockLez::new(config, &[("alice", 10_000), ("bob", 10_000)]);
     let mut zone_sequencer = ZoneSequencer::new(args.dishonest_sequencer);
     let mut indexer = ZoneIndexer::new();
+    // A Module that starts late: it answers RLN_ERR_NOT_READY until it has synced.
+    let mut late_module: Option<Module> = None;
 
     println!("RLN Membership Zone demo");
     println!("  node     {node_url}");
@@ -303,7 +308,23 @@ async fn main() -> Result<()> {
                         // The Zone indexer checks the batch against LEZ and says what is wrong;
                         // every Module reads the same batch and only compares its own root.
                         match indexer.on_batch(&info.payload) {
-                            Ok(batch) => println!("zone indexer: batch [{}..{}] Verified, root {}..", batch.from_lez_block_id, batch.to_lez_block_id, hex::encode(&batch.root_after[..4])),
+                            Ok(batch) => {
+                                println!("zone indexer: batch [{}..{}] Verified, root {}..", batch.from_lez_block_id, batch.to_lez_block_id, hex::encode(&batch.root_after[..4]));
+                                // The late Module syncs from the indexer's snapshot of this batch.
+                                if let Some(mut m) = late_module.take() {
+                                    let (tag, snapshot) = indexer.snapshot();
+                                    match m.sync((tag, snapshot), &batch, &lez) {
+                                        Ok(()) => {
+                                            println!("  module {:5} synced from a snapshot at LEZ block {tag}: root checked against the batch, leaves against LEZ; applied LEZ block {}, ready", m.name, m.reader.applied_block_id);
+                                            modules.push(m);
+                                        }
+                                        Err(reason) => {
+                                            println!("  module {:5} rejected the snapshot: {reason}", m.name);
+                                            late_module = Some(m);
+                                        }
+                                    }
+                                }
+                            }
                             Err(reason) => println!("zone indexer: batch REJECTED: {reason}"),
                         }
                         let Ok(batch) = Batch::decode(info.payload.as_slice()) else { continue };
@@ -331,6 +352,11 @@ async fn main() -> Result<()> {
                         }
                     }
                     let block = lez.produce_block(BLOCK_MS).clone();
+                    if block_id == LATE_MODULE_BLOCK {
+                        let m = Module::new("carol", IdentityKeys::generate::<PoseidonHash, ThreadRng>(&mut thread_rng()));
+                        println!("  module {:5} starts with no tree: RLN_ERR_NOT_READY until it has synced", m.name);
+                        late_module = Some(m);
+                    }
                     // 2. Every reader applies the closed block to its own tree.
                     indexer.apply_block(&block);
                     let before: Vec<_> = modules.iter().map(|m| m.status(&lez)).collect();

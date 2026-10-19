@@ -11,6 +11,10 @@ use rln::prelude::{Fr, Hasher, PoseidonHash};
 
 use crate::reader::{TREE_DEPTH, fr_to_bytes_le};
 
+/// `first_lez_block_id` of the registry: the LEZ block that created `ConfigState`. The mock
+/// creates it before its first block.
+pub const FIRST_LEZ_BLOCK_ID: u64 = 1;
+
 /// `ConfigState`, the configuration account of the registry (durations in milliseconds).
 #[derive(Debug, Clone)]
 pub struct ConfigState {
@@ -29,10 +33,7 @@ pub struct ConfigState {
 /// `MembershipState`, the membership account of one identity commitment.
 #[derive(Debug, Clone)]
 pub struct MembershipState {
-    // `leaf_index` and `rate_limit` mirror the RFC; the Zone reads both from `Register`.
-    #[allow(dead_code)]
     pub leaf_index: u64,
-    #[allow(dead_code)]
     pub rate_limit: u64,
     pub expiry_timestamp_ms: u64,
     pub holder: String,

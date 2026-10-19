@@ -6,7 +6,7 @@ with deposits in an LEZ registration program.
 The membership set, the Merkle tree of rate commitments, is derived from a registration program
 on the Logos Execution Zone (LEZ) by fixed, deterministic rules: anyone who reads the program's
 transactions computes the same tree, and every RLN Module does. A dedicated Zone computes it too
-and publishes the roots as batches on Bedrock, the reference every node checks itself against.
+and publishes the roots as batches on Bedrock, a public reference every node compares its own roots with.
 Deposits, refunds and slashing stay in the registration program.
 The RLN Module that [RLN-API](https://lip.logos.co/anoncomms/raw/rln-api.html) specifies
 (the Module for short), which runs in every user's node,
@@ -54,7 +54,8 @@ Module --Register--> LEZ registration program            (deposit, leaf index)
    Every Zone indexer recomputes each batch from LEZ and rejects any that omits, invents or misorders a change.
 4. The Module compares its roots with the batches, reads membership status from LEZ,
    and generates and validates RLN proofs as RLN-API specifies.
-   A Module that starts syncs from a Zone indexer's snapshot, checked against a batch root.
+   A Module that starts syncs from a Zone indexer's snapshot,
+   checked against a batch root and, leaf by leaf, against LEZ.
 
 The Zone holds no funds.
 A Zone sequencer can omit a change, which is provable censorship,
@@ -122,7 +123,10 @@ The demo runs a short script:
 On each tick LEZ produces one block, alice's and bob's Modules apply it to their own trees
 and print their membership status when it changes, and the Zone sequencer publishes one batch.
 After every finalized batch the Zone indexer prints its verdict,
-and each Module compares its root at the batch's last LEZ block with the batch:
+and each Module compares its root at the batch's last LEZ block with the batch.
+Carol's Module starts at LEZ block 6 with no tree, answers `RLN_ERR_NOT_READY`,
+syncs from the Zone indexer's snapshot (root checked against the batch, leaves against LEZ)
+and follows LEZ from there:
 
 ```text
 LEZ block 4: Slash ok
@@ -161,8 +165,9 @@ The unit tests cover:
 - the registration-program checks: tree capacity, grace period, single-use membership accounts;
 - the derivation rules: expiry order, `Extend`, slashing after expiry, one root per LEZ block;
 - the Module: the membership status cases of the RFC, also on a tree behind LEZ,
-  and the root comparison with a batch;
-- the Zone indexer: a Rejected batch changes nothing, the next batch continues from the last Verified one.
+  the root comparison with a batch, and the sync from a snapshot checked against the batch and LEZ;
+- the Zone indexer: a Rejected batch changes nothing, the next batch continues from the last Verified one,
+  and a snapshot stops at the last Verified batch.
 
 ## References
 
