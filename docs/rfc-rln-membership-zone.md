@@ -17,15 +17,18 @@ a registry, in the sense of the
 [RLN-API](https://lip.logos.co/anoncomms/raw/rln-api.html),
 for RLN memberships on the Logos Blockchain.
 A membership is bought with a deposit through a registration program
-on the Logos Execution Zone (LEZ), which also handles refunds and slashing.
-The Zone keeps the Merkle tree of those memberships
-and publishes its roots on Bedrock as the reference every node agrees on.
+on the Logos Execution Zone (LEZ), which also handles refunds and slashing,
+so LEZ holds the current state of every membership.
 
-The tree follows from the registration program alone:
-fixed rules turn its transactions into insertions and removals,
-so any node can compute the same tree straight from LEZ and check it against the Zone's roots.
+The membership set is a Merkle tree, and no one stores it on chain.
+Fixed rules derive it from the registration program's transactions,
+so every node that reads LEZ computes the same tree.
 The RLN Module that RLN-API specifies ("the Module" for short) runs in every user's node
-and does exactly that, so that it is as current as LEZ itself.
+and derives the tree itself.
+Its tree is as new as the latest LEZ block,
+and it generates and validates proofs from that tree alone, without the Zone or any other service.
+The Zone publishes the roots of the same tree on Bedrock as a public reference:
+every Module compares its own roots with the Zone's, and anyone can audit the registry from public data.
 
 RLN-API itself does not change; its `logos` namespace binding is filled in as [Module Requirements](#module-requirements) states.
 
@@ -34,15 +37,8 @@ all deposits stay in the registration program.
 
 ## Motivation
 
-This draft is written against the current `logos` registry,
-the logos-lez-rln implementation ("lez-rln" for short),
-and compares with it where that helps a design decision.
-The comparisons are temporary.
-Once the design decisions are settled and the specification is aligned with RLN-API,
-they will be removed, and each repository will implement only its own part.
-They appear in this section and in the [Open Questions](#open-questions).
-
-lez-rln keeps the membership set inside LEZ accounts.
+The current `logos` registry, the logos-lez-rln implementation ("lez-rln" for short),
+keeps the membership set inside LEZ accounts.
 Every registration recomputes the rate commitment and every level of the tree
 inside the RISC Zero zkVM:
 
@@ -51,7 +47,8 @@ inside the RISC Zero zkVM:
 - at the floor execution base fee (`BASE_FEE_EXEC_MIN`, 8 atomic units per gas)
   its execution fee alone is about 72.7M atomic units;
 - every registration exceeds the 5M `TARGET_GAS_EXEC`,
-  so sustained registration raises the LEZ base fee for all LEZ users by about 10% per LEZ block;
+  so each LEZ block holding one raises the base fee of the next LEZ block by about 10%, for all LEZ users,
+  and sustained registration compounds it block after block;
 - the tree is limited to depth 9 (512 leaves over its lifetime) to fit `MAX_GAS_EXEC`,
   which forces a non-standard depth-10 circuit on proof generators
   (the Merkle proof path is padded with one empty sibling).
@@ -64,6 +61,12 @@ Deriving the membership set from LEZ removes the hashing from the zkVM,
 raises the tree depth to 20 (the default depth Zerokit ships),
 keeps only the deposit logic on LEZ,
 and lets a Module that serves messaging stay as current as LEZ itself.
+
+This draft is written against lez-rln and compares with it where that helps a design decision.
+The comparisons are temporary.
+Once the design decisions are settled and the specification is aligned with RLN-API,
+they will be removed, and each repository will implement only its own part.
+They appear in this section and in the [Open Questions](#open-questions).
 
 ## Semantic
 
@@ -85,7 +88,6 @@ This document adds:
 | Term | Meaning |
 | --- | --- |
 | The Zone | The RLN Membership Zone specified here; "a Zone" or "Zones" means any Logos Zone (glossary), LEZ included. |
-| Zone channel | The channel of the Zone, written by the Zone sequencers. |
 | Batch | The payload of one `CHANNEL_INSCRIBE` in the Zone channel, carrying the membership-set changes of a contiguous range of LEZ blocks `[from_lez_block_id, to_lez_block_id]`. |
 | Reader | Anything that applies the Derivation Rules to the LEZ blocks and holds the tree: a Zone sequencer, a Zone indexer or a Module. |
 | Zone indexer | A reader that checks every batch of the Zone channel against what it derived and MAY serve snapshots of its tree to Modules that sync; it holds no identity and runs no RLN-API. Distinct from the LEZ Indexer. |
@@ -104,10 +106,10 @@ the following sections specify each part.
 - The LEZ Sequencer serves the LEZ blocks it has closed and does not change one afterwards,
   also when it inscribes a block again after a Bedrock reorg.
   Every LEZ consumer already relies on this, so every reader takes LEZ blocks from the LEZ Sequencer
-  without waiting for their finality, and rolls back only if the assumption fails ([Derivation Rules](#derivation-rules)).
-- The Zone sequencers are trusted the same way:
-  Zone indexers check a batch once it is in a Bedrock block, and Bedrock finality later confirms it.
-  A dishonest sequencer on either side is caught by recomputation, not prevented.
+  without waiting for their finality.
+- The Zone sequencers are not trusted: every reader derives the tree itself,
+  Zone indexers check each batch by recomputation once it is in a Bedrock block, and Bedrock finality later confirms it.
+  A dishonest Zone sequencer is caught, not prevented, and changes nothing in what a Module derives from LEZ.
 - Each LEZ block carries a `timestamp` in Unix-epoch milliseconds,
   which the clock program writes to the clock accounts.
   This is the registry's time base, as the `logos` namespace binding that RLN-API requires.
@@ -140,6 +142,7 @@ The Module acts as proof generator when it calls `generate_proof`
 and as validator when it calls `validate_proof`, as RLN-API calls these roles;
 the same Module plays both.
 LEZ never reads the Zone and the Zone never writes to LEZ.
+No Module needs the Zone to generate or validate a proof; the Zone works alongside, as the reference to compare with.
 Reading LEZ costs no gas, so the registry adds no LEZ load beyond its own transactions.
 
 ### A membership's life
@@ -152,7 +155,7 @@ every reader inserts the leaf into its tree,
 and the membership is `MEMBERSHIP_ACTIVE` at every Module that has applied that block.
 The Zone sequencer publishes the `Insert` in a batch on Bedrock;
 once the batch is in a Bedrock block, every Zone indexer checks it against what it derived,
-and every Module confirms its own root against it.
+and every Module compares its own root with it.
 The holder MAY send `Extend` during the grace period.
 At expiry every reader removes the leaf.
 After the withdrawal delay the holder sends `Erase` and gets the deposit back.
@@ -162,7 +165,7 @@ the deposit is slashed to the treasury, and every reader removes the leaf as soo
 
 ### Flow
 
-Registration (steps 1-9): a user action reaches the registration program on LEZ; every reader derives the new root from the LEZ block, and the Zone's batch confirms it.
+Registration (steps 1-9): a user action reaches the registration program on LEZ; every reader derives the new root from the LEZ block, and the Zone's batch records it for comparison.
 
 ```mermaid
 %%{init: {"theme": "base", "flowchart": {"curve": "basis", "nodeSpacing": 40, "rankSpacing": 70, "padding": 6}, "themeVariables": {"lineColor": "#9aa0a6", "primaryTextColor": "#111111", "edgeLabelBackground": "#ffffff", "fontSize": "15px"}, "themeCSS": "marker { overflow: visible; } .arrowMarkerPath { transform: scale(1.7); transform-origin: 5px 5px; } .edgeLabel, .edgeLabel p, .edgeLabel span { font-size: 12px; line-height: 1.2; }"}}%%
@@ -191,7 +194,7 @@ flowchart LR
     class ZSEQ,IDX zone
 ```
 
-Messaging and slashing (steps 10-15): a double-signal reveals the identity secret, a slasher slashes the deposit, every reader removes the leaf, and the Zone's batch confirms it.
+Messaging and slashing (steps 10-15): a double-signal reveals the identity secret, a slasher slashes the deposit, every reader removes the leaf, and the Zone's batch records it for comparison.
 
 ```mermaid
 %%{init: {"theme": "base", "flowchart": {"curve": "basis", "nodeSpacing": 40, "rankSpacing": 70, "padding": 6}, "themeVariables": {"lineColor": "#9aa0a6", "primaryTextColor": "#111111", "edgeLabelBackground": "#ffffff", "fontSize": "15px"}, "themeCSS": "marker { overflow: visible; } .arrowMarkerPath { transform: scale(1.7); transform-origin: 5px 5px; } .edgeLabel, .edgeLabel p, .edgeLabel span { font-size: 12px; line-height: 1.2; }"}}%%
@@ -221,13 +224,13 @@ flowchart LR
 | 6 | The Zone sequencer publishes a batch with the changes and the root to the Zone channel. | On its turn to write, covering every LEZ block not yet covered. |
 | 7 | The Zone indexer reads the batch from the Zone channel and compares it with the changes and the root it derived at step 5. | Once the batch is in a Bedrock block; Bedrock finality confirms it about 60 min later on testnet. |
 | 8 | The Module compares the batch root with its own root for the same LEZ block. | In the background, never while validating a message. |
-| 9 | A Module that starts, or fell behind, takes a snapshot from a Zone indexer, checks its root against the batch for the same LEZ block, and applies the blocks since; until then it answers `RLN_ERR_NOT_READY`. | At start, or after a long disconnection. |
+| 9 | A Module that starts, or fell behind, takes a snapshot from a Zone indexer, checks its root against the batch for the same LEZ block and its live leaves against LEZ, and applies the blocks since; until then it answers `RLN_ERR_NOT_READY`. | At start, or after a long disconnection. |
 | 10 | The sender's Module, as proof generator, sends a message with its RLN proof; another node's Module, as validator, checks it. | Every message. |
 | 11 | The validator detects a double-signal and hands `recovered_secret`, the identity secret, to a slasher, or sends the `Slash` itself. | When a nullifier repeats with a different `share_x`. |
 | 12 | The slasher sends `Slash{identity_secret}`; the registration program slashes the deposit to the treasury. | As soon as the slasher has the identity secret. |
 | 13 | Every reader applies the LEZ block holding the `Slash` and removes the leaf; every validator drops the roots from before it. | As soon as that block is closed. |
 | 14 | Steps 5-7 run again: the next batch carries `Remove{leaf_index}` for the slashed leaf. | In the next batch. |
-| 15 | Zone indexers and Modules confirm their root against the batch. The violator's Module reports `MEMBERSHIP_SLASHED` from its membership account on LEZ since step 12. | Once that batch is in a Bedrock block. |
+| 15 | Zone indexers check the batch and Modules compare their root with it. The violator's Module reports `MEMBERSHIP_SLASHED` from its membership account on LEZ since step 12. | Once that batch is in a Bedrock block. |
 
 The following sections specify the [Derivation Rules](#derivation-rules) every reader applies (steps 5 and 13),
 the [Zone Sequencer](#zone-sequencer) (steps 6 and 14) and the [Zone Indexer](#zone-indexer) (steps 7, 9 and 15),
@@ -279,11 +282,9 @@ flowchart LR
 ```
 
 A reader applies a LEZ block as soon as the LEZ Sequencer serves it.
-Should the LEZ Sequencer ever inscribe a different block under a known `block_id`,
-every reader rolls its tree back to the block before it and applies the new blocks,
-every batch covering that block or a later one is void,
-and the Zone sequencer publishes again from the block before it;
-how many blocks a reader keeps for this is open.
+Should the LEZ Sequencer ever serve a different block under a known `block_id`,
+the assumption this registry shares with every LEZ consumer has failed,
+and what follows is outside this document.
 
 ## Zone Sequencer
 
@@ -361,7 +362,8 @@ and reads every batch once it is in a Bedrock block, how deep being open, to che
 It MUST reject a batch unless:
 
 1. **Range.** The batch starts right after the last Verified batch ended
-   (`from_lez_block_id` = its `to_lez_block_id` + 1; the first batch starts at the registration program's first LEZ block),
+   (`from_lez_block_id` = its `to_lez_block_id` + 1; the first batch starts at `first_lez_block_id`,
+   the LEZ block that created `ConfigState`, a parameter of the registry like `zone_channel_id`),
    so no LEZ block is skipped or covered twice.
 2. **Changes.** `changes` equal what the derivation rules give for that range.
    A LEZ block the Zone indexer cannot read yet only delays the check.
@@ -464,8 +466,8 @@ Everything not stated here is as in RLN-API; this document requires the followin
 %%{init: {"theme": "base", "flowchart": {"curve": "basis", "nodeSpacing": 40, "rankSpacing": 70, "padding": 6, "wrappingWidth": 400}, "themeVariables": {"lineColor": "#9aa0a6", "primaryTextColor": "#111111", "edgeLabelBackground": "#ffffff", "fontSize": "15px"}, "themeCSS": "marker { overflow: visible; } .arrowMarkerPath { transform: scale(1.7); transform-origin: 5px 5px; } .edgeLabel, .edgeLabel p, .edgeLabel span { font-size: 12px; line-height: 1.2; }"}}%%
 flowchart LR
     LSEQ["LEZ Sequencer<br/>(LEZ)"] <-->|"#nbsp;every LEZ block; membership account, ConfigState, clock →#nbsp;<br/>#nbsp;← Register, Extend, Erase#nbsp;<br/>#nbsp;trust: the LEZ Sequencer#nbsp;"| MOD["Module<br/>(user node)"]
-    ZCH["Zone channel<br/>(Bedrock)"] -->|"#nbsp;batch roots to compare with#nbsp;<br/>#nbsp;trust: the Zone sequencer that signed#nbsp;"| MOD
-    IDX["Zone indexer<br/>(self-hosted or any service)"] -.->|"#nbsp;snapshot to sync from#nbsp;<br/>#nbsp;trust: none, checked against a batch root#nbsp;"| MOD
+    ZCH["Zone channel<br/>(Bedrock)"] -->|"#nbsp;batch roots to compare with#nbsp;<br/>#nbsp;trust: none, compared with the Module's own root#nbsp;"| MOD
+    IDX["Zone indexer<br/>(self-hosted or any service)"] -.->|"#nbsp;snapshot to sync from#nbsp;<br/>#nbsp;trust: none; tree checked against a batch root,#nbsp;<br/>#nbsp;live leaves against LEZ#nbsp;"| MOD
     MOD -->|"#nbsp;RLN-API#nbsp;"| APP["User interface"]
     linkStyle default stroke-width:2.5px
 
@@ -488,18 +490,21 @@ flowchart LR
 - **Tree.** The Module is a reader: it applies the derivation rules to every LEZ block,
   keeps the tree, tags each root with the `block_id` that produced it,
   and takes its own Merkle proof path from its tree.
-  It keeps enough state to roll back ([Derivation Rules](#derivation-rules)).
 - **Sync.** A Module that starts, or that has fallen too far behind to catch up by applying blocks,
-  either replays the registration program's transactions from its first LEZ block,
-  or takes a snapshot from a Zone indexer and checks the snapshot's root against the batch on Bedrock
-  for the same `to_lez_block_id`; then it applies the LEZ blocks since.
+  either replays the registration program's transactions from `first_lez_block_id`,
+  or takes a snapshot from a Zone indexer and checks it before use:
+  the snapshot's root against the batch on Bedrock for the same `to_lez_block_id`,
+  and every non-empty leaf of that tree against the membership account of the identity commitment the snapshot names for it
+  (`poseidon(id_commitment, rate_limit)` equals the leaf, and `expiry_timestamp_ms` is taken from the account,
+  since the root commits the leaves but neither whose they are nor when they expire);
+  then it applies the LEZ blocks since.
+  The snapshot is trusted for nothing else.
   A Module is ready once it trails the latest closed LEZ block by no more than the valid-root window length;
   before that, and whenever it falls further behind, for example when it loses the LEZ Sequencer,
   it answers `RLN_ERR_NOT_READY` rather than validating on stale roots.
 - **Compare.** The Module reads the batches on Bedrock only to compare:
-  a batch whose `root_after` differs from the Module's root at `to_lez_block_id`,
-  while a Zone indexer the Module does not run has Verified it, means a bug on one side,
-  and what the Module does then is open.
+  a batch deep enough on Bedrock whose `root_after` differs from the Module's root at `to_lez_block_id`
+  means that one side misread LEZ, and what the Module does then is open.
 - **Valid-root window.** A validator accepts a proof against any root in its window.
   The window holds the roots from the last removal the validator has applied on,
   bounded by a length.
@@ -509,15 +514,21 @@ flowchart LR
   A validator thus stops accepting a removed leaf as soon as it has applied the block holding the `Slash` or the expiry.
   Honest proofs made against a root before the removal fail and are generated again, partial proofs included.
 - **Roots for proofs.** A proof generator SHOULD prove against the newest root it holds.
-  Validators trail LEZ by different amounts, a few LEZ blocks at most,
-  so the window length covers that difference.
+  Validators apply a LEZ block at slightly different times.
+  A validator ahead of the generator holds the generator's root in its window, which covers that lead.
+  A validator behind the generator does not hold that root yet:
+  on a proof against a root it does not hold, it first applies the LEZ blocks the LEZ Sequencer has closed
+  since its last applied one and checks its window again; a root it still does not hold is invalid.
+  It never waits for a LEZ block not yet closed, since no valid proof can use a root from one,
+  and it runs this catch-up at most once per LEZ block interval, so unknown roots cannot make it poll.
 - **Binding.** The anchor account is `ConfigState`, and there are no tree accounts.
   `funding_holding_account_id` pays the deposit and `registration_fee`;
   it SHOULD be a public account, since `Erase` refunds `holder` and a refund to a private account id
   lands in an account no key can spend.
   The registry-specific option `active_duration_ms` is the requested active duration,
   defaulting to `max_active_duration_ms`.
-  The Module configuration names LEZ access and, for syncing, zero or more Zone indexer endpoints.
+  The Module configuration names LEZ access, `first_lez_block_id`
+  and, for syncing, zero or more Zone indexer endpoints.
 - **Registration.** The Module sends `Register` with `expiry_timestamp_ms` = the `timestamp` of its latest applied LEZ block + `active_duration_ms`.
   The program measures the active duration from the later clock of the block that includes the transaction,
   so the duration shrinks by the inclusion delay:
@@ -527,7 +538,7 @@ flowchart LR
   and therefore becomes `holder`; nothing on LEZ or in the registry tells the two apart,
   and the client acts through its membership provider for `Extend` and `Erase`.
 - **Usability.** The Module generates proofs only while LEZ and its tree agree
-  (membership account open, the latest applied `timestamp` before `expiry_timestamp_ms`, leaf live in a root of the valid-root window),
+  (membership account open, the LEZ clock before `expiry_timestamp_ms`, leaf live in a root of the valid-root window),
   and stops as soon as either side says otherwise.
   This protects an honest Module only.
 
@@ -606,27 +617,27 @@ use up the registry at about `2^20 × registration_fee`.
 ### Q3. Divergence from the Zone's roots (High)
 
 **Problem.** A Module compares its own roots with the batches on Bedrock.
-When a batch that a Zone indexer Verified has a `root_after` that differs from the Module's own root
-at the same `to_lez_block_id`, one of the two has a bug or read a different LEZ block,
+When a batch has a `root_after` that differs from the Module's own root at the same `to_lez_block_id`,
+one of the two has a bug or read a different LEZ block,
 and the Module cannot tell which from its own data.
 Trusting itself risks accepting proofs nobody else accepts, or rejecting proofs everybody else accepts;
-trusting the Zone means throwing its tree away.
-A batch counts for this comparison only once it is deep enough on Bedrock ([Q4](#q4-parameters-window-length-reference-depth-withdrawal-delay-rollback-window-medium)).
+the batch is not the truth either, LEZ is: the batch only tells the Module that one of the two misread it.
+A batch counts for this comparison only once it is deep enough on Bedrock ([Q4](#q4-parameters-window-length-reference-depth-withdrawal-delay-medium)).
 
 **Design choices:**
 
 - **Stop.** Stop serving proofs and validating, report, and wait for an operator decision.
-- **Resync.** Take a snapshot from a Zone indexer, check it against the batch, and go on from there;
-  the Zone's view wins without anyone looking.
-- **Majority.** Ask several Zone indexers and follow the root most of them Verified.
+- **Re-derive.** Replay LEZ from `first_lez_block_id`, or take a snapshot checked as in Sync, and go on from there;
+  a Module that still differs has read a different LEZ than the Zone, and nobody looks into which.
 
-### Q4. Parameters: window length, reference depth, withdrawal delay, rollback window (Medium)
+### Q4. Parameters: window length, reference depth, withdrawal delay (Medium)
 
-**Problem.** Four numbers follow from the design but depend on what only a running network shows.
+**Problem.** Three numbers follow from the design but depend on what only a running network shows.
 
-- **Window length.** Validators apply a LEZ block at slightly different times,
-  so a proof against the newest root fails at a validator that has not applied that block yet;
-  the window must hold enough roots to cover that skew.
+- **Window length.** Validators apply a LEZ block at slightly different times.
+  A validator ahead of a proof generator holds the generator's root only while it is in its window,
+  so the window must hold enough roots to cover that lead;
+  a validator behind catches up instead ([Module Requirements](#module-requirements)).
   The same length bounds how far a validator may trail LEZ before it answers `RLN_ERR_NOT_READY`,
   and therefore how long a removed leaf, whose identity secret is public after a `Slash`,
   can still be used at a validator that is behind, up to `rate_limit` messages per epoch.
@@ -638,15 +649,12 @@ A batch counts for this comparison only once it is deep enough on Bedrock ([Q4](
   and about 18 h at the protocol default of 2160 blocks.
 - **Withdrawal delay.** Its bound in [LEZ Requirements](#lez-requirements) rests on the longest a validator may trail LEZ,
   the window length above, plus the time to detect a double-signal and include the `Slash`.
-- **Rollback window.** A reader keeps past block states to roll back should the LEZ Sequencer ever inscribe
-  a different block under a known `block_id`; how many is a trade between memory and how deep a failure it survives.
 
 **Design choices:**
 
 - **Window length.** A few LEZ blocks' worth of roots, set per registry from the measured skew.
 - **Reference depth.** A few Bedrock blocks, set per registry from the observed reorg depth.
 - **Withdrawal delay.** Window length in time, plus the expected double-signal detection time, plus a margin.
-- **Rollback window.** The reference depth in LEZ blocks, so a reader survives any replacement a batch survives.
 
 ### Q5. Funding the Zone (Medium)
 
