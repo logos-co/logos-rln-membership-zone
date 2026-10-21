@@ -8,20 +8,20 @@ use prost::Message;
 
 use crate::{
     batch::Batch,
-    lez::{Action, Block, MockLez},
-    reader::{Reader, fr_to_bytes_le},
+    lez::{Block, Event, MockLez},
+    reader::Reader,
 };
 
 pub struct ZoneSequencer {
     reader: Reader,
-    /// Omit every `Slash` from the tree and the batches: provable censorship.
+    /// Omit every `Slashed` event from the tree and the batches: provable censorship.
     dishonest: bool,
 }
 
 impl ZoneSequencer {
-    pub fn new(dishonest: bool) -> Self {
+    pub fn new(tree_id: [u8; 32], dishonest: bool) -> Self {
         Self {
-            reader: Reader::new(),
+            reader: Reader::new(tree_id),
             dishonest,
         }
     }
@@ -40,15 +40,15 @@ impl ZoneSequencer {
         let mut changes = vec![];
         let mut fitted = None;
         for block in lez.blocks(from, lez.last_block_id()) {
-            // The dishonest Zone sequencer censors every `Slash`: it applies the block without
-            // them, so both its changes and its root leave the slashed leaf in the tree.
+            // The dishonest Zone sequencer censors every `Slashed`: it applies the block
+            // without them, so both its changes and its root leave the slashed leaf in the tree.
             let censored;
             let block = if self.dishonest {
                 censored = Block {
-                    actions: block
-                        .actions
+                    events: block
+                        .events
                         .iter()
-                        .filter(|action| !matches!(action, Action::Slash { .. }))
+                        .filter(|event| !matches!(event, Event::Slashed { .. }))
                         .cloned()
                         .collect(),
                     ..block.clone()
@@ -62,7 +62,7 @@ impl ZoneSequencer {
                 from_lez_block_id: from,
                 to_lez_block_id: block.block_id,
                 changes: changes.clone(),
-                root_after: fr_to_bytes_le(&next.root()).to_vec(),
+                root_after: next.root().to_vec(),
             };
             match Inscription::try_from(batch.encode_to_vec()) {
                 Ok(inscription) => fitted = Some((batch, inscription, next.clone())),

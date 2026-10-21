@@ -1,42 +1,68 @@
 //! In-memory stand-in for LEZ and the registration program (RFC "LEZ Requirements").
 //!
-//! Only what the Zone needs is modelled: blocks with a timestamp, the successful
-//! registration-program actions of each block, membership accounts and balances. A block
-//! is readable as soon as it is produced, as the RFC trusts the LEZ Sequencer to serve closed
-//! blocks without ever changing them.
+//! Only what the Zone needs is modelled: blocks with a timestamp, the events the registration
+//! program emitted in each block, membership accounts and balances. A block and its events are
+//! readable as soon as the block is produced, as the RFC trusts the LEZ Sequencer to serve
+//! closed blocks, with their events, without ever changing them.
+//!
+//! Types follow lez-rln: ids are 32 bytes, amounts `u128`, counts `u64`, timestamps Unix-epoch
+//! milliseconds; durations are milliseconds too, as RLN-API requires (lez-rln uses seconds).
 
 use std::collections::HashMap;
 
-use rln::prelude::{Fr, Hasher, PoseidonHash};
+use rln::prelude::{Hasher, PoseidonHash};
 
-use crate::reader::{TREE_DEPTH, fr_to_bytes_le};
+use crate::reader::{TREE_DEPTH, fr_from_bytes_le, fr_to_bytes_le};
 
 /// `first_lez_block_id` of the registry: the LEZ block that created `ConfigState`. The mock
 /// creates it before its first block.
 pub const FIRST_LEZ_BLOCK_ID: u64 = 1;
 
-/// `ConfigState`, the configuration account of the registry (durations in milliseconds).
-#[derive(Debug, Clone)]
-pub struct ConfigState {
-    pub min_rate_limit: u64,
-    pub max_rate_limit: u64,
-    pub price_per_unit: u128,
-    pub registration_fee: u128,
-    pub min_active_duration_ms: u64,
-    pub max_active_duration_ms: u64,
-    pub grace_period_duration_ms: u64,
-    pub withdrawal_delay_ms: u64,
-    pub treasury_account_id: String,
-    pub operator_account_id: String,
+/// A LEZ account id. The mock derives it from a name, so logs stay readable.
+pub type AccountId = [u8; 32];
+
+pub fn account(name: &str) -> AccountId {
+    let mut id = [0u8; 32];
+    id[..name.len()].copy_from_slice(name.as_bytes());
+    id
 }
 
-/// `MembershipState`, the membership account of one identity commitment.
+pub fn account_name(id: &AccountId) -> String {
+    String::from_utf8_lossy(id)
+        .trim_end_matches('\0')
+        .to_owned()
+}
+
+/// `ConfigState`, the configuration account of the registry.
+#[derive(Debug, Clone)]
+pub struct ConfigState {
+    pub zone_channel_id: [u8; 32],
+    pub operator_account_id: AccountId,
+    pub registration_fee: u128,
+    pub epoch_size_sec: u64,
+    pub min_rate_limit: u64,
+    pub max_rate_limit: u64,
+    pub min_active_duration_ms: u64,
+    pub max_active_duration_ms: u64,
+    pub tree_id: [u8; 32],
+    pub next_index: u64,
+    pub price_per_unit: u128,
+    pub treasury_account_id: AccountId,
+    pub grace_period_duration_ms: u64,
+    pub withdrawal_delay_ms: u64,
+}
+
+/// `MembershipState`, the membership account of one identity commitment. The grace period and
+/// the withdrawal delay are copied from `ConfigState` at `Register`, so a later configuration
+/// change cannot touch an open membership.
 #[derive(Debug, Clone)]
 pub struct MembershipState {
+    pub expiry_timestamp_ms: u64,
+    pub withdrawal_delay_ms: u64,
     pub leaf_index: u64,
     pub rate_limit: u64,
-    pub expiry_timestamp_ms: u64,
-    pub holder: String,
+    pub grace_period_duration_ms: u64,
+    pub holder: AccountId,
     pub deposit_amount: u128,
 }
 
@@ -58,64 +84,102 @@ enum Slot {
     ClosedBySlash,
 }
 
-/// A registration-program action (RFC "LEZ Requirements / Actions"). Only successful ones are
-/// recorded in blocks.
+/// The registration program's instructions (RFC "LEZ Requirements / Actions"), as lez-rln
+/// lays them out: `tree_id` first, ids as 32 bytes. The signer is the transaction's.
 #[derive(Debug, Clone)]
-pub enum Action {
+pub enum Instruction {
     Register {
-        payer: String,
-        id_commitment: Fr,
+        tree_id: [u8; 32],
+        id_commitment: [u8; 32],
         rate_limit: u64,
         expiry_timestamp_ms: u64,
-        /// Assigned by the registration program on success; the value passed in is ignored.
-        leaf_index: u64,
     },
     Extend {
-        holder: String,
-        id_commitment: Fr,
+        tree_id: [u8; 32],
+        id_commitment: [u8; 32],
         expiry_timestamp_ms: u64,
     },
     Erase {
-        holder: String,
-        id_commitment: Fr,
+        tree_id: [u8; 32],
+        id_commitment: [u8; 32],
     },
     Slash {
-        /// Signer; pays its LEZ transaction fee and receives nothing (slasher reward: RFC Q5).
-        #[allow(dead_code)]
-        slasher: String,
-        identity_secret: Fr,
+        tree_id: [u8; 32],
+        identity_secret: [u8; 32],
     },
 }
 
-/// A LEZ block as the Zone sees it: `block_id`, `timestamp`, registration-program actions.
+/// A transaction as the mock executes it: the signing account and its instruction.
+#[derive(Debug, Clone)]
+pub struct Transaction {
+    pub signer: AccountId,
+    pub instruction: Instruction,
+}
+
+/// The events the registration program emits, one per successful action (RFC "LEZ
+/// Requirements / Events"): the only input of the derivation rules.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    Registered {
+        tree_id: [u8; 32],
+        id_commitment: [u8; 32],
+        rate_limit: u64,
+        expiry_timestamp_ms: u64,
+        leaf_index: u64,
+    },
+    Extended {
+        tree_id: [u8; 32],
+        id_commitment: [u8; 32],
+        expiry_timestamp_ms: u64,
+    },
+    Erased {
+        tree_id: [u8; 32],
+        id_commitment: [u8; 32],
+    },
+    Slashed {
+        tree_id: [u8; 32],
+        id_commitment: [u8; 32],
+    },
+}
+
+impl Event {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Registered { .. } => "Registered",
+            Self::Extended { .. } => "Extended",
+            Self::Erased { .. } => "Erased",
+            Self::Slashed { .. } => "Slashed",
+        }
+    }
+}
+
+/// A LEZ block as a reader sees it: `block_id`, `timestamp`, and the registration program's
+/// events, served with the block.
 #[derive(Debug, Clone)]
 pub struct Block {
     pub block_id: u64,
     pub timestamp: u64,
-    pub actions: Vec<Action>,
+    pub events: Vec<Event>,
 }
 
 pub struct MockLez {
     pub config: ConfigState,
     blocks: Vec<Block>,
-    pending: Vec<Action>,
+    pending: Vec<Event>,
     /// `CLOCK_01` timestamp: the timestamp of the last block.
     timestamp: u64,
-    /// `ConfigState.next_index`: next free leaf index.
-    next_index: u64,
     memberships: HashMap<[u8; 32], Slot>,
-    balances: HashMap<String, u128>,
+    balances: HashMap<AccountId, u128>,
 }
 
 impl MockLez {
     pub fn new(config: ConfigState, funded: &[(&str, u128)]) -> Self {
-        let balances = funded.iter().map(|(a, b)| ((*a).to_owned(), *b)).collect();
+        let balances = funded.iter().map(|(a, b)| (account(a), *b)).collect();
         Self {
             config,
             blocks: vec![],
             pending: vec![],
             timestamp: 0,
-            next_index: 0,
             memberships: HashMap::new(),
             balances,
         }
@@ -130,12 +194,12 @@ impl MockLez {
         self.blocks.last().map_or(0, |b| b.block_id)
     }
 
-    pub fn balance(&self, account: &str) -> u128 {
-        self.balances.get(account).copied().unwrap_or(0)
+    pub fn balance(&self, name: &str) -> u128 {
+        self.balances.get(&account(name)).copied().unwrap_or(0)
     }
 
-    pub fn membership_account(&self, id_commitment: &Fr) -> MembershipAccount<'_> {
-        match self.memberships.get(&fr_to_bytes_le(id_commitment)) {
+    pub fn membership_account(&self, id_commitment: &[u8; 32]) -> MembershipAccount<'_> {
+        match self.memberships.get(id_commitment) {
             None => MembershipAccount::Default,
             Some(Slot::Open(membership)) => MembershipAccount::Open(membership),
             Some(Slot::ClosedByErase) => MembershipAccount::ClosedByErase,
@@ -143,7 +207,7 @@ impl MockLez {
         }
     }
 
-    pub fn membership(&self, id_commitment: &Fr) -> Option<&MembershipState> {
+    pub fn membership(&self, id_commitment: &[u8; 32]) -> Option<&MembershipState> {
         match self.membership_account(id_commitment) {
             MembershipAccount::Open(membership) => Some(membership),
             _ => None,
@@ -158,21 +222,23 @@ impl MockLez {
         &self.blocks[(from - 1) as usize..to as usize]
     }
 
-    /// Execute an action against the registration program, per the RFC "LEZ Requirements".
-    /// On success it is queued for the next block.
-    pub fn submit(&mut self, mut action: Action) -> Result<(), String> {
+    /// Execute a transaction against the registration program, per the RFC "LEZ
+    /// Requirements". On success its event is queued for the next block; a failed transaction
+    /// emits nothing.
+    pub fn submit(&mut self, tx: Transaction) -> Result<(), String> {
         let config = self.config.clone();
         let now = self.timestamp;
-        match &action {
-            Action::Register {
-                payer,
+        let signer = tx.signer;
+        let event = match tx.instruction {
+            Instruction::Register {
+                tree_id,
                 id_commitment,
                 rate_limit,
                 expiry_timestamp_ms,
-                ..
             } => {
+                self.check_tree(tree_id)?;
                 // Bounds.
-                if !(config.min_rate_limit..=config.max_rate_limit).contains(rate_limit) {
+                if !(config.min_rate_limit..=config.max_rate_limit).contains(&rate_limit) {
                     return Err("rate_limit out of bounds".into());
                 }
                 let active_duration_ms = expiry_timestamp_ms.saturating_sub(now);
@@ -182,42 +248,55 @@ impl MockLez {
                     return Err("active duration out of bounds".into());
                 }
                 // Uniqueness: the membership account must still be a default account.
-                let key = fr_to_bytes_le(id_commitment);
-                if self.memberships.contains_key(&key) {
+                if self.memberships.contains_key(&id_commitment) {
                     return Err("membership account already used".into());
                 }
                 // Capacity.
-                if self.next_index >= 1 << TREE_DEPTH {
+                if self.config.next_index >= 1 << TREE_DEPTH {
                     return Err("tree full: every leaf index has been used".into());
                 }
                 // Payment.
-                let deposit_amount = u128::from(*rate_limit) * config.price_per_unit;
-                self.debit(payer, deposit_amount + config.registration_fee)?;
+                let deposit_amount = u128::from(rate_limit) * config.price_per_unit;
+                self.debit(&signer, deposit_amount + config.registration_fee)?;
                 self.credit(&config.operator_account_id, config.registration_fee);
-                // Accept.
+                // Accept: the next leaf index, and the durations copied from the config.
+                let leaf_index = self.config.next_index;
+                self.config.next_index += 1;
                 let membership = MembershipState {
-                    leaf_index: self.next_index,
-                    rate_limit: *rate_limit,
-                    expiry_timestamp_ms: *expiry_timestamp_ms,
-                    holder: payer.clone(),
+                    expiry_timestamp_ms,
+                    withdrawal_delay_ms: config.withdrawal_delay_ms,
+                    leaf_index,
+                    rate_limit,
+                    grace_period_duration_ms: config.grace_period_duration_ms,
+                    holder: signer,
                     deposit_amount,
                 };
-                self.memberships.insert(key, Slot::Open(membership));
+                self.memberships
+                    .insert(id_commitment, Slot::Open(membership));
+                Event::Registered {
+                    tree_id,
+                    id_commitment,
+                    rate_limit,
+                    expiry_timestamp_ms,
+                    leaf_index,
+                }
             }
-            Action::Extend {
-                holder,
+            Instruction::Extend {
+                tree_id,
                 id_commitment,
                 expiry_timestamp_ms,
             } => {
-                let membership = self.open_membership(id_commitment, Some(holder))?;
-                // Grace period.
+                self.check_tree(tree_id)?;
+                let membership = self.open_membership(&id_commitment, Some(&signer))?;
+                // The membership's own grace period.
                 let expiry = membership.expiry_timestamp_ms;
-                if !(expiry.saturating_sub(config.grace_period_duration_ms)..expiry).contains(&now)
+                if !(expiry.saturating_sub(membership.grace_period_duration_ms)..expiry)
+                    .contains(&now)
                 {
                     return Err("membership is not in its grace period".into());
                 }
-                // Monotone.
-                if *expiry_timestamp_ms <= expiry
+                // Monotone, within the current config's bound.
+                if expiry_timestamp_ms <= expiry
                     || expiry_timestamp_ms.saturating_sub(now) > config.max_active_duration_ms
                 {
                     return Err(
@@ -226,64 +305,80 @@ impl MockLez {
                     );
                 }
                 // Accept.
-                if let Some(Slot::Open(membership)) =
-                    self.memberships.get_mut(&fr_to_bytes_le(id_commitment))
-                {
-                    membership.expiry_timestamp_ms = *expiry_timestamp_ms;
+                if let Some(Slot::Open(membership)) = self.memberships.get_mut(&id_commitment) {
+                    membership.expiry_timestamp_ms = expiry_timestamp_ms;
+                }
+                Event::Extended {
+                    tree_id,
+                    id_commitment,
+                    expiry_timestamp_ms,
                 }
             }
-            Action::Erase {
-                holder,
+            Instruction::Erase {
+                tree_id,
                 id_commitment,
             } => {
-                let membership = self.open_membership(id_commitment, Some(holder))?;
-                // Withdrawal delay.
-                if now < membership.expiry_timestamp_ms + config.withdrawal_delay_ms {
+                self.check_tree(tree_id)?;
+                let membership = self.open_membership(&id_commitment, Some(&signer))?;
+                // The membership's own withdrawal delay.
+                if now < membership.expiry_timestamp_ms + membership.withdrawal_delay_ms {
                     return Err("withdrawal delay not elapsed".into());
                 }
-                // Accept: refund the holder and empty the membership account.
-                self.memberships
-                    .insert(fr_to_bytes_le(id_commitment), Slot::ClosedByErase);
+                // Accept: refund the holder and close the membership account.
+                self.memberships.insert(id_commitment, Slot::ClosedByErase);
                 self.credit(&membership.holder, membership.deposit_amount);
+                Event::Erased {
+                    tree_id,
+                    id_commitment,
+                }
             }
-            Action::Slash {
-                identity_secret, ..
+            Instruction::Slash {
+                tree_id,
+                identity_secret,
             } => {
-                // Membership.
-                let id_commitment = Hasher::<PoseidonHash>::hash_single(*identity_secret);
+                self.check_tree(tree_id)?;
+                // Membership: the one whose commitment the secret hashes to.
+                let id_commitment = fr_to_bytes_le(&Hasher::<PoseidonHash>::hash_single(
+                    fr_from_bytes_le(&identity_secret)?,
+                ));
                 let membership = self.open_membership(&id_commitment, None)?;
-                // Accept: the whole deposit to the treasury (a slasher reward is RFC Q5).
-                self.memberships
-                    .insert(fr_to_bytes_le(&id_commitment), Slot::ClosedBySlash);
+                // Accept: the whole deposit to the treasury (a slasher reward is RFC Q4).
+                self.memberships.insert(id_commitment, Slot::ClosedBySlash);
                 self.credit(&config.treasury_account_id, membership.deposit_amount);
+                Event::Slashed {
+                    tree_id,
+                    id_commitment,
+                }
             }
-        }
-        // Record the assigned leaf index in the executed action, where readers read it.
-        if let Action::Register { leaf_index, .. } = &mut action {
-            *leaf_index = self.next_index;
-            self.next_index += 1;
-        }
-        self.pending.push(action);
+        };
+        self.pending.push(event);
         Ok(())
     }
 
-    /// Close the current block: advance the timestamp and record the queued actions.
+    /// Close the current block: advance the timestamp and record the queued events.
     /// The clock program runs last, so actions in a block see the previous timestamp.
     pub fn produce_block(&mut self, step_ms: u64) -> &Block {
         self.timestamp += step_ms;
         let block = Block {
             block_id: self.last_block_id() + 1,
             timestamp: self.timestamp,
-            actions: std::mem::take(&mut self.pending),
+            events: std::mem::take(&mut self.pending),
         };
         self.blocks.push(block);
         self.blocks.last().expect("just pushed")
     }
 
+    fn check_tree(&self, tree_id: [u8; 32]) -> Result<(), String> {
+        if tree_id != self.config.tree_id {
+            return Err("no registry with this tree_id".into());
+        }
+        Ok(())
+    }
+
     fn open_membership(
         &self,
-        id_commitment: &Fr,
-        holder: Option<&String>,
+        id_commitment: &[u8; 32],
+        holder: Option<&AccountId>,
     ) -> Result<MembershipState, String> {
         let membership = self
             .membership(id_commitment)
@@ -295,14 +390,14 @@ impl MockLez {
         Ok(membership)
     }
 
-    fn debit(&mut self, account: &str, amount: u128) -> Result<(), String> {
-        let balance = self.balances.entry(account.to_owned()).or_default();
+    fn debit(&mut self, account: &AccountId, amount: u128) -> Result<(), String> {
+        let balance = self.balances.entry(*account).or_default();
         *balance = balance.checked_sub(amount).ok_or("insufficient balance")?;
         Ok(())
     }
 
-    fn credit(&mut self, account: &str, amount: u128) {
-        *self.balances.entry(account.to_owned()).or_default() += amount;
+    fn credit(&mut self, account: &AccountId, amount: u128) {
+        *self.balances.entry(*account).or_default() += amount;
     }
 }
 
@@ -313,20 +408,26 @@ pub(crate) mod test {
 
     use super::*;
 
+    pub(crate) const TREE_ID: [u8; 32] = [0; 32];
+
     /// Demo parameters: grace period 4000 ms, withdrawal delay 6000 ms,
     /// active durations 4000-60000 ms.
     pub(crate) fn new_lez() -> MockLez {
         let config = ConfigState {
+            zone_channel_id: [1; 32],
+            operator_account_id: account("operator"),
+            registration_fee: 5,
+            epoch_size_sec: 600,
             min_rate_limit: 100,
             max_rate_limit: 600,
-            price_per_unit: 10,
-            registration_fee: 5,
             min_active_duration_ms: 4_000,
             max_active_duration_ms: 60_000,
+            tree_id: TREE_ID,
+            next_index: 0,
+            price_per_unit: 10,
+            treasury_account_id: account("treasury"),
             grace_period_duration_ms: 4_000,
             withdrawal_delay_ms: 6_000,
-            treasury_account_id: "treasury".into(),
-            operator_account_id: "operator".into(),
         };
         MockLez::new(config, &[("alice", 10_000), ("bob", 10_000)])
     }
@@ -335,20 +436,72 @@ pub(crate) mod test {
         IdentityKeys::generate::<PoseidonHash, ThreadRng>(&mut thread_rng())
     }
 
-    pub(crate) fn register(payer: &str, keys: &IdentityKeys, expiry_timestamp_ms: u64) -> Action {
-        Action::Register {
-            payer: payer.into(),
-            id_commitment: keys.id_commitment(),
-            rate_limit: 100,
-            expiry_timestamp_ms,
-            leaf_index: 0,
+    pub(crate) fn id_commitment(keys: &IdentityKeys) -> [u8; 32] {
+        fr_to_bytes_le(&keys.id_commitment())
+    }
+
+    pub(crate) fn tx(signer: &str, instruction: Instruction) -> Transaction {
+        Transaction {
+            signer: account(signer),
+            instruction,
         }
+    }
+
+    pub(crate) fn register(
+        payer: &str,
+        keys: &IdentityKeys,
+        expiry_timestamp_ms: u64,
+    ) -> Transaction {
+        tx(
+            payer,
+            Instruction::Register {
+                tree_id: TREE_ID,
+                id_commitment: id_commitment(keys),
+                rate_limit: 100,
+                expiry_timestamp_ms,
+            },
+        )
+    }
+
+    pub(crate) fn extend(
+        holder: &str,
+        keys: &IdentityKeys,
+        expiry_timestamp_ms: u64,
+    ) -> Transaction {
+        tx(
+            holder,
+            Instruction::Extend {
+                tree_id: TREE_ID,
+                id_commitment: id_commitment(keys),
+                expiry_timestamp_ms,
+            },
+        )
+    }
+
+    pub(crate) fn erase(holder: &str, keys: &IdentityKeys) -> Transaction {
+        tx(
+            holder,
+            Instruction::Erase {
+                tree_id: TREE_ID,
+                id_commitment: id_commitment(keys),
+            },
+        )
+    }
+
+    pub(crate) fn slash(slasher: &str, keys: &IdentityKeys) -> Transaction {
+        tx(
+            slasher,
+            Instruction::Slash {
+                tree_id: TREE_ID,
+                identity_secret: fr_to_bytes_le(&keys.identity_secret()),
+            },
+        )
     }
 
     #[test]
     fn test_register_reverts_when_tree_is_full() {
         let mut lez = new_lez();
-        lez.next_index = 1 << TREE_DEPTH;
+        lez.config.next_index = 1 << TREE_DEPTH;
         let err = lez
             .submit(register("alice", &new_keys(), 4_000))
             .unwrap_err();
@@ -356,40 +509,52 @@ pub(crate) mod test {
     }
 
     #[test]
+    fn test_successful_actions_emit_events_in_order() {
+        let mut lez = new_lez();
+        let (a, b) = (new_keys(), new_keys());
+        lez.submit(register("alice", &a, 8_000)).unwrap();
+        assert!(lez.submit(register("alice", &a, 8_000)).is_err());
+        lez.submit(register("bob", &b, 8_000)).unwrap();
+        let block = lez.produce_block(2_000);
+        assert_eq!(block.events.len(), 2, "a failed action emits nothing");
+        assert!(matches!(
+            block.events[1],
+            Event::Registered {
+                leaf_index: 1,
+                rate_limit: 100,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn test_extend_only_in_grace_period() {
         let mut lez = new_lez();
         let keys = new_keys();
         lez.submit(register("alice", &keys, 8_000)).unwrap();
-        let extend = |expiry_timestamp_ms| Action::Extend {
-            holder: "alice".into(),
-            id_commitment: keys.id_commitment(),
-            expiry_timestamp_ms,
-        };
         // now 0: grace period is [4000, 8000).
-        assert!(lez.submit(extend(12_000)).is_err());
+        assert!(lez.submit(extend("alice", &keys, 12_000)).is_err());
         lez.produce_block(2_000);
         lez.produce_block(2_000);
         // now 4000: in the grace period.
-        lez.submit(extend(12_000)).unwrap();
+        lez.submit(extend("alice", &keys, 12_000)).unwrap();
         lez.produce_block(4_000);
         lez.produce_block(4_000);
         // now 16000: expired, cannot be extended any more.
-        assert!(lez.submit(extend(20_000)).is_err());
+        assert!(lez.submit(extend("alice", &keys, 20_000)).is_err());
     }
 
     #[test]
-    fn test_erased_commitment_cannot_register_again() {
+    fn test_membership_keeps_its_own_withdrawal_delay() {
         let mut lez = new_lez();
         let keys = new_keys();
         lez.submit(register("alice", &keys, 4_000)).unwrap();
+        // The configuration changes after the registration: the membership keeps 6000.
+        lez.config.withdrawal_delay_ms = 60_000;
         lez.produce_block(10_000);
-        lez.submit(Action::Erase {
-            holder: "alice".into(),
-            id_commitment: keys.id_commitment(),
-        })
-        .unwrap();
+        lez.submit(erase("alice", &keys)).unwrap();
         assert!(matches!(
-            lez.membership_account(&keys.id_commitment()),
+            lez.membership_account(&id_commitment(&keys)),
             MembershipAccount::ClosedByErase
         ));
         let err = lez.submit(register("alice", &keys, 20_000)).unwrap_err();

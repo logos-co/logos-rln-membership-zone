@@ -1,15 +1,15 @@
-//! A reader (RFC "Derivation Rules"): holds the tree and applies the rules to every LEZ block.
-//! The Zone sequencer, every Zone indexer and every Module are readers, so they all hold the
-//! same tree and the same roots. This is what `rln-membership-core` will become.
+//! A reader (RFC "Derivation Rules"): holds the tree and applies the rules to the registration
+//! program's events of every LEZ block. The Zone sequencer and every Zone indexer are readers,
+//! so they hold the same tree and the same roots. This is what `rln-membership-core` will become.
 
 use std::collections::HashMap;
 
 use rln::prelude::{CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, PoseidonHash};
-use zerokit_utils::merkle_tree::{OptimalMerkleTree, ZerokitMerkleTree};
+use zerokit_utils::merkle_tree::{OptimalMerkleTree, ZerokitMerkleProof, ZerokitMerkleTree};
 
 use crate::{
     batch::Change,
-    lez::{Action, Block, MockLez},
+    lez::{Block, Event, MockLez},
 };
 
 pub const TREE_DEPTH: usize = 20;
@@ -22,18 +22,24 @@ pub fn fr_to_bytes_le(fr: &Fr) -> [u8; 32] {
     out
 }
 
-pub fn short(fr: &Fr) -> String {
-    hex::encode(&fr_to_bytes_le(fr)[..4])
+/// The field element 32 little-endian bytes encode, if they are below the modulus.
+pub fn fr_from_bytes_le(bytes: &[u8; 32]) -> Result<Fr, String> {
+    Fr::deserialize_compressed(&bytes[..]).map_err(|e| format!("not a field element: {e}"))
 }
 
-/// A live leaf as the reader tracks it; the expiry comes from LEZ, not from the batches.
+pub fn short(bytes: &[u8; 32]) -> String {
+    hex::encode(&bytes[..4])
+}
+
+/// A live leaf as the reader tracks it; the expiry comes from the events, not from the batches.
 #[derive(Debug, Clone, Copy)]
 pub struct Leaf {
     pub leaf_index: u64,
     pub expiry_timestamp_ms: u64,
 }
 
-/// Why a leaf left the tree. Read from LEZ and used for status only; batches do not carry it.
+/// Why a leaf left the tree. Read from the events and used for status only; batches do not
+/// carry it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Removed {
     Expired,
@@ -50,7 +56,10 @@ struct Applied {
 
 #[derive(Clone)]
 pub struct Reader {
+    /// The registry this reader follows; events of other registries are ignored.
+    tree_id: [u8; 32],
     tree: OptimalMerkleTree<PoseidonHash>,
+    /// Live leaves by identity commitment.
     live: HashMap<[u8; 32], Leaf>,
     removed: HashMap<[u8; 32], Removed>,
     /// One entry per LEZ block applied, in order: the root history and the changes.
@@ -62,8 +71,9 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub fn new() -> Self {
+    pub fn new(tree_id: [u8; 32]) -> Self {
         Self {
+            tree_id,
             tree: OptimalMerkleTree::default(TREE_DEPTH).expect("depth 20 tree"),
             live: HashMap::new(),
             removed: HashMap::new(),
@@ -73,8 +83,8 @@ impl Reader {
         }
     }
 
-    pub fn root(&self) -> Fr {
-        self.tree.root()
+    pub fn root(&self) -> [u8; 32] {
+        fr_to_bytes_le(&self.tree.root())
     }
 
     /// The root this reader held right after applying `block_id`, if it has applied it.
@@ -100,28 +110,26 @@ impl Reader {
         )
     }
 
-    /// Apply the derivation rules to one LEZ block and return the changes, in order.
+    /// Apply the derivation rules to the events of one LEZ block and return the changes, in
+    /// order.
     pub fn apply_block(&mut self, block: &Block) -> Vec<Change> {
         let mut changes = vec![];
-        for action in &block.actions {
-            match action {
-                Action::Register {
+        for event in &block.events {
+            match event {
+                Event::Registered {
+                    tree_id,
                     id_commitment,
                     rate_limit,
                     expiry_timestamp_ms,
                     leaf_index,
-                    ..
-                } => {
-                    // The registration program assigned `leaf_index` and enforced the capacity.
+                } if *tree_id == self.tree_id => {
                     // Leaf = rate commitment = poseidon(identity_commitment, rate_limit).
-                    let leaf =
-                        Hasher::<PoseidonHash>::hash_pair(*id_commitment, Fr::from(*rate_limit));
+                    let leaf = rate_commitment(id_commitment, *rate_limit);
                     self.tree
                         .set(*leaf_index as usize, leaf)
                         .expect("Register caps leaf_index below 2^depth");
-                    let key = fr_to_bytes_le(id_commitment);
                     self.live.insert(
-                        key,
+                        *id_commitment,
                         Leaf {
                             leaf_index: *leaf_index,
                             expiry_timestamp_ms: *expiry_timestamp_ms,
@@ -129,39 +137,42 @@ impl Reader {
                     );
                     changes.push(Change::insert(*leaf_index, fr_to_bytes_le(&leaf).to_vec()));
                 }
-                Action::Extend {
+                Event::Extended {
+                    tree_id,
                     id_commitment,
                     expiry_timestamp_ms,
-                    ..
-                } => {
+                } if *tree_id == self.tree_id => {
                     // No change: the tree is untouched, only the expiry the reader tracks moves.
-                    if let Some(leaf) = self.live.get_mut(&fr_to_bytes_le(id_commitment)) {
+                    if let Some(leaf) = self.live.get_mut(id_commitment) {
                         leaf.expiry_timestamp_ms = *expiry_timestamp_ms;
                     }
                 }
                 // Normally no change: `Erase` needs `now >= expiry + withdrawal delay`, and
                 // the previous block, whose timestamp is `now`, already expired the leaf.
                 // A still-live leaf means the program allowed an early `Erase`; remove it.
-                Action::Erase { id_commitment, .. } => {
-                    changes.extend(self.remove(fr_to_bytes_le(id_commitment), Removed::Expired));
+                Event::Erased {
+                    tree_id,
+                    id_commitment,
+                } if *tree_id == self.tree_id => {
+                    changes.extend(self.remove(*id_commitment, Removed::Expired));
                 }
-                Action::Slash {
-                    identity_secret, ..
-                } => {
-                    let key =
-                        fr_to_bytes_le(&Hasher::<PoseidonHash>::hash_single(*identity_secret));
-                    match self.remove(key, Removed::Slashed) {
+                Event::Slashed {
+                    tree_id,
+                    id_commitment,
+                } if *tree_id == self.tree_id => {
+                    match self.remove(*id_commitment, Removed::Slashed) {
                         Some(change) => changes.push(change),
                         // Slashed during the withdrawal delay: the leaf already expired, so no
                         // change, but the membership is reported as slashed.
                         None => {
-                            self.removed.insert(key, Removed::Slashed);
+                            self.removed.insert(*id_commitment, Removed::Slashed);
                         }
                     }
                 }
+                _ => {}
             }
         }
-        // Expiry after the block's actions, in leaf order, at most once per leaf.
+        // Expiry after the block's events, in leaf order, at most once per leaf.
         let mut expired: Vec<_> = self
             .live
             .iter()
@@ -176,7 +187,7 @@ impl Reader {
         self.applied_timestamp = block.timestamp;
         self.history.push(Applied {
             block_id: block.block_id,
-            root: fr_to_bytes_le(&self.tree.root()),
+            root: self.root(),
             changes: changes.clone(),
         });
         changes
@@ -191,68 +202,79 @@ impl Reader {
         Some(Change::remove(leaf.leaf_index))
     }
 
-    /// Check a snapshot's leaves against LEZ (RFC "Module Requirements / Sync"). The root
-    /// commits the leaves but not whose they are or when they expire, so every non-empty leaf
-    /// must come with an identity commitment whose open membership account reproduces it
-    /// (`leaf_index`, `poseidon(id_commitment, rate_limit)`), and its expiry is taken from that
-    /// account.
+    /// Check a snapshot's leaves against LEZ (RFC "Zone Indexer / Serving"). The root commits
+    /// the leaves but not whose they are or when they expire, so every non-empty leaf must
+    /// come with an identity commitment whose open membership account reproduces it
+    /// (`leaf_index`, `poseidon(id_commitment, rate_limit)`), and its expiry is taken from
+    /// that account.
     pub fn check_against_lez(&mut self, lez: &MockLez) -> Result<(), String> {
         for index in 0..self.tree.leaves_set() {
             let leaf = self.tree.get(index).map_err(|e| e.to_string())?;
             if leaf == Fr::default() {
                 continue;
             }
-            let (key, _) = self
+            let id_commitment = self
                 .live
                 .iter()
                 .find(|(_, tracked)| tracked.leaf_index == index as u64)
-                .map(|(key, tracked)| (*key, *tracked))
+                .map(|(key, _)| *key)
                 .ok_or(format!(
                     "leaf {index} has no identity commitment in the snapshot"
                 ))?;
-            let id_commitment = Fr::deserialize_compressed(&key[..]).map_err(|e| e.to_string())?;
             let membership = lez.membership(&id_commitment).ok_or(format!(
                 "leaf {index} has no open membership account on LEZ"
             ))?;
             if membership.leaf_index != index as u64
-                || Hasher::<PoseidonHash>::hash_pair(id_commitment, Fr::from(membership.rate_limit))
-                    != leaf
+                || rate_commitment(&id_commitment, membership.rate_limit) != leaf
             {
                 return Err(format!(
                     "leaf {index} does not match its membership account"
                 ));
             }
-            if let Some(tracked) = self.live.get_mut(&key) {
+            if let Some(tracked) = self.live.get_mut(&id_commitment) {
                 tracked.expiry_timestamp_ms = membership.expiry_timestamp_ms;
             }
         }
         Ok(())
     }
 
-    pub fn leaf_index(&self, id_commitment: &Fr) -> Option<u64> {
+    /// The Merkle proof path of a live leaf at this reader's current root: the sibling
+    /// elements from the leaf up, and the side of each.
+    pub fn proof_path(&self, id_commitment: &[u8; 32]) -> Option<(Vec<Fr>, Vec<u8>)> {
+        let leaf = self.live_leaf(id_commitment)?;
+        let proof = self.tree.proof(leaf.leaf_index as usize).ok()?;
+        Some((proof.get_path_elements(), proof.get_path_index()))
+    }
+
+    pub fn leaf_index(&self, id_commitment: &[u8; 32]) -> Option<u64> {
         self.live_leaf(id_commitment).map(|l| l.leaf_index)
     }
 
-    pub fn live_leaf(&self, id_commitment: &Fr) -> Option<Leaf> {
-        self.live.get(&fr_to_bytes_le(id_commitment)).copied()
+    pub fn live_leaf(&self, id_commitment: &[u8; 32]) -> Option<Leaf> {
+        self.live.get(id_commitment).copied()
     }
 
-    pub fn removed(&self, id_commitment: &Fr) -> Option<Removed> {
-        self.removed.get(&fr_to_bytes_le(id_commitment)).copied()
+    pub fn removed(&self, id_commitment: &[u8; 32]) -> Option<Removed> {
+        self.removed.get(id_commitment).copied()
     }
+}
+
+/// `poseidon(id_commitment, rate_limit)`, the leaf of a membership. An identity commitment
+/// that is not a field element cannot have been registered; the leaf is then the empty one.
+fn rate_commitment(id_commitment: &[u8; 32], rate_limit: u64) -> Fr {
+    fr_from_bytes_le(id_commitment)
+        .map(|id| Hasher::<PoseidonHash>::hash_pair(id, Fr::from(rate_limit)))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
-    use crate::lez::{
-        MockLez,
-        test::{new_keys, new_lez, register},
-    };
+    use crate::lez::test::{extend, id_commitment, new_keys, new_lez, register, slash};
 
     /// Apply every LEZ block to a fresh reader and return the changes per block.
     pub(crate) fn replay(lez: &MockLez) -> (Reader, Vec<Vec<Change>>) {
-        let mut reader = Reader::new();
+        let mut reader = Reader::new(lez.config.tree_id);
         let changes = lez
             .blocks(1, lez.last_block_id())
             .iter()
@@ -279,19 +301,14 @@ pub(crate) mod test {
         let keys = new_keys();
         lez.submit(register("alice", &keys, 8_000)).unwrap();
         lez.produce_block(4_000);
-        lez.submit(Action::Extend {
-            holder: "alice".into(),
-            id_commitment: keys.id_commitment(),
-            expiry_timestamp_ms: 12_000,
-        })
-        .unwrap();
+        lez.submit(extend("alice", &keys, 12_000)).unwrap();
         lez.produce_block(2_000);
         // At 10000 the old expiry (8000) has passed, the new one (12000) has not.
         lez.produce_block(4_000);
         let (reader, changes) = replay(&lez);
         assert!(changes[1].is_empty());
         assert!(changes[2].is_empty());
-        assert_eq!(reader.leaf_index(&keys.id_commitment()), Some(0));
+        assert_eq!(reader.leaf_index(&id_commitment(&keys)), Some(0));
     }
 
     #[test]
@@ -302,36 +319,36 @@ pub(crate) mod test {
         lez.produce_block(2_000);
         lez.produce_block(2_000);
         // Expired at 4000; the account stays open until 4000 + withdrawal delay.
-        lez.submit(Action::Slash {
-            slasher: "carol".into(),
-            identity_secret: *keys.identity_secret(),
-        })
-        .unwrap();
+        lez.submit(slash("carol", &keys)).unwrap();
         lez.produce_block(2_000);
         let (reader, changes) = replay(&lez);
         assert_eq!(changes[1], vec![Change::remove(0)]);
         assert!(changes[2].is_empty());
         assert_eq!(
-            reader.removed(&keys.id_commitment()),
+            reader.removed(&id_commitment(&keys)),
             Some(Removed::Slashed)
         );
     }
 
     #[test]
-    fn test_roots_are_tagged_by_block() {
+    fn test_roots_are_tagged_by_block_and_other_trees_are_ignored() {
         let mut lez = new_lez();
-        lez.submit(register("alice", &new_keys(), 8_000)).unwrap();
+        let keys = new_keys();
+        lez.submit(register("alice", &keys, 8_000)).unwrap();
         lez.produce_block(2_000);
         lez.produce_block(2_000);
         let (reader, _) = replay(&lez);
         assert_eq!(reader.root_at(1), reader.root_at(2));
-        assert_eq!(reader.root_at(2), Some(fr_to_bytes_le(&reader.root())));
+        assert_eq!(reader.root_at(2), Some(reader.root()));
         assert_eq!(reader.root_at(3), None);
-        assert_eq!(
-            reader.changes_in(1, 2).map(|c| c.len()),
-            Some(1),
-            "one Insert over both blocks"
-        );
+        assert_eq!(reader.changes_in(1, 2).map(|c| c.len()), Some(1));
         assert_eq!(reader.changes_in(1, 3), None);
+        let (path, index) = reader.proof_path(&id_commitment(&keys)).unwrap();
+        assert_eq!((path.len(), index.len()), (TREE_DEPTH, TREE_DEPTH));
+        // A reader of another registry sees no change.
+        let mut other = Reader::new([7; 32]);
+        for block in lez.blocks(1, 2) {
+            assert!(other.apply_block(block).is_empty());
+        }
     }
 }

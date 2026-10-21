@@ -1,22 +1,39 @@
-//! The Zone indexer (RFC "Zone Indexer"): a reader that follows LEZ like every other reader,
-//! checks every batch on the Zone channel against what it derived (range, changes, root) and
-//! keeps the verdicts. A Rejected batch changes nothing: the next batch must continue from the
-//! last Verified one. It can also serve its tree as a snapshot to a Module that syncs.
+//! The Zone indexer (RFC "Zone Indexer"): a reader that follows LEZ, checks every batch on the
+//! Zone channel against what it derived (range, changes, root), keeps the verdicts, and serves
+//! the registry to Modules as their registry access (RFC "Serving"): the valid roots, a leaf's
+//! Merkle proof path at the newest valid root, and the membership state and clock it reads
+//! from LEZ. A Rejected batch changes nothing and its root is never a valid root.
 
 use prost::Message;
+use rln::prelude::Fr;
 
 use crate::{
-    batch::Batch,
-    lez::{Block, FIRST_LEZ_BLOCK_ID},
+    batch::{Batch, Kind},
+    lez::{Block, FIRST_LEZ_BLOCK_ID, MembershipAccount, MockLez},
     reader::Reader,
 };
+
+/// Valid-root window length in LEZ blocks (RFC Q3): how far a root may trail the newest one
+/// and still be accepted, and how far a Module may trail LEZ and still be ready.
+pub const WINDOW_LENGTH_BLOCKS: u64 = 3;
+
+/// A Verified batch as the root history keeps it.
+#[derive(Debug, Clone)]
+pub struct VerifiedBatch {
+    pub to_lez_block_id: u64,
+    pub root_after: [u8; 32],
+    /// Whether the batch holds a `Remove`: the valid-root window resets at it.
+    pub removes: bool,
+}
 
 pub struct ZoneIndexer {
     pub reader: Reader,
     /// `to_lez_block_id` of the last Verified batch: where the next batch must start.
     pub verified_to: u64,
-    pub verified: u64,
-    /// The tree at `verified_to`: what a snapshot may hand out, since a Module can check it.
+    /// The Verified batches, in Bedrock order. The mock Bedrock has no reorgs, so every
+    /// Verified batch is at the reference depth at once.
+    pub history: Vec<VerifiedBatch>,
+    /// The tree at `verified_to`: the newest valid root, where proof paths are served from.
     verified_reader: Reader,
     /// LEZ blocks applied after `verified_to`, to bring `verified_reader` forward.
     unverified_blocks: Vec<Block>,
@@ -25,12 +42,12 @@ pub struct ZoneIndexer {
 }
 
 impl ZoneIndexer {
-    pub fn new() -> Self {
+    pub fn new(tree_id: [u8; 32]) -> Self {
         Self {
-            reader: Reader::new(),
+            reader: Reader::new(tree_id),
             verified_to: FIRST_LEZ_BLOCK_ID - 1,
-            verified: 0,
-            verified_reader: Reader::new(),
+            history: Vec::new(),
+            verified_reader: Reader::new(tree_id),
             unverified_blocks: Vec::new(),
             rejected: Vec::new(),
         }
@@ -40,19 +57,112 @@ impl ZoneIndexer {
         &self.rejected
     }
 
+    pub fn verified(&self) -> u64 {
+        self.history.len() as u64
+    }
+
     /// Apply a LEZ block, as every reader does, as soon as it is closed.
     pub fn apply_block(&mut self, block: &Block) {
         self.reader.apply_block(block);
         self.unverified_blocks.push(block.clone());
     }
 
-    /// A snapshot for a syncing Module: the tree at the last Verified batch's
-    /// `to_lez_block_id`, so the Module can check its root against that batch before applying
-    /// the LEZ blocks since (RFC "Module Requirements / Sync").
-    #[allow(dead_code)]
+    // Serving (RFC "Zone Indexer / Serving").
+
+    /// The valid roots, newest last: the Verified batches from the last one holding a
+    /// `Remove` on, no older in LEZ blocks than the window length.
+    pub fn valid_roots(&self) -> Vec<VerifiedBatch> {
+        let Some(newest) = self.history.last() else {
+            return vec![];
+        };
+        let start = self
+            .history
+            .iter()
+            .rposition(|batch| batch.removes)
+            .unwrap_or(0);
+        self.history[start..]
+            .iter()
+            .filter(|batch| batch.to_lez_block_id + WINDOW_LENGTH_BLOCKS >= newest.to_lez_block_id)
+            .cloned()
+            .collect()
+    }
+
+    pub fn newest_valid_root(&self) -> Option<&VerifiedBatch> {
+        self.history.last()
+    }
+
+    /// A leaf's Merkle proof path at the newest valid root, if the leaf is live in it.
+    pub fn proof_path(&self, id_commitment: &[u8; 32]) -> Option<(Vec<Fr>, Vec<u8>)> {
+        self.verified_reader.proof_path(id_commitment)
+    }
+
+    /// The tree at the newest valid root, for what a Module asks about its own leaf.
+    pub fn served_tree(&self) -> &Reader {
+        &self.verified_reader
+    }
+
+    /// The membership state the indexer reads from LEZ.
+    pub fn membership_state<'a>(
+        &self,
+        lez: &'a MockLez,
+        id_commitment: &[u8; 32],
+    ) -> MembershipAccount<'a> {
+        lez.membership_account(id_commitment)
+    }
+
+    /// The latest LEZ `timestamp` the indexer has read.
+    pub fn clock(&self, lez: &MockLez) -> u64 {
+        lez.now()
+    }
+
+    /// A snapshot for another Zone indexer that starts: the tree at the last Verified batch's
+    /// `to_lez_block_id`, to be checked against that batch and against LEZ before use.
     pub fn snapshot(&self) -> (u64, Reader) {
         (self.verified_to, self.verified_reader.clone())
     }
+
+    /// Start from another Zone indexer's snapshot instead of replaying LEZ: the snapshot is
+    /// tagged with the `to_lez_block_id` of `batch`, its root must equal `root_after`, and its
+    /// leaves must match LEZ; the snapshot is trusted for nothing else. The LEZ blocks since
+    /// are applied as usual afterwards.
+    pub fn sync(
+        &mut self,
+        snapshot: (u64, Reader),
+        batch: &Batch,
+        lez: &MockLez,
+    ) -> Result<(), String> {
+        let (tag, mut reader) = snapshot;
+        if tag != batch.to_lez_block_id || reader.applied_block_id != tag {
+            return Err(format!(
+                "snapshot at LEZ block {tag} is not the batch's block {}",
+                batch.to_lez_block_id
+            ));
+        }
+        let root_after: [u8; 32] = batch
+            .root_after
+            .as_slice()
+            .try_into()
+            .map_err(|_| "root_after is not 32 bytes")?;
+        if reader.root() != root_after {
+            return Err("snapshot root differs from the batch".into());
+        }
+        reader.check_against_lez(lez)?;
+        self.verified_to = tag;
+        self.history = vec![VerifiedBatch {
+            to_lez_block_id: tag,
+            root_after,
+            removes: batch
+                .changes
+                .iter()
+                .any(|c| matches!(c.kind, Some(Kind::Remove(_)))),
+        }];
+        self.verified_reader = reader.clone();
+        self.reader = reader;
+        self.unverified_blocks.clear();
+        Ok(())
+    }
+
+    // Checking (RFC "Zone Indexer").
 
     /// Check one batch. A Rejected batch is recorded and skipped; `verified_to` stays where the
     /// last Verified batch left it.
@@ -113,8 +223,15 @@ impl ZoneIndexer {
         }
 
         self.verified_to = batch.to_lez_block_id;
-        self.verified += 1;
-        // Bring the snapshot tree up to the Verified batch.
+        self.history.push(VerifiedBatch {
+            to_lez_block_id: batch.to_lez_block_id,
+            root_after,
+            removes: batch
+                .changes
+                .iter()
+                .any(|c| matches!(c.kind, Some(Kind::Remove(_)))),
+        });
+        // Bring the served tree up to the Verified batch.
         let still_unverified = self
             .unverified_blocks
             .iter()
@@ -128,26 +245,26 @@ impl ZoneIndexer {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
     use crate::{
         batch::Change,
         lez::{
-            Action, MockLez,
-            test::{new_keys, new_lez, register},
+            Event,
+            test::{TREE_ID, id_commitment, new_keys, new_lez, register, slash},
         },
     };
 
     /// An indexer that has applied every LEZ block.
-    fn synced(lez: &MockLez) -> ZoneIndexer {
-        let mut indexer = ZoneIndexer::new();
+    pub(crate) fn synced(lez: &MockLez) -> ZoneIndexer {
+        let mut indexer = ZoneIndexer::new(lez.config.tree_id);
         for block in lez.blocks(1, lez.last_block_id()) {
             indexer.apply_block(block);
         }
         indexer
     }
 
-    fn batch(reader: &Reader, from: u64, to: u64, changes: Vec<Change>) -> Vec<u8> {
+    pub(crate) fn batch(reader: &Reader, from: u64, to: u64, changes: Vec<Change>) -> Vec<u8> {
         Batch {
             from_lez_block_id: from,
             to_lez_block_id: to,
@@ -157,39 +274,128 @@ mod test {
         .encode_to_vec()
     }
 
+    /// Verify honest batches, one per LEZ block, up to `to`.
+    pub(crate) fn verify_through(indexer: &mut ZoneIndexer, to: u64) {
+        let reader = indexer.reader.clone();
+        for block_id in indexer.verified_to + 1..=to {
+            let changes = reader.changes_in(block_id, block_id).unwrap();
+            indexer
+                .on_batch(&batch(&reader, block_id, block_id, changes))
+                .unwrap();
+        }
+    }
+
     #[test]
     fn test_rejected_batch_changes_nothing() {
         let mut lez = new_lez();
         let keys = new_keys();
         lez.submit(register("alice", &keys, 8_000)).unwrap();
         lez.produce_block(2_000);
-        lez.submit(Action::Slash {
-            slasher: "carol".into(),
-            identity_secret: *keys.identity_secret(),
-        })
-        .unwrap();
+        lez.submit(slash("carol", &keys)).unwrap();
         lez.produce_block(2_000);
         lez.produce_block(2_000);
         let mut indexer = synced(&lez);
         let reader = indexer.reader.clone();
         let honest = |from, to| batch(&reader, from, to, reader.changes_in(from, to).unwrap());
-        // Block 1 Verified; the snapshot stops there even though the tree is at block 3.
+        // Block 1 Verified; the served tree stops there even though the reader is at block 3.
         assert!(indexer.on_batch(&honest(1, 1)).is_ok());
         assert_eq!(indexer.verified_to, 1);
-        let (tag, snapshot) = indexer.snapshot();
-        assert_eq!((tag, snapshot.applied_block_id), (1, 1));
-        assert_eq!(snapshot.root_at(1), reader.root_at(1));
-        // Block 2 without the Remove: Rejected, the mark stays.
+        assert_eq!(indexer.served_tree().applied_block_id, 1);
+        assert!(indexer.proof_path(&id_commitment(&keys)).is_some());
+        // Block 2 without the Remove: Rejected, the mark stays, no new valid root.
         let censored = batch(&reader, 2, 2, vec![]);
         let err = indexer.on_batch(&censored).unwrap_err();
         assert!(err.contains("Remove leaf 0 omitted"), "{err}");
-        assert_eq!(indexer.verified_to, 1);
+        assert_eq!((indexer.verified_to, indexer.valid_roots().len()), (1, 1));
         // A batch continuing from the Rejected one is Rejected too.
         assert!(indexer.on_batch(&honest(3, 3)).is_err());
-        // The correct block 2 batch is Verified.
+        // The correct block 2 batch is Verified: the window resets at its Remove.
         assert!(indexer.on_batch(&honest(2, 2)).is_ok());
-        assert_eq!((indexer.verified_to, indexer.verified), (2, 2));
-        assert_eq!(indexer.snapshot().1.applied_block_id, 2);
+        assert_eq!((indexer.verified_to, indexer.verified()), (2, 2));
+        assert_eq!(indexer.valid_roots().len(), 1);
+        assert!(indexer.proof_path(&id_commitment(&keys)).is_none());
         assert_eq!(indexer.rejected().len(), 2);
+    }
+
+    #[test]
+    fn test_sync_checks_the_snapshot_against_the_batch_and_lez() {
+        let mut lez = new_lez();
+        let (alice, bob) = (new_keys(), new_keys());
+        lez.submit(register("alice", &alice, 20_000)).unwrap();
+        lez.submit(register("bob", &bob, 20_000)).unwrap();
+        lez.produce_block(2_000);
+        lez.produce_block(2_000);
+        let mut service = synced(&lez);
+        verify_through(&mut service, 2);
+        let batch = Batch::decode(
+            batch(
+                &service.reader,
+                2,
+                2,
+                service.reader.changes_in(2, 2).unwrap(),
+            )
+            .as_slice(),
+        )
+        .unwrap();
+        // A new indexer syncs from the snapshot, then applies block 3 like any reader.
+        lez.produce_block(2_000);
+        let mut own = ZoneIndexer::new(TREE_ID);
+        own.sync(service.snapshot(), &batch, &lez).unwrap();
+        for block in lez.blocks(3, 3) {
+            own.apply_block(block);
+        }
+        assert_eq!((own.verified_to, own.reader.applied_block_id), (2, 3));
+        assert_eq!(
+            own.proof_path(&id_commitment(&bob)).map(|(p, _)| p.len()),
+            Some(20)
+        );
+        // A snapshot whose expiry for alice is wrong (same tree, same root): LEZ corrects it.
+        let (tag, mut tampered) = service.snapshot();
+        tampered.apply_block(&Block {
+            block_id: tag,
+            timestamp: 4_000,
+            events: vec![Event::Extended {
+                tree_id: TREE_ID,
+                id_commitment: id_commitment(&alice),
+                expiry_timestamp_ms: 99_000,
+            }],
+        });
+        own.sync((tag, tampered), &batch, &lez).unwrap();
+        assert_eq!(
+            own.served_tree()
+                .live_leaf(&id_commitment(&alice))
+                .unwrap()
+                .expiry_timestamp_ms,
+            20_000
+        );
+        // A snapshot with another tree: the root check fails.
+        let (tag, mut other) = service.snapshot();
+        other.apply_block(&Block {
+            block_id: tag,
+            timestamp: 4_000,
+            events: vec![Event::Slashed {
+                tree_id: TREE_ID,
+                id_commitment: id_commitment(&bob),
+            }],
+        });
+        assert!(own.sync((tag, other), &batch, &lez).is_err());
+    }
+
+    #[test]
+    fn test_valid_roots_are_bounded_by_the_window_length() {
+        let mut lez = new_lez();
+        lez.submit(register("alice", &new_keys(), 60_000)).unwrap();
+        for _ in 0..6 {
+            lez.produce_block(2_000);
+        }
+        let mut indexer = synced(&lez);
+        verify_through(&mut indexer, 6);
+        // Six Verified batches, no Remove: only those within 3 LEZ blocks of the newest.
+        let roots: Vec<_> = indexer
+            .valid_roots()
+            .iter()
+            .map(|b| b.to_lez_block_id)
+            .collect();
+        assert_eq!(roots, vec![3, 4, 5, 6]);
     }
 }

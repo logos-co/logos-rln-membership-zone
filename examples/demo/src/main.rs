@@ -1,20 +1,25 @@
 //! End-to-end demo of the RLN Membership Zone RFC (`docs/rfc-rln-membership-zone.md`).
 //!
 //! One process plays every role, named as in the RFC:
-//! - a mock LEZ with the registration program (`lez.rs`), producing one block per tick;
-//! - a reader (`reader.rs`): the derivation rules and the tree, shared by the three roles below;
+//! - a mock LEZ with the registration program (`lez.rs`), producing one block per tick with
+//!   the events of its successful actions;
+//! - a reader (`reader.rs`): the derivation rules and the tree, shared by the two roles below;
 //! - the Zone sequencer (`sequencer.rs`): builds one batch (`batch.rs`) per tick from the LEZ
 //!   blocks not covered yet and publishes it on the real local chain through the Zone SDK;
-//! - a Zone indexer (`indexer.rs`): checks every finalized batch against LEZ;
-//! - three Modules (`module.rs`): alice's and bob's apply every LEZ block to their own tree,
-//!   report their membership status and compare their roots with the batches; carol's starts
-//!   late and syncs from the Zone indexer's snapshot, checked against a batch and against LEZ.
+//! - a Zone indexer (`indexer.rs`): checks every finalized batch against LEZ and serves the
+//!   registry to the Modules, as their registry access: valid roots, proof paths, membership
+//!   state, the LEZ clock;
+//! - three Modules (`module.rs`), alice's, bob's and carol's: no tree; they report their
+//!   membership status from their registry access, prove against the newest valid root and
+//!   validate against the valid-root window. Alice and bob read the shared Zone indexer;
+//!   carol starts late with her own Zone indexer, synced from the shared one's snapshot
+//!   (checked against a Verified batch and against LEZ) and following LEZ from there.
 //!
 //! The scripted scenario: alice and bob register, bob double-signals and is slashed by carol,
 //! alice extends, expires and erases. `--dishonest-sequencer` makes the Zone sequencer omit
 //! bob's slash from its tree and its batch: the Zone indexer marks the batch Rejected (an
-//! omission is provable censorship) and every Module, which reads LEZ itself, sees its own root
-//! diverge from the batch.
+//! omission is provable censorship), no newer root becomes valid, and the registry pauses
+//! until a correct batch arrives.
 
 mod batch;
 mod indexer;
@@ -40,17 +45,15 @@ use lb_zone_sdk::{
         Error as SeqError, Event, FinalizedOp, FundingConfig, ZoneSequencer as SdkSequencer,
     },
 };
-use prost::Message;
 use rand::{RngCore, rngs::ThreadRng, thread_rng};
 use reqwest::Url;
 use rln::prelude::{IdentityKeys, PoseidonHash};
 
 use crate::{
-    batch::Batch,
     indexer::ZoneIndexer,
-    lez::{Action, ConfigState, MockLez},
+    lez::{ConfigState, Instruction, MockLez, Transaction, account, account_name},
     module::Module,
-    reader::short,
+    reader::{fr_to_bytes_le, short},
     sequencer::ZoneSequencer,
 };
 
@@ -58,7 +61,7 @@ use crate::{
 const BLOCK_MS: u64 = 2_000;
 /// Last scripted LEZ block; the demo ends once the Zone indexer has verified it.
 const LAST_BLOCK: u64 = 13;
-/// LEZ block at which carol's Module starts, with no tree yet.
+/// LEZ block at which carol's Module and her own Zone indexer start.
 const LATE_MODULE_BLOCK: u64 = 6;
 
 #[derive(Parser, Debug)]
@@ -132,47 +135,63 @@ fn script(block_id: u64) -> Vec<Step> {
     }
 }
 
-/// Build the registration-program action for a scripted step.
-fn to_action(step: &Step, modules: &[Module], lez: &MockLez) -> Action {
+/// Build the registration-program transaction for a scripted step.
+fn to_transaction(step: &Step, modules: &[Module], lez: &MockLez) -> Transaction {
     let module = |name: &str| {
         modules
             .iter()
             .find(|m| m.name == name)
             .expect("scripted member")
     };
-    match step {
+    let tree_id = lez.config.tree_id;
+    let (signer, instruction) = match step {
         Step::Register {
             who,
             rate_limit,
             active_duration_ms,
-        } => Action::Register {
-            payer: (*who).into(),
-            id_commitment: module(who).id_commitment(),
-            rate_limit: *rate_limit,
-            expiry_timestamp_ms: lez.now() + active_duration_ms,
-            leaf_index: 0,
-        },
+        } => (
+            who,
+            Instruction::Register {
+                tree_id,
+                id_commitment: module(who).id_commitment(),
+                rate_limit: *rate_limit,
+                expiry_timestamp_ms: lez.now() + active_duration_ms,
+            },
+        ),
         Step::Extend { who, extra_ms } => {
             let id_commitment = module(who).id_commitment();
             let expiry = lez
                 .membership(&id_commitment)
                 .map_or(0, |m| m.expiry_timestamp_ms);
-            Action::Extend {
-                holder: (*who).into(),
-                id_commitment,
-                expiry_timestamp_ms: expiry + extra_ms,
-            }
+            (
+                who,
+                Instruction::Extend {
+                    tree_id,
+                    id_commitment,
+                    expiry_timestamp_ms: expiry + extra_ms,
+                },
+            )
         }
         // In reality the slasher learns the secret from `validate_proof`
         // (PROOF_RATE_LIMIT_VIOLATION, `recovered_secret`); here we take it directly.
-        Step::Slash { who, by } => Action::Slash {
-            slasher: (*by).into(),
-            identity_secret: *module(who).keys.identity_secret(),
-        },
-        Step::Erase { who } => Action::Erase {
-            holder: (*who).into(),
-            id_commitment: module(who).id_commitment(),
-        },
+        Step::Slash { who, by } => (
+            by,
+            Instruction::Slash {
+                tree_id,
+                identity_secret: fr_to_bytes_le(&module(who).keys.identity_secret()),
+            },
+        ),
+        Step::Erase { who } => (
+            who,
+            Instruction::Erase {
+                tree_id,
+                id_commitment: module(who).id_commitment(),
+            },
+        ),
+    };
+    Transaction {
+        signer: account(signer),
+        instruction,
     }
 }
 
@@ -189,21 +208,56 @@ fn parse_funding_pk(hex_str: &str) -> Result<ZkPublicKey> {
     ))
 }
 
-/// One line per Module: its leaf in its own tree and its membership status.
-fn print_modules(modules: &[Module], lez: &MockLez) {
+/// One line per Module: its membership status and readiness, as its registry access serves them.
+fn print_modules(modules: &[Module], indexers: &[ZoneIndexer], lez: &MockLez) {
     for m in modules {
-        let leaf = m
-            .reader
+        let access = &indexers[m.access];
+        let leaf = access
+            .served_tree()
             .leaf_index(&m.id_commitment())
             .map_or("-".into(), |i| i.to_string());
         println!(
-            "  module {:5} {}.. leaf {:>2}  {}  (applied LEZ block {}, root {}..)",
+            "  module {:5} {}.. leaf {:>2}  {:36} {}",
             m.name,
             short(&m.id_commitment()),
             leaf,
-            m.status(lez),
-            m.reader.applied_block_id,
-            short(&m.reader.root())
+            m.status(access, lez),
+            if m.is_ready(access, lez) {
+                "ready"
+            } else {
+                "RLN_ERR_NOT_READY"
+            }
+        );
+    }
+}
+
+/// Every Module as generator proves against the newest valid root; every other Module as
+/// validator checks that root against its window.
+fn print_proofs(modules: &[Module], indexers: &[ZoneIndexer], lez: &MockLez) {
+    for generator in modules {
+        let Some((root, path_len)) = generator.generate(&indexers[generator.access], lez) else {
+            continue;
+        };
+        let verdicts: Vec<_> = modules
+            .iter()
+            .filter(|v| v.name != generator.name)
+            .map(|v| {
+                format!(
+                    "{} {}",
+                    v.name,
+                    if v.validate(&indexers[v.access], lez, &root) {
+                        "accepts"
+                    } else {
+                        "rejects"
+                    }
+                )
+            })
+            .collect();
+        println!(
+            "  module {:5} proves against root {}.. (path of {path_len}); {}",
+            generator.name,
+            hex::encode(&root[..4]),
+            verdicts.join(", ")
         );
     }
 }
@@ -236,32 +290,39 @@ async fn main() -> Result<()> {
     let node = NodeHttpClient::new(CommonHttpClient::new(auth), node_url.clone());
     let mut sdk = SdkSequencer::init(channel_id, signing_key, node, funding, None);
 
+    let new_module = |name, access| {
+        Module::new(
+            name,
+            IdentityKeys::generate::<PoseidonHash, ThreadRng>(&mut thread_rng()),
+            access,
+        )
+    };
     let mut modules: Vec<Module> = ["alice", "bob"]
         .into_iter()
-        .map(|name| {
-            Module::new(
-                name,
-                IdentityKeys::generate::<PoseidonHash, ThreadRng>(&mut thread_rng()),
-            )
-        })
+        .map(|name| new_module(name, 0))
         .collect();
     let config = ConfigState {
+        zone_channel_id: channel_id.into(),
+        operator_account_id: account("operator"),
+        registration_fee: 5,
+        epoch_size_sec: 600,
         min_rate_limit: 100,
         max_rate_limit: 600,
-        price_per_unit: 10,
-        registration_fee: 5,
         min_active_duration_ms: 4_000,
         max_active_duration_ms: 60_000,
+        tree_id: [0; 32],
+        next_index: 0,
+        price_per_unit: 10,
+        treasury_account_id: account("treasury"),
         grace_period_duration_ms: 4_000,
         withdrawal_delay_ms: 6_000,
-        treasury_account_id: "treasury".into(),
-        operator_account_id: "operator".into(),
     };
     let mut lez = MockLez::new(config, &[("alice", 10_000), ("bob", 10_000)]);
-    let mut zone_sequencer = ZoneSequencer::new(args.dishonest_sequencer);
-    let mut indexer = ZoneIndexer::new();
-    // A Module that starts late: it answers RLN_ERR_NOT_READY until it has synced.
-    let mut late_module: Option<Module> = None;
+    let mut zone_sequencer = ZoneSequencer::new(lez.config.tree_id, args.dishonest_sequencer);
+    // The Zone indexers the Modules read: index 0 is the shared service alice and bob read,
+    // index 1 is carol's own, added when she starts.
+    let mut indexers = vec![ZoneIndexer::new(lez.config.tree_id)];
+    let mut own_synced = false;
 
     println!("RLN Membership Zone demo");
     println!("  node     {node_url}");
@@ -273,6 +334,14 @@ async fn main() -> Result<()> {
             .map(|m| format!("{} {}..", m.name, short(&m.id_commitment())))
             .collect::<Vec<_>>()
             .join(", ")
+    );
+    println!(
+        "  registry zone channel {}.., tree {}.., epoch {} s, treasury {}, operator {}",
+        hex::encode(&lez.config.zone_channel_id[..4]),
+        hex::encode(&lez.config.tree_id[..4]),
+        lez.config.epoch_size_sec,
+        account_name(&lez.config.treasury_account_id),
+        account_name(&lez.config.operator_account_id)
     );
     println!("  dishonest sequencer {}", args.dishonest_sequencer);
     println!("waiting for the Zone sequencer to be ready...");
@@ -305,67 +374,68 @@ async fn main() -> Result<()> {
                         if in_flight == Some(info.this_msg) {
                             in_flight = None;
                         }
-                        // The Zone indexer checks the batch against LEZ and says what is wrong;
-                        // every Module reads the same batch and only compares its own root.
-                        match indexer.on_batch(&info.payload) {
+                        // Every Zone indexer checks the batch against LEZ; a Verified batch's root
+                        // becomes a valid root for every Module it serves.
+                        let verdict = indexers[0].on_batch(&info.payload);
+                        if own_synced {
+                            let _ = indexers[1].on_batch(&info.payload);
+                        }
+                        match verdict {
                             Ok(batch) => {
-                                println!("zone indexer: batch [{}..{}] Verified, root {}..", batch.from_lez_block_id, batch.to_lez_block_id, hex::encode(&batch.root_after[..4]));
-                                // The late Module syncs from the indexer's snapshot of this batch.
-                                if let Some(mut m) = late_module.take() {
-                                    let (tag, snapshot) = indexer.snapshot();
-                                    match m.sync((tag, snapshot), &batch, &lez) {
+                                let window: Vec<_> = indexers[0].valid_roots().iter().map(|b| format!("{}@{}", hex::encode(&b.root_after[..4]), b.to_lez_block_id)).collect();
+                                println!("zone indexer: batch [{}..{}] Verified; valid roots: {}", batch.from_lez_block_id, batch.to_lez_block_id, window.join(" "));
+                                // Carol's own indexer syncs from the service's snapshot of this batch.
+                                if indexers.len() > 1 && !own_synced {
+                                    let snapshot = indexers[0].snapshot();
+                                    match indexers[1].sync(snapshot, &batch, &lez) {
                                         Ok(()) => {
-                                            println!("  module {:5} synced from a snapshot at LEZ block {tag}: root checked against the batch, leaves against LEZ; applied LEZ block {}, ready", m.name, m.reader.applied_block_id);
-                                            modules.push(m);
+                                            own_synced = true;
+                                            let from = indexers[1].verified_to + 1;
+                                            for block in lez.blocks(from, lez.last_block_id()) {
+                                                indexers[1].apply_block(block);
+                                            }
+                                            println!("  carol's own Zone indexer synced from the service's snapshot at LEZ block {}: root checked against the batch, leaves against LEZ; at LEZ block {} now", batch.to_lez_block_id, indexers[1].reader.applied_block_id);
                                         }
-                                        Err(reason) => {
-                                            println!("  module {:5} rejected the snapshot: {reason}", m.name);
-                                            late_module = Some(m);
-                                        }
+                                        Err(reason) => println!("  carol's own Zone indexer rejected the snapshot: {reason}"),
                                     }
                                 }
+                                print_modules(&modules, &indexers, &lez);
+                                print_proofs(&modules, &indexers, &lez);
                             }
-                            Err(reason) => println!("zone indexer: batch REJECTED: {reason}"),
-                        }
-                        let Ok(batch) = Batch::decode(info.payload.as_slice()) else { continue };
-                        for m in &modules {
-                            match m.compare(&batch) {
-                                Ok(Some(())) => println!("  module {:5} root at LEZ block {} matches the batch", m.name, batch.to_lez_block_id),
-                                Ok(None) => println!("  module {:5} has not applied LEZ block {} yet", m.name, batch.to_lez_block_id),
-                                Err(reason) => println!("  module {:5} DIVERGES from the Zone: {reason}", m.name),
-                            }
+                            Err(reason) => println!("zone indexer: batch REJECTED, no new valid root: {reason}"),
                         }
                     }
                 }
                 _ => {}
             },
             _ = tick.tick(), if ready => {
-                // 1. LEZ: run this block's scripted actions, then close the block.
+                // 1. LEZ: run this block's scripted actions, then close the block with their events.
                 if lez.last_block_id() < LAST_BLOCK {
                     let block_id = lez.last_block_id() + 1;
                     for step in script(block_id) {
-                        let action = to_action(&step, &modules, &lez);
-                        let label = format!("{action:?}").split_whitespace().next().unwrap_or("").to_owned();
-                        match lez.submit(action) {
+                        let tx = to_transaction(&step, &modules, &lez);
+                        let label = format!("{:?}", tx.instruction).split_whitespace().next().unwrap_or("").to_owned();
+                        match lez.submit(tx) {
                             Ok(()) => println!("LEZ block {block_id}: {label} ok"),
                             Err(e) => println!("LEZ block {block_id}: {label} REVERTED: {e}"),
                         }
                     }
                     let block = lez.produce_block(BLOCK_MS).clone();
+                    if !block.events.is_empty() {
+                        let names: Vec<_> = block.events.iter().map(|e| e.name()).collect();
+                        println!("LEZ block {block_id}: events {}", names.join(", "));
+                    }
                     if block_id == LATE_MODULE_BLOCK {
-                        let m = Module::new("carol", IdentityKeys::generate::<PoseidonHash, ThreadRng>(&mut thread_rng()));
-                        println!("  module {:5} starts with no tree: RLN_ERR_NOT_READY until it has synced", m.name);
-                        late_module = Some(m);
+                        let m = new_module("carol", 1);
+                        println!("  module {:5} starts with its own Zone indexer, to be synced from the service's snapshot; RLN_ERR_NOT_READY until then", m.name);
+                        modules.push(m);
+                        indexers.push(ZoneIndexer::new(lez.config.tree_id));
                     }
                     // 2. Every reader applies the closed block to its own tree.
-                    indexer.apply_block(&block);
-                    let before: Vec<_> = modules.iter().map(|m| m.status(&lez)).collect();
-                    for m in &mut modules {
-                        m.apply_block(&block);
-                    }
-                    let after: Vec<_> = modules.iter().map(|m| m.status(&lez)).collect();
-                    if before != after || !block.actions.is_empty() {
-                        print_modules(&modules, &lez);
+                    for (i, indexer) in indexers.iter_mut().enumerate() {
+                        if i == 0 || own_synced {
+                            indexer.apply_block(&block);
+                        }
                     }
                 }
                 // 3. Zone sequencer: one batch covering the LEZ blocks not covered yet, with at
@@ -387,17 +457,19 @@ async fn main() -> Result<()> {
             _ = tokio::signal::ctrl_c() => break,
         }
         // The demo stops at the first rejection: the dishonest sequencer never publishes a
-        // correct batch, so the Zone indexer would wait forever.
-        if indexer.verified_to >= LAST_BLOCK || !indexer.rejected().is_empty() {
+        // correct batch, so the registry would stay paused forever.
+        if indexers[0].verified_to >= LAST_BLOCK || !indexers[0].rejected().is_empty() {
             break;
         }
     }
 
     println!(
-        "\nfinal state (Zone indexer: {} batches Verified, up to LEZ block {}):",
-        indexer.verified, indexer.verified_to
+        "\nfinal state (Zone indexer: {} batches Verified, up to LEZ block {}, LEZ at block {}):",
+        indexers[0].verified(),
+        indexers[0].verified_to,
+        lez.last_block_id()
     );
-    print_modules(&modules, &lez);
+    print_modules(&modules, &indexers, &lez);
     println!(
         "LEZ balances: alice {}, bob {}, carol {}, treasury {}, operator {}",
         lez.balance("alice"),
@@ -406,8 +478,10 @@ async fn main() -> Result<()> {
         lez.balance("treasury"),
         lez.balance("operator")
     );
-    for reason in indexer.rejected() {
-        println!("zone indexer rejected a batch and waits for a correct one: {reason}");
+    for reason in indexers[0].rejected() {
+        println!(
+            "zone indexer rejected a batch, the registry pauses until a correct one arrives: {reason}"
+        );
     }
     Ok(())
 }
