@@ -30,14 +30,17 @@ pub enum Status {
     Finalized { l1_slot: u64 },
 }
 
-/// One batch this sequencer published, tracked by the hash of its Mantle Transaction.
+/// One batch this sequencer published, tracked by its inscription's message id: the Zone SDK
+/// re-funds a transaction that stays unmined (`stale_refund_slots`) under a new transaction
+/// hash but the same message id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Published {
-    #[serde(with = "hex::serde")]
-    pub tx_hash: [u8; 32],
     /// The inscription's message id in the channel.
     #[serde(with = "hex::serde")]
     pub msg_id: [u8; 32],
+    /// Hash of the latest Mantle Transaction carrying it.
+    #[serde(with = "hex::serde")]
+    pub tx_hash: [u8; 32],
     pub from_lez_block_id: u64,
     pub to_lez_block_id: u64,
     #[serde(with = "hex::serde")]
@@ -80,9 +83,9 @@ pub struct Registry {
     pub head: Reader,
     /// Changes of the LEZ blocks after `covered_to`, in derivation-rule order.
     pub pending_changes: Vec<Change>,
-    /// The tree right after the last block of each published batch, by transaction hash.
+    /// The tree right after the last block of each published batch, by message id.
     snapshots: HashMap<[u8; 32], Reader>,
-    /// The payload of each published batch, to publish it again after a reorg.
+    /// The payload of each published batch, by message id, to publish it again after a reorg.
     payloads: HashMap<[u8; 32], Vec<u8>>,
 }
 
@@ -109,7 +112,7 @@ impl Registry {
                 if published.to_lez_block_id == block.block_id
                     && published.status != Status::Orphaned
                 {
-                    self.snapshots.insert(published.tx_hash, self.head.clone());
+                    self.snapshots.insert(published.msg_id, self.head.clone());
                 }
             }
         }
@@ -132,16 +135,16 @@ impl Registry {
     /// Record a batch handed to the SDK.
     pub fn on_published(
         &mut self,
-        tx_hash: [u8; 32],
         msg_id: [u8; 32],
+        tx_hash: [u8; 32],
         batch: &Batch,
         payload: Vec<u8>,
     ) {
         let mut root_after = [0u8; 32];
         root_after.copy_from_slice(&batch.root_after);
         self.history.published.push(Published {
-            tx_hash,
             msg_id,
+            tx_hash,
             from_lez_block_id: batch.from_lez_block_id,
             to_lez_block_id: batch.to_lez_block_id,
             root_after,
@@ -151,39 +154,40 @@ impl Registry {
         });
         self.history.covered_to = batch.to_lez_block_id;
         self.pending_changes.clear();
-        self.snapshots.insert(tx_hash, self.head.clone());
-        self.payloads.insert(tx_hash, payload);
+        self.snapshots.insert(msg_id, self.head.clone());
+        self.payloads.insert(msg_id, payload);
     }
 
-    /// A reorg dropped the transaction `old`: the same batch goes out again as `new`.
-    pub fn on_republished(&mut self, old: [u8; 32], new_tx_hash: [u8; 32], new_msg_id: [u8; 32]) {
+    /// A reorg dropped the message `old`: the same batch goes out again as `new_msg_id` (a
+    /// new message, since its parent changed).
+    pub fn on_republished(&mut self, old: [u8; 32], new_msg_id: [u8; 32], new_tx_hash: [u8; 32]) {
         let Some(entry) = self.published_mut(&old) else {
             return;
         };
         let mut again = entry.clone();
         entry.status = Status::Orphaned;
-        again.tx_hash = new_tx_hash;
         again.msg_id = new_msg_id;
+        again.tx_hash = new_tx_hash;
         again.status = Status::Pending;
         again.published_at_unix = now_unix();
         self.history.published.push(again);
         if let Some(snapshot) = self.snapshots.remove(&old) {
-            self.snapshots.insert(new_tx_hash, snapshot);
+            self.snapshots.insert(new_msg_id, snapshot);
         }
         if let Some(payload) = self.payloads.remove(&old) {
-            self.payloads.insert(new_tx_hash, payload);
+            self.payloads.insert(new_msg_id, payload);
         }
     }
 
-    pub fn payload(&self, tx_hash: &[u8; 32]) -> Option<&Vec<u8>> {
-        self.payloads.get(tx_hash)
+    pub fn payload(&self, msg_id: &[u8; 32]) -> Option<&Vec<u8>> {
+        self.payloads.get(msg_id)
     }
 
-    pub fn published_mut(&mut self, tx_hash: &[u8; 32]) -> Option<&mut Published> {
+    pub fn published_mut(&mut self, msg_id: &[u8; 32]) -> Option<&mut Published> {
         self.history
             .published
             .iter_mut()
-            .find(|p| p.tx_hash == *tx_hash)
+            .find(|p| p.msg_id == *msg_id)
     }
 
     /// The newest batch in a Bedrock block (Adopted or Finalized): the RFC's reference for
@@ -213,7 +217,7 @@ impl Registry {
         } else {
             self.newest_adopted()?
         };
-        let reader = self.snapshots.get(&published.tx_hash)?;
+        let reader = self.snapshots.get(&published.msg_id)?;
         Some((published, reader))
     }
 

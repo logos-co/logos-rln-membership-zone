@@ -39,7 +39,7 @@ use lb_zone_sdk::{
     adapter::NodeHttpClient,
     sequencer::{
         Error as SeqError, Event, FinalizedOp, FinalizedTx, FundingConfig, SequencerCheckpoint,
-        ZoneSequencer,
+        SequencerConfig, ZoneSequencer,
     },
 };
 use prost::Message as _;
@@ -122,6 +122,12 @@ struct Args {
     /// Publish an empty batch after this long without one.
     #[arg(long, default_value_t = 600, env = "HEARTBEAT_SEC")]
     heartbeat_sec: u64,
+    /// LIB slots a published transaction may stay unmined before the Zone SDK re-funds it
+    /// under a new transaction hash (same message id); 0 disables. The SDK default of 30 is
+    /// one block's worth of LIB progress on the testnet, which re-funds every unmined batch at
+    /// every finalized block.
+    #[arg(long, default_value_t = 3_000, env = "STALE_REFUND_SLOTS")]
+    stale_refund_slots: u64,
 }
 
 fn parse_funding_pk(hex_str: &str) -> Result<ZkPublicKey> {
@@ -272,7 +278,12 @@ async fn main() -> Result<()> {
         None
     };
     let resumed = checkpoint.is_some();
-    let mut sdk = ZoneSequencer::init(channel_id, signing_key, node, funding, checkpoint);
+    let sdk_config = SequencerConfig {
+        stale_refund_slots: args.stale_refund_slots,
+        ..SequencerConfig::new(funding)
+    };
+    let mut sdk =
+        ZoneSequencer::init_with_config(channel_id, signing_key, node, sdk_config, checkpoint);
 
     // HTTP API.
     let state = AppState {
@@ -329,7 +340,7 @@ async fn main() -> Result<()> {
     println!("waiting for the Zone sequencer to be ready...");
 
     let mut ready = false;
-    // The batch waiting to land in a block (its transaction hash), if any.
+    // The batch waiting to land in a block (its message id), if any.
     let mut in_flight: Option<[u8; 32]> = None;
     let mut last_publish_unix = registry
         .read()
@@ -353,31 +364,35 @@ async fn main() -> Result<()> {
                     let mut changed = false;
                     // Our batch is in a Bedrock block: its fee note is spent, the next may go.
                     for tx in channel_update.adopted() {
-                        let tx_hash = tx_bytes(&tx.tx_hash());
+                        let Some(info) = tx.inscription() else { continue };
+                        let msg = msg_bytes(&info.this_msg);
                         let mut registry = registry.write().expect("registry lock");
-                        if let Some(entry) = registry.published_mut(&tx_hash)
+                        if let Some(entry) = registry.published_mut(&msg)
                             && entry.status == Status::Pending
                         {
                             entry.status = Status::Adopted;
-                            println!("batch [{}..{}] tx {} adopted in a Bedrock block", entry.from_lez_block_id, entry.to_lez_block_id, hex::encode(&tx_hash[..4]));
+                            entry.tx_hash = tx_bytes(&info.tx_hash);
+                            println!("batch [{}..{}] msg {} adopted in a Bedrock block (tx {})", entry.from_lez_block_id, entry.to_lez_block_id, hex::encode(&msg[..4]), hex::encode(&entry.tx_hash[..4]));
                             changed = true;
                         }
-                        if in_flight == Some(tx_hash) { in_flight = None; }
+                        if in_flight == Some(msg) { in_flight = None; }
                     }
-                    // A reorg dropped our batch: publish the same payload again.
+                    // A reorg dropped our batch: publish the same payload again (a new message,
+                    // since its parent changed).
                     for tx in channel_update.orphaned() {
-                        let old = tx_bytes(&tx.tx_hash());
+                        let Some(info) = tx.inscription() else { continue };
+                        let old = msg_bytes(&info.this_msg);
                         let payload = registry.read().expect("registry lock").payload(&old).cloned();
                         let Some(payload) = payload else { continue };
                         let inscription = Inscription::try_from(payload).map_err(|e| anyhow!("payload too large: {e:?}"))?;
                         match sdk.handle().publish(inscription).await {
                             Ok((result, checkpoint)) => {
-                                let new_tx = tx_bytes(&result.inscription_id());
                                 let new_msg = msg_bytes(&result.tx.inscription().this_msg);
-                                registry.write().expect("registry lock").on_republished(old, new_tx, new_msg);
+                                let new_tx = tx_bytes(&result.inscription_id());
+                                registry.write().expect("registry lock").on_republished(old, new_msg, new_tx);
                                 save_checkpoint(&checkpoint_path, &checkpoint)?;
-                                in_flight = Some(new_tx);
-                                println!("batch tx {} orphaned by a reorg, published again as tx {}", hex::encode(&old[..4]), hex::encode(&new_tx[..4]));
+                                in_flight = Some(new_msg);
+                                println!("batch msg {} orphaned by a reorg, published again as msg {}", hex::encode(&old[..4]), hex::encode(&new_msg[..4]));
                                 changed = true;
                             }
                             Err(e) => println!("republish after reorg failed: {e}"),
@@ -386,8 +401,8 @@ async fn main() -> Result<()> {
                     // Bedrock finality reached our batch: its root is a valid root from now on.
                     // Backfilled blocks report an empty `channel_update`, so finality is also
                     // the fallback signal that a batch landed.
-                    for tx_hash in finalize(&registry, &finalized) {
-                        if in_flight == Some(tx_hash) { in_flight = None; }
+                    for msg in finalize(&registry, &finalized) {
+                        if in_flight == Some(msg) { in_flight = None; }
                         changed = true;
                     }
                     if changed {
@@ -427,21 +442,22 @@ async fn main() -> Result<()> {
                 };
                 match sdk.handle().publish(inscription).await {
                     Ok((result, checkpoint)) => {
-                        let tx_hash = tx_bytes(&result.inscription_id());
                         let msg = msg_bytes(&result.tx.inscription().this_msg);
+                        let tx_hash = tx_bytes(&result.inscription_id());
                         {
                             let mut registry = registry.write().expect("registry lock");
-                            registry.on_published(tx_hash, msg, &batch, payload);
+                            registry.on_published(msg, tx_hash, &batch, payload);
                             registry.history.save(&history_path)?;
                         }
                         save_checkpoint(&checkpoint_path, &checkpoint)?;
-                        in_flight = Some(tx_hash);
+                        in_flight = Some(msg);
                         last_publish_unix = now_unix();
                         let described: Vec<_> = batch.changes.iter().map(|c| c.describe()).collect();
                         println!(
-                            "batch [{}..{}] published as tx {}: root {}.., {}",
+                            "batch [{}..{}] published as msg {} (tx {}): root {}.., {}",
                             batch.from_lez_block_id,
                             batch.to_lez_block_id,
+                            hex::encode(&msg[..4]),
                             hex::encode(&tx_hash[..4]),
                             hex::encode(&batch.root_after[..4]),
                             if described.is_empty() { "no changes".into() } else { described.join("; ") }
@@ -459,7 +475,7 @@ async fn main() -> Result<()> {
 }
 
 /// Mark our batches Finalized as Bedrock finality reaches them, with the L1 slot; returns
-/// the transaction hashes that became Finalized now.
+/// the message ids that became Finalized now.
 fn finalize(registry: &Shared, finalized: &[FinalizedTx]) -> Vec<[u8; 32]> {
     let mut done = vec![];
     for tx in finalized {
@@ -467,15 +483,15 @@ fn finalize(registry: &Shared, finalized: &[FinalizedTx]) -> Vec<[u8; 32]> {
             let FinalizedOp::Inscription(info) = op else {
                 continue;
             };
-            let tx_hash = tx_bytes(&tx.tx_hash);
+            let msg = msg_bytes(&info.this_msg);
             let mut registry = registry.write().expect("registry lock");
             let payload_matches = registry
-                .payload(&tx_hash)
+                .payload(&msg)
                 .is_some_and(|p| p[..] == info.payload[..]);
-            let Some(entry) = registry.published_mut(&tx_hash) else {
+            let Some(entry) = registry.published_mut(&msg) else {
                 println!(
-                    "finalized inscription tx {} is not one of ours",
-                    hex::encode(&tx_hash[..4])
+                    "finalized inscription msg {} is not one of ours",
+                    hex::encode(&msg[..4])
                 );
                 continue;
             };
@@ -484,20 +500,21 @@ fn finalize(registry: &Shared, finalized: &[FinalizedTx]) -> Vec<[u8; 32]> {
             }
             if !payload_matches {
                 println!(
-                    "finalized tx {} carries a different payload than we published; left as is",
-                    hex::encode(&tx_hash[..4])
+                    "finalized msg {} carries a different payload than we published; left as is",
+                    hex::encode(&msg[..4])
                 );
                 continue;
             }
             let l1_slot = tx.l1_slot.into_inner();
             entry.status = Status::Finalized { l1_slot };
+            entry.tx_hash = tx_bytes(&tx.tx_hash);
             println!(
                 "batch [{}..{}] FINALIZED at L1 slot {l1_slot}: root {}.. is a valid root",
                 entry.from_lez_block_id,
                 entry.to_lez_block_id,
                 hex::encode(&entry.root_after[..4])
             );
-            done.push(tx_hash);
+            done.push(msg);
         }
     }
     done
