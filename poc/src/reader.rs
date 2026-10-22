@@ -32,18 +32,36 @@ pub fn fr_from_bytes_le(bytes: &[u8; 32]) -> Result<Fr, String> {
 pub struct Leaf {
     pub leaf_index: u64,
     pub expiry_timestamp_ms: u64,
+    /// The leaf value, `poseidon(id_commitment, rate_limit)`, kept so a snapshot can rebuild
+    /// the tree without the events.
+    pub rate_commitment: [u8; 32],
+}
+
+/// A reader's state without the tree (`snapshots/<msg_id>.json`): the tree is rebuilt from the
+/// live leaves, so a restart needs no replay of the LEZ blocks already covered.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Snapshot {
+    #[serde(with = "hex::serde")]
+    pub tree_id: [u8; 32],
+    pub applied_block_id: u64,
+    pub applied_timestamp_ms: u64,
+    pub stats: Stats,
+    /// `(id_commitment, leaf_index, expiry_timestamp_ms, rate_commitment)`.
+    pub live: Vec<(String, u64, u64, String)>,
+    /// `(id_commitment, cause)`.
+    pub removed: Vec<(String, Removed)>,
 }
 
 /// Why a leaf left the tree. Read from the events and used for status only; batches do not
 /// carry it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Removed {
     Expired,
     Slashed,
 }
 
 /// Counts of what the derivation rules did so far, for monitoring.
-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct Stats {
     pub registered: u64,
     pub extended: u64,
@@ -97,6 +115,66 @@ impl Reader {
         fr_to_bytes_le(&self.tree.root())
     }
 
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            tree_id: self.tree_id,
+            applied_block_id: self.applied_block_id,
+            applied_timestamp_ms: self.applied_timestamp_ms,
+            stats: self.stats,
+            live: self
+                .live_leaves()
+                .into_iter()
+                .map(|(index, id, expiry)| {
+                    let leaf = self.live[&id];
+                    (
+                        hex::encode(id),
+                        index,
+                        expiry,
+                        hex::encode(leaf.rate_commitment),
+                    )
+                })
+                .collect(),
+            removed: self
+                .removed_leaves()
+                .into_iter()
+                .map(|(id, cause)| (hex::encode(id), cause))
+                .collect(),
+        }
+    }
+
+    /// Rebuild a reader from a snapshot: every live leaf is set again, so the root is the
+    /// one the snapshot was taken at.
+    pub fn from_snapshot(snapshot: &Snapshot) -> Result<Self, String> {
+        let parse = |hex_str: &str| -> Result<[u8; 32], String> {
+            let bytes = hex::decode(hex_str).map_err(|e| format!("snapshot hex: {e}"))?;
+            <[u8; 32]>::try_from(bytes).map_err(|_| "snapshot value is not 32 bytes".to_owned())
+        };
+        let mut reader = Self::new(snapshot.tree_id, snapshot.applied_block_id);
+        reader.applied_timestamp_ms = snapshot.applied_timestamp_ms;
+        reader.stats = snapshot.stats;
+        for (id, leaf_index, expiry_timestamp_ms, rate_commitment) in &snapshot.live {
+            let id = parse(id)?;
+            let rate_commitment = parse(rate_commitment)?;
+            let leaf = fr_from_bytes_le(&rate_commitment)?;
+            reader
+                .tree
+                .set(*leaf_index as usize, leaf)
+                .map_err(|e| format!("snapshot leaf {leaf_index}: {e}"))?;
+            reader.live.insert(
+                id,
+                Leaf {
+                    leaf_index: *leaf_index,
+                    expiry_timestamp_ms: *expiry_timestamp_ms,
+                    rate_commitment,
+                },
+            );
+        }
+        for (id, cause) in &snapshot.removed {
+            reader.removed.insert(parse(id)?, *cause);
+        }
+        Ok(reader)
+    }
+
     pub fn live_count(&self) -> usize {
         self.live.len()
     }
@@ -143,6 +221,7 @@ impl Reader {
                         Leaf {
                             leaf_index: *leaf_index,
                             expiry_timestamp_ms: *expiry_timestamp_ms,
+                            rate_commitment: fr_to_bytes_le(&leaf),
                         },
                     );
                     changes.push(Change::insert(*leaf_index, fr_to_bytes_le(&leaf).to_vec()));
@@ -290,6 +369,25 @@ mod test {
         assert_eq!(changes.len(), 1);
         assert_eq!(reader.root(), empty);
         assert!(reader.proof_path(0).is_none());
+    }
+
+    #[test]
+    fn test_snapshot_rebuilds_the_same_root() {
+        let mut reader = Reader::new([0; 32], 0);
+        reader.apply_block(&block(
+            1,
+            1_000,
+            vec![registered(1, 0, 5_000), registered(2, 1, 9_000)],
+        ));
+        reader.apply_block(&block(2, 5_000, vec![]));
+        let snapshot = reader.snapshot();
+        let text = serde_json::to_string(&snapshot).unwrap();
+        let back = Reader::from_snapshot(&serde_json::from_str(&text).unwrap()).unwrap();
+        assert_eq!(back.root(), reader.root());
+        assert_eq!(back.live_count(), 1);
+        assert_eq!(back.removed_leaves().len(), 1);
+        assert_eq!(back.applied_block_id, 2);
+        assert!(back.proof_path(1).is_some());
     }
 
     #[test]

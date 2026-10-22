@@ -49,7 +49,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     http::{AppState, Shared},
-    lez::{IndexerLez, Selectors, Source, TickingLez},
+    lez::{IndexerLez, Selectors, SequencerLez, Source, TickingLez},
     registry::{History, Registry, Status, now_unix},
 };
 
@@ -98,8 +98,9 @@ struct Args {
     /// Registration program account id (64 hex) whose events build the tree.
     #[arg(long, default_value = PROGRAM_ACCOUNT_ID_HEX, env = "PROGRAM_ACCOUNT_ID")]
     program_account_id: String,
-    /// LEZ source: `indexer` = a LEZ Indexer's JSON-RPC (`getEvents`, finalized blocks);
-    /// `ticking` = stand-in clock with empty blocks.
+    /// LEZ source: `sequencer` = the LEZ Sequencer's JSON-RPC (closed blocks, events derived
+    /// from the program's transactions); `indexer` = a LEZ Indexer's JSON-RPC (`getEvents`,
+    /// finalized blocks); `ticking` = stand-in clock with empty blocks.
     #[arg(long, default_value = "ticking", env = "LEZ_SOURCE")]
     lez_source: String,
     /// LEZ Indexer JSON-RPC, the event source (`poc/lez-indexer/indexer_config.json`).
@@ -116,6 +117,11 @@ struct Args {
     /// 49431 on the testnet). Ignored by the ticking source, which starts at first start.
     #[arg(long, env = "FIRST_LEZ_BLOCK_ID")]
     first_lez_block_id: Option<u64>,
+    /// Membership lifetime after the timestamp a `Register` carries, for the `sequencer`
+    /// source: the program computes the expiry itself and its rule is not confirmed yet.
+    /// Unset = memberships never expire in this PoC.
+    #[arg(long, env = "ACTIVE_DURATION_MS")]
+    active_duration_ms: Option<u64>,
     /// Program name behind the event selectors (`sha256("<name>::Registered")[..8]`, ...).
     /// Without it, events are told apart by their borsh length, which cannot separate
     /// `Erased` from `Slashed` (both remove the leaf).
@@ -234,7 +240,12 @@ async fn main() -> Result<()> {
                     .map(Selectors::from_program_name),
             ))
         }
-        other => bail!("unknown LEZ source {other:?}: `indexer` or `ticking`"),
+        "sequencer" => Source::Sequencer(SequencerLez::new(
+            args.lez_sequencer_url.clone(),
+            program_account_id,
+            args.active_duration_ms,
+        )),
+        other => bail!("unknown LEZ source {other:?}: `sequencer`, `indexer` or `ticking`"),
     };
     // The ticking stand-in numbers its blocks by wall clock, so the program's deploy block
     // means nothing to it: it always starts at the block of the first start.
@@ -264,7 +275,11 @@ async fn main() -> Result<()> {
             }
         }
     };
-    let registry: Shared = Arc::new(RwLock::new(Registry::new(tree_id, history)));
+    let registry: Shared = Arc::new(RwLock::new(Registry::new(
+        tree_id,
+        history,
+        args.data_dir.join("snapshots"),
+    )));
 
     // Zone SDK sequencer on the node.
     let signing_key = load_or_create_key(&key_path)?;
@@ -337,7 +352,8 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Rebuild the trees: apply every LEZ block up to the last covered one again.
+    // The trees: from the snapshots taken at each published batch, or, without them, by
+    // applying every LEZ block up to the last covered one again.
     let (first, covered_to) = {
         let registry = registry.read().expect("registry lock");
         (
@@ -345,9 +361,22 @@ async fn main() -> Result<()> {
             registry.history.covered_to,
         )
     };
-    if covered_to >= first {
-        let count = apply_range(&source, &registry, first, covered_to).await?;
-        println!("replayed {count} LEZ blocks up to {covered_to}");
+    let loaded = registry.write().expect("registry lock").load_snapshots();
+    source.set_registered_count(
+        registry
+            .read()
+            .expect("registry lock")
+            .head
+            .stats
+            .registered,
+    );
+    match loaded {
+        Some(at) => println!("tree restored from the snapshot at LEZ block {at}"),
+        None if covered_to >= first => {
+            let count = apply_range(&source, &registry, first, covered_to).await?;
+            println!("replayed {count} LEZ blocks up to {covered_to}");
+        }
+        None => {}
     }
     println!("waiting for the Zone sequencer to be ready...");
 

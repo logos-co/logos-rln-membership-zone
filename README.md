@@ -71,7 +71,7 @@ but that only pauses the registry at the Zone indexers until a correct batch arr
 ```text
 docs/rfc-rln-membership-zone.md   the specification (raw LIP draft)
 poc/                              PoC: Zone sequencer on the testnet with an HTTP registry API
-  src/lez.rs                      LEZ blocks and events, the `LezSource` trait, the ticking stand-in
+  src/lez.rs                      LEZ blocks and events; sources: LEZ Sequencer (transactions), LEZ Indexer (events), ticking
   src/reader.rs                   a reader: derivation rules over the events and the tree
   src/batch.rs                    batch wire format (protobuf)
   src/registry.rs                 published batches with their status on Bedrock, trees per batch, history file
@@ -133,15 +133,27 @@ curl -s localhost:3000/leaf/<id_commitment hex>
 curl -s localhost:3000/leaves          # every leaf at the LEZ head, event counters
 ```
 
-Ctrl-C stops it; the next start resumes from `poc/data/checkpoint.json` and `history.json`
-and rebuilds the trees from LEZ.
+Ctrl-C stops it; the next start resumes from `poc/data/checkpoint.json` and `history.json`,
+restores the tree from `poc/data/snapshots/` (the reader state at each published batch) and
+reads from LEZ only the blocks after the last batch; without snapshots it replays the blocks.
 
 ### Read the registration program's events
 
 The RFC derives the tree from the program's events. In LEZ 0.3.x the LEZ Sequencer RPC
-serves blocks but not events, and the LEZ Indexer RPC serves events (`getEvents`,
-`subscribeToEvents`) for finalized blocks only, so the PoC reads a LEZ Indexer that follows
-the LEZ channel from the same testnet node. Run one next to the PoC:
+serves closed blocks but not events, and the LEZ Indexer RPC serves events (`getEvents`,
+`subscribeToEvents`) for finalized blocks only, which on the testnet trail the chain by
+8 to 10 hours. The PoC therefore has two LEZ sources, chosen with `LEZ_SOURCE`:
+
+- `sequencer` (default): the public LEZ Sequencer (`https://testnet.lez.logos.co`,
+  `getBlockRange`, closed blocks within seconds). The events are derived from the program's
+  transactions, which a block holds only when they succeeded: a `Register` is a `Registered`
+  with the `leaf_index` the instruction carries, a `Slash` a `Slashed` of
+  `poseidon(identity_secret)`. The instruction layout was read off the testnet transactions
+  (`poc/src/lez.rs`, `decode_instruction`); a `Register` carries the client's timestamp, not
+  the expiry the program computes, so `ACTIVE_DURATION_MS` sets the membership lifetime
+  until the program's rule is confirmed.
+- `indexer`: a LEZ Indexer's `getEvents`, the RFC's input, finalized blocks only. Run one
+  next to the PoC to compare:
 
 ```bash
 git clone --depth 1 --branch v0.3.1 https://github.com/logos-blockchain/logos-execution-zone
@@ -156,9 +168,8 @@ The config points `bedrock_config.addr` at the node, `channel_id` at the testnet
 (`0101...01`, what `getChannelId` on `https://testnet.lez.logos.co` returns) and keeps only the
 registration program's events through `event_filter.sources`
 (`HAxY9SiqUjJQHdtvazFDWFCxn1Jw1dtbUGio8DMC4bBw`, deployed in LEZ block 49431, registry
-`47b2de4f...b4cf`); a filter that keeps nothing serves nothing. The indexer re-executes the LEZ channel from its genesis, trailing the LEZ
-Sequencer by Bedrock finality. The PoC's `LEZ_SOURCE` for it is the next step
-(`lez.rs`, `LezSource`).
+`47b2de4f...b4cf`); a filter that keeps nothing serves nothing. The indexer re-executes the LEZ
+channel from its genesis, trailing the LEZ Sequencer by Bedrock finality.
 
 The Zone SDK must match the node's release (the submodule tag): a node on a newer release
 answers the backfill with blocks the older SDK cannot parse, which shows as
