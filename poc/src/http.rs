@@ -1,5 +1,5 @@
-//! The HTTP API a Module's node reads (its registry access): the roots with the Zone SDK
-//! `TxStatus` of their transaction on Bedrock, the Merkle proof path of a leaf at the newest Finalized root, a leaf's status.
+//! The HTTP API a Module's node reads (its registry access): the roots with the status of
+//! their transaction on Bedrock, the Merkle proof path of a leaf at the newest Finalized root, a leaf's status.
 //! 32-byte values are hex, little-endian (RLN-API Appendix B).
 
 use std::sync::{Arc, RwLock};
@@ -13,7 +13,7 @@ use axum::{
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::registry::{Registry, source_name, status_name};
+use crate::registry::{Registry, Status};
 
 pub type Shared = Arc<RwLock<Registry>>;
 
@@ -41,10 +41,8 @@ struct RootEntry {
     to_lez_block_id: u64,
     change_count: usize,
     published_at_unix: u64,
-    /// Zone SDK `TxStatus` of the transaction, snake case.
-    status: &'static str,
-    source: Option<&'static str>,
-    l1_slot: Option<u64>,
+    #[serde(flatten)]
+    status: Status,
     tx_hash: String,
     msg_id: String,
 }
@@ -81,9 +79,7 @@ async fn roots(State(state): State<AppState>, Path(window_size): Path<usize>) ->
             to_lez_block_id: p.to_lez_block_id,
             change_count: p.change_count,
             published_at_unix: p.published_at_unix,
-            status: status_name(&p.status),
-            source: source_name(&p.status),
-            l1_slot: p.l1_slot,
+            status: p.status.clone(),
             tx_hash: hex::encode(p.tx_hash),
             msg_id: hex::encode(p.msg_id),
         })

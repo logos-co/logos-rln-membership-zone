@@ -74,12 +74,11 @@ poc/                              PoC: Zone sequencer on the testnet with an HTT
   src/lez.rs                      LEZ blocks and events, the `LezSource` trait, the ticking stand-in
   src/reader.rs                   a reader: derivation rules over the events and the tree
   src/batch.rs                    batch wire format (protobuf)
-  src/registry.rs                 published batches with their Zone SDK `TxStatus`, trees per batch, history file
+  src/registry.rs                 published batches with their status on Bedrock, trees per batch, history file
   src/http.rs                     HTTP API: roots, Merkle proof path, leaf status
   src/main.rs                     Zone SDK loop: publish, follow to finality, poll LEZ
   lez-indexer/indexer_config.json LEZ Indexer config that keeps only the registration program's events
-devnet/run.sh                     local single-node Logos Blockchain (start, fund, status, stop, reset)
-logos-blockchain/                 git submodule pinned to node release 0.3.0 (Zone SDK path dependencies)
+logos-blockchain/                 git submodule pinned to node release 0.3.2 (Zone SDK path dependencies)
 ```
 
 ## Quick start
@@ -88,7 +87,10 @@ logos-blockchain/                 git submodule pinned to node release 0.3.0 (Zo
 
 - Rust, with the toolchain pinned in `rust-toolchain.toml`
   to the channel of the `logos-blockchain` submodule.
-- `git`, `curl` and `jq`, for `devnet/run.sh`.
+- Build tools the `logos-blockchain` crates need on Linux:
+  `build-essential pkg-config libssl-dev clang cmake protobuf-compiler unzip`
+  (`rust-rapidsnark` downloads a prebuilt library and unzips it at build time).
+- `git`, `curl` and `jq`.
 - macOS or Linux on x86_64 or aarch64, the platforms the node release binaries are published for.
 
 ### Run the PoC on the testnet
@@ -115,9 +117,10 @@ What happens:
    out at once, then one batch whenever the tree changed or after `HEARTBEAT_SEC` without one,
    at most one in flight. Every publish is paid from the node wallet (`FUNDING_PK`), capped at
    `MAX_TX_FEE`.
-3. Each batch moves through the Zone SDK `TxStatus` values (`accepted_locally`,
-   `pending_mempool`, `on_chain`, `finalized`; `orphaned` after a reorg, then published again)
-   and the log prints the L1 slot it finalized in. A finalized batch's root is a valid root.
+3. Each batch is `pending` from publish, `adopted` once the Zone SDK reports it in a Bedrock
+   block, `finalized` once it is in finalized history (the log prints the L1 slot), or
+   `orphaned` after a reorg, in which case it is published again. A finalized batch's root is
+   a valid root.
 4. The HTTP API serves the registry on `HTTP_ADDR`:
 
 ```bash
@@ -138,8 +141,8 @@ serves blocks but not events, and the LEZ Indexer RPC serves events (`getEvents`
 the LEZ channel from the same testnet node. Run one next to the PoC:
 
 ```bash
-git clone --depth 1 --branch v0.3.1 https://github.com/logos-blockchain/logos-execution-zone lez
-cd lez
+git clone --depth 1 --branch v0.3.1 https://github.com/logos-blockchain/logos-execution-zone
+cd logos-execution-zone
 RUST_LOG=info cargo run --release --features prove -p indexer_service -- \
     ../logos-rln-membership-zone/poc/lez-indexer/indexer_config.json \
     --port 8779 --data-dir ../logos-rln-membership-zone/poc/lez-indexer
@@ -154,9 +157,9 @@ registration program's events through `event_filter.sources`
 Sequencer by Bedrock finality. The PoC's `LEZ_SOURCE` for it is the next step
 (`lez.rs`, `LezSource`).
 
-Local development without the testnet: `devnet/run.sh start|fund|status|stop|reset` runs the
-upstream standalone single-node chain on `127.0.0.1:8080` with 1 s slots and data under
-`devnet/`; `FUNDING_PK` is then the dev key in `devnet/run.sh`.
+The Zone SDK must match the node's release (the submodule tag): a node on a newer release
+answers the backfill with blocks the older SDK cannot parse, which shows as
+`Failed to fetch immutable blocks ... Failed to parse response` repeating forever.
 
 ### Tests
 

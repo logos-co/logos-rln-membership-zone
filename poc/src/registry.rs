@@ -6,7 +6,6 @@
 use std::{collections::HashMap, fs, path::Path};
 
 use anyhow::{Context as _, Result};
-use lb_zone_sdk::sequencer::{TxSource, TxStatus};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -15,47 +14,20 @@ use crate::{
     reader::Reader,
 };
 
-/// Serde for the Zone SDK's `TxStatus` (`subscribe_tx_status`), which derives no serde itself.
-/// JSON, externally tagged (the only tagging serde allows with `with` on a remote field):
-/// `"accepted_locally"`, `{"on_chain": "local"}`.
-#[derive(Serialize, Deserialize)]
-#[serde(remote = "TxStatus", rename_all = "snake_case")]
-enum TxStatusDef {
-    AcceptedLocally,
-    PendingMempool,
-    OnChain(#[serde(with = "TxSourceDef")] TxSource),
-    Orphaned(#[serde(with = "TxSourceDef")] TxSource),
-    Finalized(#[serde(with = "TxSourceDef")] TxSource),
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(remote = "TxSource", rename_all = "snake_case")]
-enum TxSourceDef {
-    Local,
-    Other,
-}
-
-/// Snake-case name of a `TxStatus` variant, as in the JSON.
-pub fn status_name(status: &TxStatus) -> &'static str {
-    match status {
-        TxStatus::AcceptedLocally => "accepted_locally",
-        TxStatus::PendingMempool => "pending_mempool",
-        TxStatus::OnChain(_) => "on_chain",
-        TxStatus::Orphaned(_) => "orphaned",
-        TxStatus::Finalized(_) => "finalized",
-    }
-}
-
-pub fn source_name(status: &TxStatus) -> Option<&'static str> {
-    match status {
-        TxStatus::OnChain(source) | TxStatus::Orphaned(source) | TxStatus::Finalized(source) => {
-            Some(match source {
-                TxSource::Local => "local",
-                TxSource::Other => "other",
-            })
-        }
-        _ => None,
-    }
+/// Where the Mantle Transaction carrying a batch stands, in the Zone SDK's words: it is
+/// `pending` from `publish`, `adopted` or `orphaned` through `ChannelUpdate`, `finalized`
+/// through `FinalizedTx`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum Status {
+    /// Published, not yet seen in a Bedrock block.
+    Pending,
+    /// In a Bedrock block on the canonical branch, not yet final.
+    Adopted,
+    /// Dropped from the canonical branch by a reorg; published again as a new transaction.
+    Orphaned,
+    /// In finalized chain history: a valid root for the PoC.
+    Finalized { l1_slot: u64 },
 }
 
 /// One batch this sequencer published, tracked by the hash of its Mantle Transaction.
@@ -72,11 +44,8 @@ pub struct Published {
     pub root_after: [u8; 32],
     pub change_count: usize,
     pub published_at_unix: u64,
-    /// The Zone SDK's lifecycle status of the transaction.
-    #[serde(with = "TxStatusDef")]
-    pub status: TxStatus,
-    /// L1 slot of the block the transaction finalized in (`FinalizedTx::l1_slot`).
-    pub l1_slot: Option<u64>,
+    #[serde(flatten)]
+    pub status: Status,
 }
 
 /// What survives a restart (`history.json`); the trees are rebuilt from LEZ.
@@ -138,7 +107,7 @@ impl Registry {
             }
             for published in &self.history.published {
                 if published.to_lez_block_id == block.block_id
-                    && !matches!(published.status, TxStatus::Orphaned(_))
+                    && published.status != Status::Orphaned
                 {
                     self.snapshots.insert(published.tx_hash, self.head.clone());
                 }
@@ -178,8 +147,7 @@ impl Registry {
             root_after,
             change_count: batch.changes.len(),
             published_at_unix: now_unix(),
-            status: TxStatus::AcceptedLocally,
-            l1_slot: None,
+            status: Status::Pending,
         });
         self.history.covered_to = batch.to_lez_block_id;
         self.pending_changes.clear();
@@ -193,11 +161,10 @@ impl Registry {
             return;
         };
         let mut again = entry.clone();
-        entry.status = TxStatus::Orphaned(TxSource::Local);
+        entry.status = Status::Orphaned;
         again.tx_hash = new_tx_hash;
         again.msg_id = new_msg_id;
-        again.status = TxStatus::AcceptedLocally;
-        again.l1_slot = None;
+        again.status = Status::Pending;
         again.published_at_unix = now_unix();
         self.history.published.push(again);
         if let Some(snapshot) = self.snapshots.remove(&old) {
@@ -225,7 +192,7 @@ impl Registry {
             .published
             .iter()
             .rev()
-            .find(|p| matches!(p.status, TxStatus::Finalized(_)))
+            .find(|p| matches!(p.status, Status::Finalized { .. }))
     }
 
     /// The tree at the newest Finalized root: what proof paths are served against.
@@ -241,7 +208,7 @@ impl Registry {
             .published
             .iter()
             .rev()
-            .filter(|p| !matches!(p.status, TxStatus::Orphaned(_)))
+            .filter(|p| p.status != Status::Orphaned)
             .take(window_size)
             .collect()
     }

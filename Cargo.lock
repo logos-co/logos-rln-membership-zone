@@ -2976,7 +2976,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "logos-blockchain-binary-codec"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "bincode",
  "bytes",
@@ -2991,7 +2991,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-binary-codec-macros"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "hex",
  "proc-macro2",
@@ -3001,7 +3001,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-blend-crypto"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "blake2",
  "logos-blockchain-groth16",
@@ -3015,7 +3015,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-blend-message"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "blake2",
  "educe 0.7.6",
@@ -3041,7 +3041,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-blend-proofs"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "ed25519-dalek",
  "generic-array 1.4.5",
@@ -3062,7 +3062,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-chain-broadcast-service"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "educe 0.7.6",
@@ -3076,7 +3076,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-chain-service"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3158,7 +3158,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-circuits-prover"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "rust-rapidsnark",
 ]
@@ -3184,7 +3184,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-common-http-client"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "futures",
  "hex",
@@ -3196,6 +3196,7 @@ dependencies = [
  "logos-blockchain-http-api-common",
  "logos-blockchain-key-management-system-keys",
  "logos-blockchain-log-targets",
+ "logos-blockchain-sdp-service",
  "logos-blockchain-version",
  "reqwest 0.12.28",
  "serde",
@@ -3207,7 +3208,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-core"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "ark-ff",
  "bincode",
@@ -3240,7 +3241,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-cryptarchia-engine"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "logos-blockchain-binary-codec",
  "logos-blockchain-log-targets",
@@ -3257,7 +3258,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-cryptarchia-sync"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "bytes",
  "futures",
@@ -3279,14 +3280,14 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-dynamic-merkle"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "logos-blockchain-groth16"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "ark-bn254",
  "ark-ec",
@@ -3306,7 +3307,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-http-api-common"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "axum 0.7.9",
  "logos-blockchain-core",
@@ -3326,7 +3327,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-key-management-system-keys"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "arbitrary-int",
  "async-trait",
@@ -3356,7 +3357,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-key-management-system-macros"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3365,7 +3366,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-key-management-system-operators"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "logos-blockchain-blend-proofs",
@@ -3382,7 +3383,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-key-management-system-service"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "logos-blockchain-key-management-system-keys",
@@ -3398,7 +3399,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-ledger"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "educe 0.7.6",
  "logos-blockchain-binary-codec",
@@ -3425,7 +3426,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-libp2p"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "backon",
@@ -3453,14 +3454,14 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-log-targets"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "logos-blockchain-log-targets-macros",
 ]
 
 [[package]]
 name = "logos-blockchain-log-targets-macros"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3469,7 +3470,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-merkle-tree"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "logos-blockchain-dynamic-merkle",
  "rpds",
@@ -3479,7 +3480,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-mmr"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "ark-ff",
  "logos-blockchain-groth16",
@@ -3492,7 +3493,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-network-service"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -3513,7 +3514,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-poc"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "logos-blockchain-circuits-poc-sys",
  "logos-blockchain-circuits-prover",
@@ -3529,7 +3530,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-pol"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "astro-float",
  "logos-blockchain-circuits-pol-sys",
@@ -3548,7 +3549,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-poq"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "logos-blockchain-circuits-poq-sys",
  "logos-blockchain-circuits-prover",
@@ -3565,7 +3566,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-poseidon2"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "ark-bn254",
  "ark-ff",
@@ -3575,7 +3576,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-proofs-error"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "logos-blockchain-circuits-types",
  "logos-blockchain-groth16",
@@ -3584,8 +3585,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "logos-blockchain-sdp-service"
+version = "0.3.2"
+dependencies = [
+ "async-trait",
+ "logos-blockchain-chain-service",
+ "logos-blockchain-core",
+ "logos-blockchain-key-management-system-keys",
+ "logos-blockchain-ledger",
+ "logos-blockchain-log-targets",
+ "logos-blockchain-services-utils",
+ "logos-blockchain-tracing",
+ "overwatch",
+ "serde",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
 name = "logos-blockchain-services-utils"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3600,7 +3622,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-storage-service"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3622,7 +3644,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-time-service"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -3644,7 +3666,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-tracing"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "flate2",
  "logos-blockchain-log-targets",
@@ -3652,9 +3674,10 @@ dependencies = [
  "opentelemetry-appender-tracing",
  "opentelemetry-http",
  "opentelemetry-otlp",
+ "opentelemetry-prometheus",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
- "rand 0.8.8",
+ "prometheus",
  "serde",
  "tokio",
  "tonic",
@@ -3669,7 +3692,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-utils"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "const-hex",
@@ -3692,7 +3715,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-utxotree"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "ark-ff",
  "logos-blockchain-dynamic-merkle",
@@ -3704,7 +3727,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-version"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "serde",
  "utoipa",
@@ -3712,7 +3735,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-zksign"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "logos-blockchain-circuits-prover",
  "logos-blockchain-circuits-signature-sys",
@@ -3731,7 +3754,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-zone-sdk"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -4206,6 +4229,7 @@ dependencies = [
  "js-sys",
  "pin-project-lite",
  "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]
@@ -4250,6 +4274,18 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-types",
+]
+
+[[package]]
+name = "opentelemetry-prometheus"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c0359983e7f79cf33c9abd89e5d7ddf67c46c419d0148598022d70e70c01aba"
+dependencies = [
+ "once_cell",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prometheus",
 ]
 
 [[package]]
@@ -4298,7 +4334,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 [[package]]
 name = "overwatch"
 version = "0.2.0"
-source = "git+https://github.com/logos-co/Overwatch?rev=8f06c685948620d5d9931ed8f5bdb86e6cbffcd9#8f06c685948620d5d9931ed8f5bdb86e6cbffcd9"
+source = "git+https://github.com/logos-co/Overwatch?rev=fc71a844886f9fb8f382ecfadcebff455e33474b#fc71a844886f9fb8f382ecfadcebff455e33474b"
 dependencies = [
  "async-trait",
  "futures",
@@ -4313,7 +4349,7 @@ dependencies = [
 [[package]]
 name = "overwatch-derive"
 version = "0.2.0"
-source = "git+https://github.com/logos-co/Overwatch?rev=8f06c685948620d5d9931ed8f5bdb86e6cbffcd9#8f06c685948620d5d9931ed8f5bdb86e6cbffcd9"
+source = "git+https://github.com/logos-co/Overwatch?rev=fc71a844886f9fb8f382ecfadcebff455e33474b#fc71a844886f9fb8f382ecfadcebff455e33474b"
 dependencies = [
  "convert_case",
  "manyhow",
@@ -4562,6 +4598,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "prometheus"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ca5326d8d0b950a9acd87e6a3f94745394f62e4dae1b1ee22b2bc0c394af43a"
+dependencies = [
+ "cfg-if",
+ "fnv",
+ "lazy_static",
+ "memchr",
+ "parking_lot 0.12.5",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

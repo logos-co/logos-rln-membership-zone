@@ -4,9 +4,6 @@ checkpoint*.json
 logs/
 .env
 
-# local node (devnet/run.sh): binary, chain data, generated configs, logs
-/devnet/*
-!/devnet/run.sh
 
 # PoC: accredited key, Zone SDK checkpoint, batch history; LEZ indexer store
 /poc/data/

@@ -38,7 +38,7 @@ use lb_zone_sdk::{
     adapter::NodeHttpClient,
     sequencer::{
         Error as SeqError, Event, FinalizedOp, FinalizedTx, FundingConfig, SequencerCheckpoint,
-        TxSource, TxStatus, ZoneSequencer,
+        ZoneSequencer,
     },
 };
 use prost::Message as _;
@@ -49,7 +49,7 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     http::{AppState, Shared},
     lez::{LezSource, TickingLez},
-    registry::{History, Registry, now_unix, status_name},
+    registry::{History, Registry, Status, now_unix},
 };
 
 /// Largest LEZ block range fetched at once (the LEZ Indexer caps `getEvents` at 1000).
@@ -322,8 +322,6 @@ async fn main() -> Result<()> {
     println!("waiting for the Zone sequencer to be ready...");
 
     let mut ready = false;
-    // Lifecycle of every transaction the SDK tracks, by transaction hash.
-    let mut tx_status = sdk.subscribe_tx_status();
     // The batch waiting to land in a block (its transaction hash), if any.
     let mut in_flight: Option<[u8; 32]> = None;
     let mut last_publish_unix = registry
@@ -343,75 +341,53 @@ async fn main() -> Result<()> {
                     if !ready { println!("ready\n"); }
                     ready = true;
                 }
-                Event::BlocksProcessed { checkpoint, finalized, .. } => {
+                Event::BlocksProcessed { checkpoint, channel_update, finalized, .. } => {
                     save_checkpoint(&checkpoint_path, &checkpoint)?;
-                    // Bedrock finality reached our batch: its root is a valid root from now on.
-                    let done = finalize(&registry, &finalized);
-                    for tx_hash in &done {
-                        if in_flight == Some(*tx_hash) { in_flight = None; }
+                    let mut changed = false;
+                    // Our batch is in a Bedrock block: its fee note is spent, the next may go.
+                    for tx in channel_update.adopted() {
+                        let tx_hash = tx_bytes(&tx.tx_hash());
+                        let mut registry = registry.write().expect("registry lock");
+                        if let Some(entry) = registry.published_mut(&tx_hash)
+                            && entry.status == Status::Pending
+                        {
+                            entry.status = Status::Adopted;
+                            println!("batch [{}..{}] tx {} adopted in a Bedrock block", entry.from_lez_block_id, entry.to_lez_block_id, hex::encode(&tx_hash[..4]));
+                            changed = true;
+                        }
+                        if in_flight == Some(tx_hash) { in_flight = None; }
                     }
-                    if !done.is_empty() {
+                    // A reorg dropped our batch: publish the same payload again.
+                    for tx in channel_update.orphaned() {
+                        let old = tx_bytes(&tx.tx_hash());
+                        let payload = registry.read().expect("registry lock").payload(&old).cloned();
+                        let Some(payload) = payload else { continue };
+                        let inscription = Inscription::try_from(payload).map_err(|e| anyhow!("payload too large: {e:?}"))?;
+                        match sdk.handle().publish(inscription).await {
+                            Ok((result, checkpoint)) => {
+                                let new_tx = tx_bytes(&result.inscription_id());
+                                let new_msg = msg_bytes(&result.tx.inscription().this_msg);
+                                registry.write().expect("registry lock").on_republished(old, new_tx, new_msg);
+                                save_checkpoint(&checkpoint_path, &checkpoint)?;
+                                in_flight = Some(new_tx);
+                                println!("batch tx {} orphaned by a reorg, published again as tx {}", hex::encode(&old[..4]), hex::encode(&new_tx[..4]));
+                                changed = true;
+                            }
+                            Err(e) => println!("republish after reorg failed: {e}"),
+                        }
+                    }
+                    // Bedrock finality reached our batch: its root is a valid root from now on.
+                    // Backfilled blocks report an empty `channel_update`, so finality is also
+                    // the fallback signal that a batch landed.
+                    for tx_hash in finalize(&registry, &finalized) {
+                        if in_flight == Some(tx_hash) { in_flight = None; }
+                        changed = true;
+                    }
+                    if changed {
                         registry.read().expect("registry lock").history.save(&history_path)?;
                     }
                 }
                 _ => {}
-            },
-            update = tx_status.recv() => {
-                let update = match update {
-                    Ok(update) => update,
-                    // Missed updates: finality still arrives through `BlocksProcessed`.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => { println!("missed {n} tx status updates"); continue; }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                };
-                let tx_hash = tx_bytes(&update.tx_hash);
-                let mut changed = false;
-                {
-                    let mut registry = registry.write().expect("registry lock");
-                    if let Some(entry) = registry.published_mut(&tx_hash) {
-                        // Finality is recorded with its slot from `BlocksProcessed`; keep it.
-                        let keep = matches!(entry.status, TxStatus::Finalized(_));
-                        if !keep && entry.status != update.status {
-                            println!(
-                                "batch [{}..{}] tx {}: {}",
-                                entry.from_lez_block_id,
-                                entry.to_lez_block_id,
-                                hex::encode(&tx_hash[..4]),
-                                status_name(&update.status)
-                            );
-                            entry.status = update.status;
-                            changed = true;
-                        }
-                    }
-                }
-                match update.status {
-                    // In a Bedrock block: its fee note is spent, the next batch may go.
-                    TxStatus::OnChain(_) | TxStatus::Finalized(_) => {
-                        if in_flight == Some(tx_hash) { in_flight = None; }
-                    }
-                    // A reorg dropped our batch: publish the same payload again.
-                    TxStatus::Orphaned(_) => {
-                        let payload = registry.read().expect("registry lock").payload(&tx_hash).cloned();
-                        if let Some(payload) = payload {
-                            let inscription = Inscription::try_from(payload).map_err(|e| anyhow!("payload too large: {e:?}"))?;
-                            match sdk.handle().publish(inscription).await {
-                                Ok((result, checkpoint)) => {
-                                    let new_tx = tx_bytes(&result.inscription_id());
-                                    let new_msg = msg_bytes(&result.tx.inscription().this_msg);
-                                    registry.write().expect("registry lock").on_republished(tx_hash, new_tx, new_msg);
-                                    save_checkpoint(&checkpoint_path, &checkpoint)?;
-                                    in_flight = Some(new_tx);
-                                    println!("batch tx {} orphaned by a reorg, published again as tx {}", hex::encode(&tx_hash[..4]), hex::encode(&new_tx[..4]));
-                                    changed = true;
-                                }
-                                Err(e) => println!("republish after reorg failed: {e}"),
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                if changed {
-                    registry.read().expect("registry lock").history.save(&history_path)?;
-                }
             },
             _ = tick.tick(), if ready => {
                 // 1. LEZ: apply every block closed since the last poll.
@@ -496,7 +472,7 @@ fn finalize(registry: &Shared, finalized: &[FinalizedTx]) -> Vec<[u8; 32]> {
                 );
                 continue;
             };
-            if entry.l1_slot.is_some() {
+            if matches!(entry.status, Status::Finalized { .. }) {
                 continue;
             }
             if !payload_matches {
@@ -507,8 +483,7 @@ fn finalize(registry: &Shared, finalized: &[FinalizedTx]) -> Vec<[u8; 32]> {
                 continue;
             }
             let l1_slot = tx.l1_slot.into_inner();
-            entry.status = TxStatus::Finalized(TxSource::Local);
-            entry.l1_slot = Some(l1_slot);
+            entry.status = Status::Finalized { l1_slot };
             println!(
                 "batch [{}..{}] FINALIZED at L1 slot {l1_slot}: root {}.. is a valid root",
                 entry.from_lez_block_id,
