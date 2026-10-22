@@ -1,5 +1,5 @@
 [workspace]
-members  = ["examples/demo"]
+members  = ["poc"]
 # The submodule is its own workspace; keep Cargo from treating its crates as ours.
 exclude  = ["logos-blockchain"]
 resolver = "2"
@@ -23,12 +23,14 @@ zerokit_utils = { default-features = false, version = "3.0.0" }
 
 # third party
 anyhow             = "1"
+axum               = { default-features = false, features = ["http1", "json", "tokio"], version = "0.8" }
 clap               = { features = ["derive", "env", "std"], version = "4" }
 hex                = "0.4"
 prost              = "0.13"
 rand               = "0.8"
 reqwest            = { default-features = false, features = ["json", "rustls-tls"], version = "0.12" }
 serde              = { features = ["derive"], version = "1" }
+sha2               = "0.10"
 serde_json         = "1"
 tokio              = { features = ["macros", "rt-multi-thread", "signal", "sync", "time"], version = "1" }
 tracing            = "0.1"

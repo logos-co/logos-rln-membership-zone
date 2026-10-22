@@ -27,10 +27,12 @@ Early design. Nothing is deployed.
 
 - **Specification**: [`docs/rfc-rln-membership-zone.md`](docs/rfc-rln-membership-zone.md),
   a raw LIP draft that ends with the open design questions.
-- **Demo**: [`examples/demo`](examples/demo) runs the whole flow of the RFC
-  against a real local Logos Blockchain node through the Zone SDK.
-  LEZ and the registration program are mocked in memory.
-- **Not yet written**: the LEZ registration program, and the production
+- **PoC**: [`poc/`](poc) is a Zone sequencer for the Logos testnet with an HTTP registry API.
+  It publishes batches on its channel through the Zone SDK and follows them to finality;
+  until its LEZ event source is wired, LEZ is a stand-in clock that closes empty blocks.
+- **Deployed elsewhere**: the registration program is on the testnet LEZ
+  (`HAxY9SiqUjJQHdtvazFDWFCxn1Jw1dtbUGio8DMC4bBw`, block 49431).
+- **Not yet written**: the LEZ event source of the PoC, and the production
   Zone sequencer and Zone indexer.
 
 ## How it works
@@ -68,14 +70,14 @@ but that only pauses the registry at the Zone indexers until a correct batch arr
 
 ```text
 docs/rfc-rln-membership-zone.md   the specification (raw LIP draft)
-examples/demo/                    end-to-end demo: mock LEZ, Zone sequencer, Zone indexer, Modules
-  src/lez.rs                      mock LEZ and registration program (ConfigState, MembershipState, Action, Event)
-  src/reader.rs                   a reader: derivation rules over the events and the tree, one root per LEZ block
-  src/sequencer.rs                Zone sequencer: builds the batches
+poc/                              PoC: Zone sequencer on the testnet with an HTTP registry API
+  src/lez.rs                      LEZ blocks and events, the `LezSource` trait, the ticking stand-in
+  src/reader.rs                   a reader: derivation rules over the events and the tree
   src/batch.rs                    batch wire format (protobuf)
-  src/indexer.rs                  Zone indexer: follows LEZ, checks the batches, serves roots, paths and state
-  src/module.rs                   Module: no tree; status, generate and validate through its registry access
-  src/main.rs                     scripted scenario, published through the Zone SDK
+  src/registry.rs                 published batches with their Zone SDK `TxStatus`, trees per batch, history file
+  src/http.rs                     HTTP API: roots, Merkle proof path, leaf status
+  src/main.rs                     Zone SDK loop: publish, follow to finality, poll LEZ
+  lez-indexer/indexer_config.json LEZ Indexer config that keeps only the registration program's events
 devnet/run.sh                     local single-node Logos Blockchain (start, fund, status, stop, reset)
 logos-blockchain/                 git submodule pinned to node release 0.3.0 (Zone SDK path dependencies)
 ```
@@ -89,93 +91,82 @@ logos-blockchain/                 git submodule pinned to node release 0.3.0 (Zo
 - `git`, `curl` and `jq`, for `devnet/run.sh`.
 - macOS or Linux on x86_64 or aarch64, the platforms the node release binaries are published for.
 
-### Run the demo
+### Run the PoC on the testnet
+
+The PoC needs a synced Logos Blockchain testnet node on `127.0.0.1:8080` whose wallet holds
+funds (mined PoW rewards on the `PoWClaim` key are enough).
 
 ```bash
 git clone --recurse-submodules https://github.com/logos-co/logos-rln-membership-zone
 cd logos-rln-membership-zone
 
-devnet/run.sh start              # download node 0.3.0 and start a local single-node chain
-devnet/run.sh fund               # mine PoW tickets and claim them to the funding key
-
-cp .env.example .env
+cp .env.example .env             # set FUNDING_PK to the node's PoWClaim public key
 set -a; source .env; set +a      # clap reads process env vars, not the .env file
-cargo run -p demo                # add `-- --dishonest-sequencer` to see a Zone indexer catch an omitted slash
-
-devnet/run.sh stop               # stop the node when done
+cargo run -p rln-zone-poc
 ```
 
-`devnet/run.sh start` runs the upstream standalone deployment:
-no peers, 1 s slots, HTTP on `127.0.0.1:8080`,
-and all data under `devnet/`, which is gitignored.
-The Zone SDK pays for every publish from the node wallet.
-If a publish fails with "Wallet does not have enough funds", run `devnet/run.sh fund` again.
-`devnet/run.sh reset` stops the node and wipes the chain data.
-The public devnet does not work here: its fleet runs unreleased builds,
-and released binaries cannot sync with them.
+What happens:
 
-### What the demo does
+1. First start writes the accredited key to `poc/data/key.hex`. The channel id is
+   `sha256(CHANNEL_NAME)`; the key signing the first inscription to that id becomes its
+   accredited key, there is no separate create step. Keep the key file: without it the channel
+   cannot be written again.
+2. The Zone SDK backfills the channel from the node and reports `ready`; the first batch goes
+   out at once, then one batch whenever the tree changed or after `HEARTBEAT_SEC` without one,
+   at most one in flight. Every publish is paid from the node wallet (`FUNDING_PK`), capped at
+   `MAX_TX_FEE`.
+3. Each batch moves through the Zone SDK `TxStatus` values (`accepted_locally`,
+   `pending_mempool`, `on_chain`, `finalized`; `orphaned` after a reorg, then published again)
+   and the log prints the L1 slot it finalized in. A finalized batch's root is a valid root.
+4. The HTTP API serves the registry on `HTTP_ADDR`:
 
-The demo runs a short script:
-
-1. Alice and bob register.
-2. Alice extends her membership during her grace period.
-3. Bob double-signals and carol slashes him; his whole deposit goes to the treasury.
-4. Alice's membership expires and she erases it.
-
-On each tick LEZ produces one block with the events of its actions, the Zone indexer applies it,
-and the Zone sequencer publishes one batch.
-After every finalized batch the Zone indexer prints its verdict and the valid roots it now serves;
-each Module then prints its membership status and readiness, proves against the newest valid root,
-and the other Modules validate that root against their window.
-Alice and bob read the shared Zone indexer. Carol's Module starts at LEZ block 6 with her own
-Zone indexer, synced from the shared one's snapshot (root checked against the batch, leaves against
-LEZ) and following LEZ from there:
-
-```text
-LEZ block 4: Slash ok
-LEZ block 4: events Slashed
-zone sequencer: batch [4..4] published: Remove leaf 1
-zone indexer: batch [4..4] Verified; valid roots: 7b1e52a0@4
-  module alice 2c8d0a91.. leaf  0  MEMBERSHIP_ACTIVE                    ready
-  module bob   d4e67f13.. leaf  -  MEMBERSHIP_SLASHED                   ready
-  module alice proves against root 7b1e52a0.. (path of 20); bob accepts
-...
-final state (Zone indexer: 9 batches Verified, up to LEZ block 13, LEZ at block 13):
-  module alice 2c8d0a91.. leaf  -  MEMBERSHIP_ERASED                    ready
-  module bob   d4e67f13.. leaf  -  MEMBERSHIP_SLASHED                   ready
-  module carol 9a0b1c2d.. leaf  -  MEMBERSHIP_UNKNOWN                   ready
-LEZ balances: alice 9995, bob 6995, carol 0, treasury 3000, operator 10
+```bash
+curl -s localhost:3000/                 # channel, LEZ head, covered block, batch count
+curl -s localhost:3000/roots/5          # newest 5 roots with their status
+curl -s localhost:3000/merkle_proof/0   # proof path of leaf 0 at the newest finalized root
+curl -s localhost:3000/leaf/<id_commitment hex>
 ```
 
-Identity commitments and roots differ per run; the balances do not.
+Ctrl-C stops it; the next start resumes from `poc/data/checkpoint.json` and `history.json`
+and rebuilds the trees from LEZ.
 
-With `--dishonest-sequencer`, the Zone sequencer censors bob's slash:
-it keeps the leaf in its own tree, so its batch has neither the `Remove` nor the right root.
-The Zone indexer rejects that batch with
-`changes differ from LEZ: Remove leaf 1 omitted (provable censorship)`;
-no newer root becomes valid, so the registry pauses until a correct batch continues from the last
-Verified one. Bob's membership state on LEZ already says `MEMBERSHIP_SLASHED`,
-but a proof he made against the newest valid root still validates until that batch arrives,
-which is the exposure the withdrawal delay covers.
+### Read the registration program's events
+
+The RFC derives the tree from the program's events. In LEZ 0.3.x the LEZ Sequencer RPC
+serves blocks but not events, and the LEZ Indexer RPC serves events (`getEvents`,
+`subscribeToEvents`) for finalized blocks only, so the PoC reads a LEZ Indexer that follows
+the LEZ channel from the same testnet node. Run one next to the PoC:
+
+```bash
+git clone --depth 1 --branch v0.3.1 https://github.com/logos-blockchain/logos-execution-zone lez
+cd lez
+RUST_LOG=info cargo run --release --features prove -p indexer_service -- \
+    ../logos-rln-membership-zone/poc/lez-indexer/indexer_config.json \
+    --port 8779 --data-dir ../logos-rln-membership-zone/poc/lez-indexer
+```
+
+`--features prove` executes the guest programs in process, so no `r0vm` install is needed.
+The config points `bedrock_config.addr` at the node, `channel_id` at the testnet LEZ channel
+(`0101...01`, what `getChannelId` on `https://testnet.lez.logos.co` returns) and keeps only the
+registration program's events through `event_filter.sources`
+(`HAxY9SiqUjJQHdtvazFDWFCxn1Jw1dtbUGio8DMC4bBw`, deployed in LEZ block 49431, registry
+`47b2de4f...b4cf`); a filter that keeps nothing serves nothing. The indexer re-executes the LEZ channel from its genesis, trailing the LEZ
+Sequencer by Bedrock finality. The PoC's `LEZ_SOURCE` for it is the next step
+(`lez.rs`, `LezSource`).
+
+Local development without the testnet: `devnet/run.sh start|fund|status|stop|reset` runs the
+upstream standalone single-node chain on `127.0.0.1:8080` with 1 s slots and data under
+`devnet/`; `FUNDING_PK` is then the dev key in `devnet/run.sh`.
 
 ### Tests
 
 ```bash
-cargo test -p demo
+cargo test -p rln-zone-poc
+cargo clippy -p rln-zone-poc --all-targets -- -D warnings
 ```
 
-The unit tests cover:
-
-- the registration program: tree capacity, events only for successful actions, the grace period,
-  a membership's own withdrawal delay surviving a configuration change;
-- the derivation rules: expiry order, `Extended`, slashing after expiry, one root per LEZ block,
-  events of other trees ignored;
-- the Zone indexer: a Rejected batch changes nothing and adds no valid root, the valid-root window
-  resets at a removal and is bounded in LEZ blocks, and a sync from a snapshot is checked against
-  the batch and against LEZ;
-- the Module: the membership status cases of the RFC, also ahead of the valid roots,
-  and generate and validate against the window, readiness included.
+The unit tests cover the derivation rules: a `Registered` event sets the leaf and the proof
+path, expiry removes it at the LEZ timestamp, events of other registries are ignored.
 
 ## References
 

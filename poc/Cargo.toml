@@ -1,6 +1,6 @@
 [package]
-name        = "demo"
-description = "End-to-end demo of the RLN Membership Zone RFC: mock LEZ stake program, zone sequencer, indexer"
+name        = "rln-zone-poc"
+description = "PoC of the RLN Membership Zone: a Zone sequencer on the Logos testnet that derives the tree from the registration program's events and serves roots and Merkle proof paths over HTTP"
 edition     = { workspace = true }
 license     = { workspace = true }
 repository  = { workspace = true }
@@ -9,8 +9,9 @@ publish     = false
 
 [dependencies]
 anyhow                           = { workspace = true }
+axum                             = { workspace = true }
 clap                             = { workspace = true }
-hex                              = { workspace = true }
+hex                              = { features = ["serde"], workspace = true }
 lb-common-http-client            = { workspace = true }
 lb-core                          = { workspace = true }
 lb-key-management-system-service = { workspace = true }
@@ -19,7 +20,9 @@ prost                            = { workspace = true }
 rand                             = { workspace = true }
 reqwest                          = { workspace = true }
 rln                              = { workspace = true }
+serde                            = { workspace = true }
 serde_json                       = { workspace = true }
+sha2                             = { workspace = true }
 tokio                            = { workspace = true }
 tracing                          = { workspace = true }
 tracing-subscriber               = { workspace = true }
