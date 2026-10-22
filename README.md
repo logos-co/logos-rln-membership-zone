@@ -119,14 +119,16 @@ What happens:
    `MAX_TX_FEE`.
 3. Each batch is `pending` from publish, `adopted` once the Zone SDK reports it in a Bedrock
    block, `finalized` once it is in finalized history (the log prints the L1 slot), or
-   `orphaned` after a reorg, in which case it is published again. A finalized batch's root is
-   a valid root.
+   `orphaned` after a reorg, in which case it is published again. Proof paths are served at
+   the newest adopted root, as the RFC has Zone indexers act on a batch once it is in a
+   Bedrock block; finality is the later audit, and `?at=finalized` asks for it.
 4. The HTTP API serves the registry on `HTTP_ADDR`:
 
 ```bash
 curl -s localhost:3000/                 # channel, LEZ head, covered block, batch count
 curl -s localhost:3000/roots/5          # newest 5 roots with their status
-curl -s localhost:3000/merkle_proof/0   # proof path of leaf 0 at the newest finalized root
+curl -s localhost:3000/merkle_proof/0   # proof path of leaf 0 at the newest root in a Bedrock block
+curl -s "localhost:3000/merkle_proof/0?at=finalized"   # same, at the newest finalized root
 curl -s localhost:3000/leaf/<id_commitment hex>
 ```
 

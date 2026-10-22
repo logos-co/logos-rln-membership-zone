@@ -1,7 +1,7 @@
 //! The registry the sequencer holds and the HTTP API serves: the tree at the LEZ head, the
 //! changes not yet in a batch, every batch published with the status of its Mantle
 //! Transaction on Bedrock, and the tree at each published batch so proof paths can be served
-//! at the newest Finalized root.
+//! at the newest root in a Bedrock block (or the newest Finalized one on request).
 
 use std::{collections::HashMap, fs, path::Path};
 
@@ -186,6 +186,16 @@ impl Registry {
             .find(|p| p.tx_hash == *tx_hash)
     }
 
+    /// The newest batch in a Bedrock block (Adopted or Finalized): the RFC's reference for
+    /// Zone indexers, finality being the later audit.
+    pub fn newest_adopted(&self) -> Option<&Published> {
+        self.history
+            .published
+            .iter()
+            .rev()
+            .find(|p| matches!(p.status, Status::Adopted | Status::Finalized { .. }))
+    }
+
     /// The newest Finalized batch, if any.
     pub fn newest_finalized(&self) -> Option<&Published> {
         self.history
@@ -195,9 +205,14 @@ impl Registry {
             .find(|p| matches!(p.status, Status::Finalized { .. }))
     }
 
-    /// The tree at the newest Finalized root: what proof paths are served against.
-    pub fn served(&self) -> Option<(&Published, &Reader)> {
-        let published = self.newest_finalized()?;
+    /// The tree at the newest root in a Bedrock block, or at the newest Finalized root when
+    /// `finalized_only`: what proof paths are served against.
+    pub fn served(&self, finalized_only: bool) -> Option<(&Published, &Reader)> {
+        let published = if finalized_only {
+            self.newest_finalized()?
+        } else {
+            self.newest_adopted()?
+        };
         let reader = self.snapshots.get(&published.tx_hash)?;
         Some((published, reader))
     }

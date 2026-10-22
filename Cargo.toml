@@ -23,7 +23,7 @@ zerokit_utils = { default-features = false, version = "3.0.0" }
 
 # third party
 anyhow             = "1"
-axum               = { default-features = false, features = ["http1", "json", "tokio"], version = "0.8" }
+axum               = { default-features = false, features = ["http1", "json", "query", "tokio"], version = "0.8" }
 clap               = { features = ["derive", "env", "std"], version = "4" }
 hex                = "0.4"
 prost              = "0.13"

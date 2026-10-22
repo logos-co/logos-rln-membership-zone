@@ -4,7 +4,8 @@
 //! It reads closed LEZ blocks with the registration program's events (`lez.rs`), derives the
 //! tree (`reader.rs`), publishes one batch (`batch.rs`) per change or heartbeat on its channel
 //! through the Zone SDK, follows each batch to Bedrock finality, and serves the registry over
-//! HTTP (`http.rs`): roots with their status, Merkle proof paths at the newest Finalized root.
+//! HTTP (`http.rs`): roots with their status, Merkle proof paths at the newest root in a
+//! Bedrock block.
 //! Until the program is deployed the LEZ source is a stand-in clock that closes empty blocks,
 //! so the channel, the batches, finality and the API run end to end with an empty tree.
 //!
@@ -112,7 +113,7 @@ struct Args {
     )]
     lez_sequencer_url: String,
     /// First LEZ block the registry covers: the block the program was deployed in (default
-    /// 49431 on the testnet); for the ticking source the block at first start.
+    /// 49431 on the testnet). Ignored by the ticking source, which starts at first start.
     #[arg(long, env = "FIRST_LEZ_BLOCK_ID")]
     first_lez_block_id: Option<u64>,
     /// Seconds between LEZ polls (and the block period of the ticking source).
@@ -217,10 +218,16 @@ async fn main() -> Result<()> {
         ),
         other => bail!("unknown LEZ source {other:?}: `indexer` or `ticking`"),
     };
-    let default_first_block = if args.lez_source == "ticking" {
+    // The ticking stand-in numbers its blocks by wall clock, so the program's deploy block
+    // means nothing to it: it always starts at the block of the first start.
+    let ticking = args.lez_source == "ticking";
+    let first_block = if ticking {
         None
     } else {
-        Some(DEFAULT_FIRST_LEZ_BLOCK_ID)
+        Some(
+            args.first_lez_block_id
+                .unwrap_or(DEFAULT_FIRST_LEZ_BLOCK_ID),
+        )
     };
 
     // Registry: resume the published batches, rebuild the trees from LEZ below.
@@ -228,7 +235,7 @@ async fn main() -> Result<()> {
     let history = match History::load(&history_path)? {
         Some(history) => history,
         None => {
-            let first_lez_block_id = match args.first_lez_block_id.or(default_first_block) {
+            let first_lez_block_id = match first_block {
                 Some(id) => id,
                 None => source.last_block_id()?,
             };
