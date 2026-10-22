@@ -42,6 +42,21 @@ pub enum Removed {
     Slashed,
 }
 
+/// Counts of what the derivation rules did so far, for monitoring.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct Stats {
+    pub registered: u64,
+    pub extended: u64,
+    pub erased: u64,
+    pub slashed: u64,
+    /// Leaves removed because their expiry passed on the LEZ clock.
+    pub removed_expired: u64,
+    /// Leaves removed by a slash while live.
+    pub removed_slashed: u64,
+    /// Events of other registries (another `tree_id`), ignored.
+    pub other_tree: u64,
+}
+
 /// A Merkle proof path at one root, in RLN-API form.
 pub struct ProofPath {
     pub leaf_index: u64,
@@ -58,6 +73,7 @@ pub struct Reader {
     /// Live leaves by identity commitment.
     live: HashMap<[u8; 32], Leaf>,
     removed: HashMap<[u8; 32], Removed>,
+    pub stats: Stats,
     /// Last LEZ `block_id` applied.
     pub applied_block_id: u64,
     /// `timestamp_ms` of the last LEZ block applied: the clock this reader's tree is at.
@@ -71,6 +87,7 @@ impl Reader {
             tree: OptimalMerkleTree::default(TREE_DEPTH).expect("depth 20 tree"),
             live: HashMap::new(),
             removed: HashMap::new(),
+            stats: Stats::default(),
             applied_block_id,
             applied_timestamp_ms: 0,
         }
@@ -82,6 +99,24 @@ impl Reader {
 
     pub fn live_count(&self) -> usize {
         self.live.len()
+    }
+
+    /// Live leaves by `leaf_index`: `(leaf_index, id_commitment, expiry_timestamp_ms)`.
+    pub fn live_leaves(&self) -> Vec<(u64, [u8; 32], u64)> {
+        let mut leaves: Vec<_> = self
+            .live
+            .iter()
+            .map(|(id, leaf)| (leaf.leaf_index, *id, leaf.expiry_timestamp_ms))
+            .collect();
+        leaves.sort();
+        leaves
+    }
+
+    /// Removed leaves: `(id_commitment, cause)`.
+    pub fn removed_leaves(&self) -> Vec<([u8; 32], Removed)> {
+        let mut removed: Vec<_> = self.removed.iter().map(|(id, c)| (*id, *c)).collect();
+        removed.sort_by_key(|(id, _)| *id);
+        removed
     }
 
     /// Apply the derivation rules to the events of one LEZ block and return the changes, in
@@ -97,6 +132,7 @@ impl Reader {
                     expiry_timestamp_ms,
                     leaf_index,
                 } if *tree_id == self.tree_id => {
+                    self.stats.registered += 1;
                     // Leaf = rate commitment = poseidon(identity_commitment, rate_limit).
                     let leaf = rate_commitment(id_commitment, *rate_limit);
                     self.tree
@@ -116,6 +152,7 @@ impl Reader {
                     id_commitment,
                     expiry_timestamp_ms,
                 } if *tree_id == self.tree_id => {
+                    self.stats.extended += 1;
                     // No change: the tree is untouched, only the expiry the reader tracks moves.
                     if let Some(leaf) = self.live.get_mut(id_commitment) {
                         leaf.expiry_timestamp_ms = *expiry_timestamp_ms;
@@ -128,12 +165,14 @@ impl Reader {
                     tree_id,
                     id_commitment,
                 } if *tree_id == self.tree_id => {
+                    self.stats.erased += 1;
                     changes.extend(self.remove(*id_commitment, Removed::Expired));
                 }
                 Event::Slashed {
                     tree_id,
                     id_commitment,
                 } if *tree_id == self.tree_id => {
+                    self.stats.slashed += 1;
                     match self.remove(*id_commitment, Removed::Slashed) {
                         Some(change) => changes.push(change),
                         // Slashed during the withdrawal delay: the leaf already expired, so no
@@ -143,7 +182,7 @@ impl Reader {
                         }
                     }
                 }
-                _ => {}
+                _ => self.stats.other_tree += 1,
             }
         }
         // Expiry after the block's events, in leaf order, at most once per leaf.
@@ -164,6 +203,10 @@ impl Reader {
 
     fn remove(&mut self, key: [u8; 32], cause: Removed) -> Option<Change> {
         let leaf = self.live.remove(&key)?;
+        match cause {
+            Removed::Expired => self.stats.removed_expired += 1,
+            Removed::Slashed => self.stats.removed_slashed += 1,
+        }
         self.tree
             .delete(leaf.leaf_index as usize)
             .expect("index in range");

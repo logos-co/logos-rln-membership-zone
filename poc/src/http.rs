@@ -32,6 +32,7 @@ pub fn router(state: AppState) -> Router {
         .route("/roots/{window_size}", get(roots))
         .route("/merkle_proof/{leaf_index}", get(merkle_proof))
         .route("/leaf/{id_commitment}", get(leaf))
+        .route("/leaves", get(leaves))
         .with_state(state)
 }
 
@@ -74,14 +75,19 @@ async fn summary(State(state): State<AppState>) -> Json<Value> {
         "latest_lez_block_id": registry.head.applied_block_id,
         "lez_timestamp_ms": registry.head.applied_timestamp_ms,
         "covered_to_lez_block_id": registry.history.covered_to,
-        "live_leaves_at_head": registry.head.live_count(),
+        "tree": {
+            "live_leaves": registry.head.live_count(),
+            "removed_leaves": registry.head.removed_leaves().len(),
+            "root_at_head": hex::encode(registry.head.root()),
+            "events": registry.head.stats,
+        },
         "pending_changes": registry.pending_changes.len(),
         "published_batches": registry.history.published.len(),
         "newest_adopted_root": adopted.map(|p| hex::encode(p.root_after)),
         "newest_adopted_to_lez_block_id": adopted.map(|p| p.to_lez_block_id),
         "newest_finalized_root": finalized.map(|p| hex::encode(p.root_after)),
         "newest_finalized_to_lez_block_id": finalized.map(|p| p.to_lez_block_id),
-        "endpoints": ["/roots/{window_size}", "/merkle_proof/{leaf_index}[?at=finalized]", "/leaf/{id_commitment}[?at=finalized]", "/health"],
+        "endpoints": ["/roots/{window_size}", "/merkle_proof/{leaf_index}[?at=finalized]", "/leaf/{id_commitment}[?at=finalized]", "/leaves", "/health"],
     }))
 }
 
@@ -177,6 +183,38 @@ async fn leaf(
         },
         "at_served_root": served,
     })))
+}
+
+/// Every leaf at the LEZ head: live ones with their expiry, removed ones with the cause.
+async fn leaves(State(state): State<AppState>) -> Json<Value> {
+    let registry = state.registry.read().expect("registry lock");
+    let live: Vec<Value> = registry
+        .head
+        .live_leaves()
+        .into_iter()
+        .map(|(leaf_index, id, expiry)| {
+            json!({
+                "leaf_index": leaf_index,
+                "id_commitment": hex::encode(id),
+                "expiry_timestamp_ms": expiry,
+                "expires_in_ms": expiry.saturating_sub(registry.head.applied_timestamp_ms),
+            })
+        })
+        .collect();
+    let removed: Vec<Value> = registry
+        .head
+        .removed_leaves()
+        .into_iter()
+        .map(|(id, cause)| json!({ "id_commitment": hex::encode(id), "cause": format!("{cause:?}") }))
+        .collect();
+    Json(json!({
+        "lez_block_id": registry.head.applied_block_id,
+        "lez_timestamp_ms": registry.head.applied_timestamp_ms,
+        "root_at_head": hex::encode(registry.head.root()),
+        "events": registry.head.stats,
+        "live": live,
+        "removed": removed,
+    }))
 }
 
 fn error(code: StatusCode, message: &str) -> (StatusCode, Json<Value>) {

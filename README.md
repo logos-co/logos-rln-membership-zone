@@ -130,6 +130,7 @@ curl -s localhost:3000/roots/5          # newest 5 roots with their status
 curl -s localhost:3000/merkle_proof/0   # proof path of leaf 0 at the newest root in a Bedrock block
 curl -s "localhost:3000/merkle_proof/0?at=finalized"   # same, at the newest finalized root
 curl -s localhost:3000/leaf/<id_commitment hex>
+curl -s localhost:3000/leaves          # every leaf at the LEZ head, event counters
 ```
 
 Ctrl-C stops it; the next start resumes from `poc/data/checkpoint.json` and `history.json`

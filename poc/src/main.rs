@@ -49,7 +49,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     http::{AppState, Shared},
-    lez::{LezSource, TickingLez},
+    lez::{IndexerLez, Selectors, Source, TickingLez},
     registry::{History, Registry, Status, now_unix},
 };
 
@@ -116,6 +116,11 @@ struct Args {
     /// 49431 on the testnet). Ignored by the ticking source, which starts at first start.
     #[arg(long, env = "FIRST_LEZ_BLOCK_ID")]
     first_lez_block_id: Option<u64>,
+    /// Program name behind the event selectors (`sha256("<name>::Registered")[..8]`, ...).
+    /// Without it, events are told apart by their borsh length, which cannot separate
+    /// `Erased` from `Slashed` (both remove the leaf).
+    #[arg(long, env = "PROGRAM_NAME")]
+    program_name: Option<String>,
     /// Seconds between LEZ polls (and the block period of the ticking source).
     #[arg(long, default_value_t = 10, env = "POLL_SEC")]
     poll_sec: u64,
@@ -177,12 +182,12 @@ fn save_checkpoint(path: &PathBuf, checkpoint: &SequencerCheckpoint) -> Result<(
 }
 
 /// Fetch and apply LEZ blocks `from..=to` in spans the source accepts.
-fn apply_range(source: &mut dyn LezSource, registry: &Shared, from: u64, to: u64) -> Result<usize> {
+async fn apply_range(source: &Source, registry: &Shared, from: u64, to: u64) -> Result<usize> {
     let mut applied = 0;
     let mut start = from;
     while start <= to {
         let end = to.min(start + FETCH_SPAN - 1);
-        let blocks = source.blocks(start, end)?;
+        let blocks = source.blocks(start, end).await?;
         let mut registry = registry.write().expect("registry lock");
         for block in &blocks {
             if !block.events.is_empty() {
@@ -212,16 +217,23 @@ async fn main() -> Result<()> {
 
     // LEZ source.
     let program_account_id = parse_32(&args.program_account_id, "PROGRAM_ACCOUNT_ID")?;
-    let mut source: Box<dyn LezSource> = match args.lez_source.as_str() {
-        "ticking" => Box::new(TickingLez::new(args.poll_sec)),
-        "indexer" => bail!(
-            "LEZ source `indexer` is not wired yet: it will read program {} ({}) from {} and the \
-             head from {}",
-            PROGRAM_ACCOUNT_ID_BASE58,
-            hex::encode(program_account_id),
-            args.lez_indexer_url,
-            args.lez_sequencer_url
-        ),
+    let source = match args.lez_source.as_str() {
+        "ticking" => Source::Ticking(TickingLez::new(args.poll_sec)),
+        "indexer" => {
+            if program_account_id != parse_32(PROGRAM_ACCOUNT_ID_HEX, "default")? {
+                bail!(
+                    "PROGRAM_ACCOUNT_ID differs from the built-in program; the indexer source \
+                     needs its base58 form, add it next to PROGRAM_ACCOUNT_ID_BASE58"
+                );
+            }
+            Source::Indexer(IndexerLez::new(
+                args.lez_indexer_url.clone(),
+                PROGRAM_ACCOUNT_ID_BASE58.to_owned(),
+                args.program_name
+                    .as_deref()
+                    .map(Selectors::from_program_name),
+            ))
+        }
         other => bail!("unknown LEZ source {other:?}: `indexer` or `ticking`"),
     };
     // The ticking stand-in numbers its blocks by wall clock, so the program's deploy block
@@ -243,7 +255,7 @@ async fn main() -> Result<()> {
         None => {
             let first_lez_block_id = match first_block {
                 Some(id) => id,
-                None => source.last_block_id()?,
+                None => source.last_block_id().await?,
             };
             History {
                 first_lez_block_id,
@@ -334,14 +346,29 @@ async fn main() -> Result<()> {
         )
     };
     if covered_to >= first {
-        let count = apply_range(source.as_mut(), &registry, first, covered_to)?;
+        let count = apply_range(&source, &registry, first, covered_to).await?;
         println!("replayed {count} LEZ blocks up to {covered_to}");
     }
     println!("waiting for the Zone sequencer to be ready...");
 
     let mut ready = false;
-    // The batch waiting to land in a block (its message id), if any.
-    let mut in_flight: Option<[u8; 32]> = None;
+    // The batch waiting to land in a block (its message id), if any; after a restart, the
+    // newest Pending batch of the history, which the SDK checkpoint keeps resubmitting.
+    let mut in_flight: Option<[u8; 32]> = registry
+        .read()
+        .expect("registry lock")
+        .history
+        .published
+        .iter()
+        .rev()
+        .find(|p| p.status == Status::Pending)
+        .map(|p| p.msg_id);
+    if let Some(msg) = in_flight {
+        println!(
+            "batch msg {} still pending from the previous run; no new batch until it lands",
+            hex::encode(&msg[..4])
+        );
+    }
     let mut last_publish_unix = registry
         .read()
         .expect("registry lock")
@@ -413,13 +440,13 @@ async fn main() -> Result<()> {
             },
             _ = tick.tick(), if ready => {
                 // 1. LEZ: apply every block closed since the last poll.
-                let head = match source.last_block_id() {
+                let head = match source.last_block_id().await {
                     Ok(head) => head,
                     Err(e) => { println!("LEZ unreachable: {e}"); continue; }
                 };
                 let applied_to = registry.read().expect("registry lock").head.applied_block_id;
                 if head > applied_to
-                    && let Err(e) = apply_range(source.as_mut(), &registry, applied_to + 1, head)
+                    && let Err(e) = apply_range(&source, &registry, applied_to + 1, head).await
                 {
                     println!("LEZ read failed: {e}");
                     continue;
