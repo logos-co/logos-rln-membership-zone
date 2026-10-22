@@ -72,6 +72,10 @@ struct Args {
     /// Hard cap per publish, in atomic units.
     #[arg(long, default_value_t = 1_000_000, env = "MAX_TX_FEE")]
     max_tx_fee: u64,
+    /// Reserve over the mandatory fee, in percent; the excess becomes the tip that ranks the
+    /// transaction in a congested mempool. The Zone SDK default is 12.
+    #[arg(long, default_value_t = 12, env = "PRIORITY_FEE_PERCENT")]
+    priority_fee_percent: u64,
     /// Key, checkpoint and history live here.
     #[arg(long, default_value = "zone-sequencer/data", env = "DATA_DIR")]
     data_dir: PathBuf,
@@ -117,10 +121,11 @@ struct Args {
     #[arg(long, default_value_t = 600, env = "HEARTBEAT_SEC")]
     heartbeat_sec: u64,
     /// LIB slots a published transaction may stay unmined before the Zone SDK re-funds it
-    /// under a new transaction hash (same message id); 0 disables. The SDK default of 30 is
-    /// one block's worth of LIB progress on the testnet, which re-funds every unmined batch at
-    /// every finalized block.
-    #[arg(long, default_value_t = 3_000, env = "STALE_REFUND_SLOTS")]
+    /// under a new transaction hash (same message id); 0 disables. Off by default: the
+    /// mempool is FIFO with a 9 h TTL, and a re-funded transaction goes to the back of the
+    /// queue, while a resubmit of the same transaction keeps its place. The SDK default, 30,
+    /// is one finalized block's worth of LIB progress on the testnet.
+    #[arg(long, default_value_t = 0, env = "STALE_REFUND_SLOTS")]
     stale_refund_slots: u64,
 }
 
@@ -245,7 +250,7 @@ async fn main() -> Result<()> {
         funding_pk: parse_funding_pk(&args.funding_pk)?,
         change_pk: None,
         max_tx_fee: GasCost::new(args.max_tx_fee),
-        priority_fee_percent: FundingConfig::DEFAULT_PRIORITY_FEE_PERCENT,
+        priority_fee_percent: args.priority_fee_percent,
     };
     let node_url: Url = args.node_url.parse().context("invalid NODE_URL")?;
     let node = NodeHttpClient::new(CommonHttpClient::new(None), node_url.clone());

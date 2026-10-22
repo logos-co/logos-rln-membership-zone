@@ -108,7 +108,7 @@ cargo run -p zone-sequencer
 
 curl -s localhost:3000/ | jq                 # channel, LEZ head, tree counters
 curl -s localhost:3000/roots/5 | jq          # newest roots with their status on Bedrock
-curl -s localhost:3000/merkle_proof/0 | jq   # proof path of leaf 0 at the newest adopted root
+curl -s localhost:3000/merkle_proof/0 | jq   # proof path of leaf 0 (newest adopted root, or the head)
 curl -s localhost:3000/leaves | jq           # every leaf at the LEZ head
 ```
 

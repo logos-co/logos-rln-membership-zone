@@ -76,6 +76,7 @@ sed -i "s/^FUNDING_PK=.*/FUNDING_PK=$(yq .public_keys.PoWClaim ~/keystore.yaml)/
 | `NODE_URL` | `http://127.0.0.1:8080` | Logos Blockchain node HTTP API |
 | `FUNDING_PK` | | Node wallet key paying the batches (`PoWClaim`) |
 | `MAX_TX_FEE` | 1000000 | Fee cap per publish, atomic units |
+| `PRIORITY_FEE_PERCENT` | 12 | Reserve over the mandatory fee, the excess is a tip; block builders take the mempool FIFO, so it buys nothing on the testnet (SDK default 12) |
 | `CHANNEL_NAME` | `rln-membership-zone:testnet:v0.3.0` | Channel id = `sha256(CHANNEL_NAME)`; `CHANNEL_ID` (64 hex) overrides |
 | `PROGRAM_ACCOUNT_ID` | `f048...106a` | Registration program on the testnet LEZ (`HAxY9...4bBw` in base58) |
 | `TREE_ID` | `47b2de4f...b4cf` | Registry the program serves, first field of every event |
@@ -84,7 +85,7 @@ sed -i "s/^FUNDING_PK=.*/FUNDING_PK=$(yq .public_keys.PoWClaim ~/keystore.yaml)/
 | `ACTIVE_DURATION_MS` | unset | Membership lifetime after the timestamp a `Register` carries; unset = leaves never expire (section 4) |
 | `POLL_SEC` | 10 | Seconds between LEZ polls |
 | `HEARTBEAT_SEC` | 600 | Publish an empty batch after this long without one |
-| `STALE_REFUND_SLOTS` | 3000 | LIB slots an unmined batch waits before the Zone SDK re-funds it under a new transaction (0 disables). The SDK default, 30, is one finalized block's worth of LIB progress on this testnet |
+| `STALE_REFUND_SLOTS` | 0 | LIB slots an unmined batch waits before the Zone SDK re-funds it under a new transaction (0 disables). Off: the mempool is FIFO, a re-funded transaction goes to the back of the queue; the SDK default, 30, re-funded at every finalized block |
 | `DATA_DIR` | `zone-sequencer/data` | Key, checkpoint, history, snapshots |
 | `HTTP_ADDR` | `127.0.0.1:3000` | HTTP API bind address |
 
@@ -152,15 +153,17 @@ rm -rf zone-sequencer/data/snapshots
 ```bash
 curl -s localhost:3000/ | jq                  # channel, LEZ head, covered block, batch count, tree counters
 curl -s localhost:3000/roots/5 | jq           # newest 5 roots with status, msg_id, tx_hash, l1_slot
-curl -s localhost:3000/merkle_proof/0 | jq    # proof path of leaf 0 at the newest adopted root
-curl -s "localhost:3000/merkle_proof/0?at=finalized" | jq
+curl -s localhost:3000/merkle_proof/0 | jq    # proof path of leaf 0 at the newest adopted root, or at the head while none is in a block
+curl -s "localhost:3000/merkle_proof/0?at=head" | jq        # at the tree of the LEZ head
+curl -s "localhost:3000/merkle_proof/0?at=finalized" | jq   # at the newest finalized root
 curl -s localhost:3000/leaf/<id_commitment hex> | jq
 curl -s localhost:3000/leaves | jq            # every live leaf with expiry, removed leaves with cause
 curl -s localhost:3000/health
 ```
 
-`/merkle_proof` answers 503 while no batch is in a Bedrock block yet, 404 when the index holds
-no leaf at the served root. `path_elements` and `identity_path_index` are the
+`/merkle_proof` answers 404 when the index holds no leaf at the served root, 503 for
+`?at=finalized` while nothing is finalized. The answer carries the `status` of the root:
+`head` (the sequencer's own tree, nothing on Bedrock yet), `adopted` or `finalized`. `path_elements` and `identity_path_index` are the
 `RLNMerkleProof` of Zerokit; `root` is the root to prove against.
 
 Exposing the API: `ngrok http 3000` from the same box (inside WSL is fine). Do not expose
@@ -276,13 +279,20 @@ fee per batch), `lib_slot` against `slot` (finality), the time from `pending` to
 - `missing manifest in toolchain '1.98.1-...'`: a half-installed toolchain;
   `rustup toolchain uninstall 1.98.1 && rustup toolchain install 1.98.1`.
 - A batch stays `pending` for more than a few minutes: run the three node commands of
-  section 6 (`mempool/view`, `gas-prices`, `cryptarchia/info`). Transaction gone from the
+  section 6 (`mempool/view`, `gas-prices`, `cryptarchia/info`). A long `mempool/view` with
+  the batch still in it means a congested mempool: block builders take it in FIFO order up to
+  the block's gas limit, a tip buys nothing, and the pool evicts after 9 hours. Position in
+  the queue: `curl -s localhost:8080/mempool/view | jq -r '.[]' | grep -n <tx hash prefix>`;
+  the wait is roughly that position divided by the transactions per block, times 36 s. A
+  resubmit of the same transaction keeps its place; a re-fund (new transaction) loses it,
+  hence `STALE_REFUND_SLOTS=0`. Transaction gone from the
   mempool with no warning: the node dropped it (fee below the floor, or the funding note
   changed). Still in the mempool while `height` grows: producers do not see or do not accept
   it. `height` not growing: the testnet is stalled.
 - `Re-funded stale tx A -> B` in the log: the Zone SDK rebuilt the fee transaction of an
-  unmined batch; the message id stays, batches are tracked by it. With the SDK default
-  window this happened at every finalized block, hence `STALE_REFUND_SLOTS=3000`.
+  unmined batch; the message id stays, batches are tracked by it. Off by default
+  (`STALE_REFUND_SLOTS=0`): with the SDK default window it happened at every finalized block
+  and sent the batch to the back of the mempool queue each time.
 - Two batches `pending` after a restart: fixed (the in-flight batch is restored from the
   history); if seen, start a new channel (section 3).
 - WSL2: `ngrok http 3000` inside WSL; from a Windows browser `http://localhost:3000` works

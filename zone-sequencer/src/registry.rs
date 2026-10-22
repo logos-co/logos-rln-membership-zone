@@ -55,6 +55,23 @@ pub struct Published {
     pub status: Status,
 }
 
+/// Which root proof paths are served against.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ServeAt {
+    Head,
+    Adopted,
+    Finalized,
+}
+
+/// A root and the tree at it.
+pub struct Served<'a> {
+    pub root: [u8; 32],
+    pub to_lez_block_id: u64,
+    /// `{"status": "head" | "pending" | "adopted" | "orphaned" | "finalized", ...}`.
+    pub status: serde_json::Value,
+    pub reader: &'a Reader,
+}
+
 /// What survives a restart (`history.json`); the trees are rebuilt from LEZ.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct History {
@@ -280,16 +297,30 @@ impl Registry {
             .find(|p| matches!(p.status, Status::Finalized { .. }))
     }
 
-    /// The tree at the newest root in a Bedrock block, or at the newest Finalized root when
-    /// `finalized_only`: what proof paths are served against.
-    pub fn served(&self, finalized_only: bool) -> Option<(&Published, &Reader)> {
-        let published = if finalized_only {
-            self.newest_finalized()?
-        } else {
-            self.newest_adopted()?
+    /// The tree proof paths are served against, by `at`: `Head` = the tree at the LEZ head
+    /// (nothing from Bedrock needed); `Adopted` = the newest root in a Bedrock block, as the
+    /// RFC has Zone indexers act on a batch once it is in a block, falling back to the head
+    /// while no batch is in a block yet; `Finalized` = the newest root in finalized history.
+    pub fn served(&self, at: ServeAt) -> Option<Served<'_>> {
+        let published = match at {
+            ServeAt::Head => None,
+            ServeAt::Adopted => self.newest_adopted(),
+            ServeAt::Finalized => Some(self.newest_finalized()?),
         };
-        let reader = self.snapshots.get(&published.msg_id)?;
-        Some((published, reader))
+        match published {
+            Some(p) => Some(Served {
+                root: p.root_after,
+                to_lez_block_id: p.to_lez_block_id,
+                status: serde_json::to_value(&p.status).unwrap_or_default(),
+                reader: self.snapshots.get(&p.msg_id)?,
+            }),
+            None => Some(Served {
+                root: self.head.root(),
+                to_lez_block_id: self.head.applied_block_id,
+                status: serde_json::json!({ "status": "head" }),
+                reader: &self.head,
+            }),
+        }
     }
 
     /// The published batches newest first, at most `window_size`, Orphaned ones left out.
