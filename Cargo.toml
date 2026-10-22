@@ -1,5 +1,5 @@
 [workspace]
-members  = ["poc"]
+members  = ["zone-sequencer"]
 # The submodule is its own workspace; keep Cargo from treating its crates as ours.
 exclude  = ["logos-blockchain"]
 resolver = "2"

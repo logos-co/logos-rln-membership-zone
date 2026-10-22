@@ -1,0 +1,35 @@
+{
+    "home": ".",
+    "max_num_tx_in_block": 20,
+    "max_block_size": "1 MiB",
+    "mempool_max_size": 1000,
+    "block_create_timeout": "15s",
+    "retry_pending_blocks_timeout": "5s",
+    "bedrock_config": {
+        "backoff": {
+            "start_delay": "100ms",
+            "max_retries": 5
+        },
+        "channel_id": "0101010101010101010101010101010101010101010101010101010101010101",
+        "node_url": "http://127.0.0.1:8080",
+        "funding_key": "<unused by a follower: the key setup_sequencer.py writes into the home>",
+        "channel_params": {
+            "minimum_sequencer_stake": 149,
+            "posting_timeframe": 300,
+            "posting_timeout": 25,
+            "exit_delay": 100
+        }
+    },
+    "gossip": {
+        "listen_addr": "/ip4/0.0.0.0/udp/0/quic-v1",
+        "bootstrap_peers": []
+    },
+    "genesis": [
+        {
+            "supply_account": {
+                "account_id": "<the testnet genesis, from the LEZ team; the debug genesis below is NOT it>",
+                "balance": 0
+            }
+        }
+    ]
+}

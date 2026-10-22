@@ -1,6 +1,6 @@
 [package]
-name        = "rln-zone-poc"
-description = "PoC of the RLN Membership Zone: a Zone sequencer on the Logos testnet that derives the tree from the registration program's events and serves roots and Merkle proof paths over HTTP"
+name        = "zone-sequencer"
+description = "Zone sequencer of the RLN Membership Zone: derives the membership tree from the registration program on LEZ, publishes batches on the Zone channel and serves roots and Merkle proof paths over HTTP"
 edition     = { workspace = true }
 license     = { workspace = true }
 repository  = { workspace = true }

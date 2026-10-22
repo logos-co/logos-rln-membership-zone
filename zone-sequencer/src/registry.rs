@@ -30,7 +30,7 @@ pub enum Status {
     Adopted,
     /// Dropped from the canonical branch by a reorg; published again as a new transaction.
     Orphaned,
-    /// In finalized chain history: a valid root for the PoC.
+    /// In finalized chain history.
     Finalized { l1_slot: u64 },
 }
 

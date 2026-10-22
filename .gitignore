@@ -5,6 +5,7 @@ logs/
 .env
 
 
-# PoC: accredited key, Zone SDK checkpoint, batch history; LEZ indexer store
-/poc/data/
-/poc/lez-indexer/rocksdb-*
+# zone sequencer: accredited key, Zone SDK checkpoint, batch history, tree snapshots
+/zone-sequencer/data/
+# own LEZ sequencer: its home (RocksDB, keys)
+/lez-sequencer/home/

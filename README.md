@@ -27,13 +27,12 @@ Early design. Nothing is deployed.
 
 - **Specification**: [`docs/rfc-rln-membership-zone.md`](docs/rfc-rln-membership-zone.md),
   a raw LIP draft that ends with the open design questions.
-- **PoC**: [`poc/`](poc) is a Zone sequencer for the Logos testnet with an HTTP registry API.
-  It publishes batches on its channel through the Zone SDK and follows them to finality;
-  until its LEZ event source is wired, LEZ is a stand-in clock that closes empty blocks.
-- **Deployed elsewhere**: the registration program is on the testnet LEZ
-  (`HAxY9SiqUjJQHdtvazFDWFCxn1Jw1dtbUGio8DMC4bBw`, block 49431).
-- **Not yet written**: the LEZ event source of the PoC, and the production
-  Zone sequencer and Zone indexer.
+- **Zone sequencer**: [`zone-sequencer/`](zone-sequencer) runs on the Logos testnet with an
+  HTTP registry API. It reads the registration program's transactions from a LEZ Sequencer,
+  derives the tree, publishes batches on its channel through the Zone SDK and follows them to
+  finality. Setup, operation and troubleshooting: [`docs/setup-rln-membership-zone.md`](docs/setup-rln-membership-zone.md).
+- **Not yet written**: the Zone indexer (a Zone sequencer without an accredited key that
+  checks the batches), the event source once LEZ serves events live, and the Module side.
 
 ## How it works
 
@@ -70,14 +69,15 @@ but that only pauses the registry at the Zone indexers until a correct batch arr
 
 ```text
 docs/rfc-rln-membership-zone.md   the specification (raw LIP draft)
-poc/                              PoC: Zone sequencer on the testnet with an HTTP registry API
-  src/lez.rs                      LEZ blocks and events; sources: LEZ Sequencer (transactions), LEZ Indexer (events), ticking
+zone-sequencer/                   the Zone sequencer, with its HTTP registry API
+  src/lez.rs                      LEZ blocks and the program's events, derived from its transactions
   src/reader.rs                   a reader: derivation rules over the events and the tree
   src/batch.rs                    batch wire format (protobuf)
   src/registry.rs                 published batches with their status on Bedrock, trees per batch, history file
   src/http.rs                     HTTP API: roots, Merkle proof path, leaf status
   src/main.rs                     Zone SDK loop: publish, follow to finality, poll LEZ
-  lez-indexer/indexer_config.json LEZ Indexer config that keeps only the registration program's events
+lez-sequencer/                    config template to run your own LEZ sequencer as the block source
+docs/setup-rln-membership-zone.md setup, operation, monitoring, troubleshooting, cleanup
 logos-blockchain/                 git submodule pinned to node release 0.3.2 (Zone SDK path dependencies)
 ```
 
@@ -93,10 +93,10 @@ logos-blockchain/                 git submodule pinned to node release 0.3.2 (Zo
 - `git`, `curl` and `jq`.
 - macOS or Linux on x86_64 or aarch64, the platforms the node release binaries are published for.
 
-### Run the PoC on the testnet
+### Run on the testnet
 
-The PoC needs a synced Logos Blockchain testnet node on `127.0.0.1:8080` whose wallet holds
-funds (mined PoW rewards on the `PoWClaim` key are enough).
+Needs a synced Logos Blockchain testnet node on `127.0.0.1:8080` whose wallet holds funds
+(mined PoW rewards on the `PoWClaim` key are enough).
 
 ```bash
 git clone --recurse-submodules https://github.com/logos-co/logos-rln-membership-zone
@@ -104,86 +104,31 @@ cd logos-rln-membership-zone
 
 cp .env.example .env             # set FUNDING_PK to the node's PoWClaim public key
 set -a; source .env; set +a      # clap reads process env vars, not the .env file
-cargo run -p rln-zone-poc
+cargo run -p zone-sequencer
+
+curl -s localhost:3000/ | jq                 # channel, LEZ head, tree counters
+curl -s localhost:3000/roots/5 | jq          # newest roots with their status on Bedrock
+curl -s localhost:3000/merkle_proof/0 | jq   # proof path of leaf 0 at the newest adopted root
+curl -s localhost:3000/leaves | jq           # every leaf at the LEZ head
 ```
 
-What happens:
-
-1. First start writes the accredited key to `poc/data/key.hex`. The channel id is
-   `sha256(CHANNEL_NAME)`; the key signing the first inscription to that id becomes its
-   accredited key, there is no separate create step. Keep the key file: without it the channel
-   cannot be written again.
-2. The Zone SDK backfills the channel from the node and reports `ready`; the first batch goes
-   out at once, then one batch whenever the tree changed or after `HEARTBEAT_SEC` without one,
-   at most one in flight. Every publish is paid from the node wallet (`FUNDING_PK`), capped at
-   `MAX_TX_FEE`.
-3. Each batch is `pending` from publish, `adopted` once the Zone SDK reports it in a Bedrock
-   block, `finalized` once it is in finalized history (the log prints the L1 slot), or
-   `orphaned` after a reorg, in which case it is published again. Proof paths are served at
-   the newest adopted root, as the RFC has Zone indexers act on a batch once it is in a
-   Bedrock block; finality is the later audit, and `?at=finalized` asks for it.
-4. The HTTP API serves the registry on `HTTP_ADDR`:
-
-```bash
-curl -s localhost:3000/                 # channel, LEZ head, covered block, batch count
-curl -s localhost:3000/roots/5          # newest 5 roots with their status
-curl -s localhost:3000/merkle_proof/0   # proof path of leaf 0 at the newest root in a Bedrock block
-curl -s "localhost:3000/merkle_proof/0?at=finalized"   # same, at the newest finalized root
-curl -s localhost:3000/leaf/<id_commitment hex>
-curl -s localhost:3000/leaves          # every leaf at the LEZ head, event counters
-```
-
-Ctrl-C stops it; the next start resumes from `poc/data/checkpoint.json` and `history.json`,
-restores the tree from `poc/data/snapshots/` (the reader state at each published batch) and
-reads from LEZ only the blocks after the last batch; without snapshots it replays the blocks.
-
-### Read the registration program's events
-
-The RFC derives the tree from the program's events. In LEZ 0.3.x the LEZ Sequencer RPC
-serves closed blocks but not events, and the LEZ Indexer RPC serves events (`getEvents`,
-`subscribeToEvents`) for finalized blocks only, which on the testnet trail the chain by
-8 to 10 hours. The PoC therefore has two LEZ sources, chosen with `LEZ_SOURCE`:
-
-- `sequencer` (default): the public LEZ Sequencer (`https://testnet.lez.logos.co`,
-  `getBlockRange`, closed blocks within seconds). The events are derived from the program's
-  transactions, which a block holds only when they succeeded: a `Register` is a `Registered`
-  with the `leaf_index` the instruction carries, a `Slash` a `Slashed` of
-  `poseidon(identity_secret)`. The instruction layout was read off the testnet transactions
-  (`poc/src/lez.rs`, `decode_instruction`); a `Register` carries the client's timestamp, not
-  the expiry the program computes, so `ACTIVE_DURATION_MS` sets the membership lifetime
-  until the program's rule is confirmed.
-- `indexer`: a LEZ Indexer's `getEvents`, the RFC's input, finalized blocks only. Run one
-  next to the PoC to compare:
-
-```bash
-git clone --depth 1 --branch v0.3.1 https://github.com/logos-blockchain/logos-execution-zone
-cd logos-execution-zone
-RUST_LOG=info cargo run --release --features prove -p indexer_service -- \
-    ../logos-rln-membership-zone/poc/lez-indexer/indexer_config.json \
-    --port 8779 --data-dir ../logos-rln-membership-zone/poc/lez-indexer
-```
-
-`--features prove` executes the guest programs in process, so no `r0vm` install is needed.
-The config points `bedrock_config.addr` at the node, `channel_id` at the testnet LEZ channel
-(`0101...01`, what `getChannelId` on `https://testnet.lez.logos.co` returns) and keeps only the
-registration program's events through `event_filter.sources`
-(`HAxY9SiqUjJQHdtvazFDWFCxn1Jw1dtbUGio8DMC4bBw`, deployed in LEZ block 49431, registry
-`47b2de4f...b4cf`); a filter that keeps nothing serves nothing. The indexer re-executes the LEZ
-channel from its genesis, trailing the LEZ Sequencer by Bedrock finality.
-
-The Zone SDK must match the node's release (the submodule tag): a node on a newer release
-answers the backfill with blocks the older SDK cannot parse, which shows as
-`Failed to fetch immutable blocks ... Failed to parse response` repeating forever.
+The first start creates the channel (the key in `zone-sequencer/data/key.hex`, the id
+`sha256(CHANNEL_NAME)`), reads every LEZ block since the program was deployed, backfills the
+channel from the node and publishes the first batch; later starts resume from the data dir.
+Everything else, including running your own LEZ sequencer as the block source, is in
+[`docs/setup-rln-membership-zone.md`](docs/setup-rln-membership-zone.md).
 
 ### Tests
 
 ```bash
-cargo test -p rln-zone-poc
-cargo clippy -p rln-zone-poc --all-targets -- -D warnings
+cargo test -p zone-sequencer
+cargo clippy -p zone-sequencer --all-targets -- -D warnings
 ```
 
-The unit tests cover the derivation rules: a `Registered` event sets the leaf and the proof
-path, expiry removes it at the LEZ timestamp, events of other registries are ignored.
+The unit tests cover the derivation rules (a `Registered` event sets the leaf and the proof
+path, expiry removes it at the LEZ timestamp, events of other registries are ignored), the
+tree snapshot round trip, and the decoding of LEZ blocks and the program's instructions,
+including a real testnet block.
 
 ## References
 

@@ -1,13 +1,11 @@
-//! PoC of the RLN Membership Zone (`docs/rfc-rln-membership-zone.md`): one Zone sequencer on
-//! the Logos testnet.
+//! The Zone sequencer of the RLN Membership Zone (`docs/rfc-rln-membership-zone.md`), on the
+//! Logos testnet.
 //!
-//! It reads closed LEZ blocks with the registration program's events (`lez.rs`), derives the
-//! tree (`reader.rs`), publishes one batch (`batch.rs`) per change or heartbeat on its channel
+//! It reads closed LEZ blocks from a LEZ Sequencer's JSON-RPC and derives the program's events
+//! from its transactions (`lez.rs`), derives the tree (`reader.rs`), publishes one batch (`batch.rs`) per change or heartbeat on its channel
 //! through the Zone SDK, follows each batch to Bedrock finality, and serves the registry over
 //! HTTP (`http.rs`): roots with their status, Merkle proof paths at the newest root in a
 //! Bedrock block.
-//! Until the program is deployed the LEZ source is a stand-in clock that closes empty blocks,
-//! so the channel, the batches, finality and the API run end to end with an empty tree.
 //!
 //! Everything it must keep lives in `--data-dir`: `key.hex` (the accredited key; the channel id
 //! is its public key), `checkpoint.json` (Zone SDK resume point), `history.json` (the published
@@ -26,7 +24,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 use lb_core::mantle::{
     gas::GasCost,
@@ -49,14 +47,12 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     http::{AppState, Shared},
-    lez::{IndexerLez, Selectors, SequencerLez, Source, TickingLez},
+    lez::{SEQUENCER_RANGE, SequencerLez},
     registry::{History, Registry, Status, now_unix},
 };
 
-/// Largest LEZ block range fetched at once (the LEZ Indexer caps `getEvents` at 1000).
-const FETCH_SPAN: u64 = 1000;
-/// The registration program on the testnet LEZ: its account id, base58 and hex.
-const PROGRAM_ACCOUNT_ID_BASE58: &str = "HAxY9SiqUjJQHdtvazFDWFCxn1Jw1dtbUGio8DMC4bBw";
+/// The registration program on the testnet LEZ: its account id
+/// (`HAxY9SiqUjJQHdtvazFDWFCxn1Jw1dtbUGio8DMC4bBw` in base58).
 const PROGRAM_ACCOUNT_ID_HEX: &str =
     "f04803944507677bb79b27b61cd0ad6eea81928f281570347e2df6249495106a";
 /// The registry (`tree_id`) the program serves, the first field of every event.
@@ -65,7 +61,7 @@ const TREE_ID_HEX: &str = "47b2de4f08080e74e2d4beffe8e5e87e709dd598619c9b322b64f
 const DEFAULT_FIRST_LEZ_BLOCK_ID: u64 = 49_431;
 
 #[derive(Parser, Debug)]
-#[command(about = "RLN Membership Zone PoC: Zone sequencer with an HTTP registry API")]
+#[command(about = "RLN Membership Zone: Zone sequencer with an HTTP registry API")]
 struct Args {
     /// Logos Blockchain node HTTP API (no auth, local).
     #[arg(long, default_value = "http://127.0.0.1:8080", env = "NODE_URL")]
@@ -77,7 +73,7 @@ struct Args {
     #[arg(long, default_value_t = 1_000_000, env = "MAX_TX_FEE")]
     max_tx_fee: u64,
     /// Key, checkpoint and history live here.
-    #[arg(long, default_value = "poc/data", env = "DATA_DIR")]
+    #[arg(long, default_value = "zone-sequencer/data", env = "DATA_DIR")]
     data_dir: PathBuf,
     /// HTTP API bind address.
     #[arg(long, default_value = "127.0.0.1:3000", env = "HTTP_ADDR")]
@@ -98,36 +94,23 @@ struct Args {
     /// Registration program account id (64 hex) whose events build the tree.
     #[arg(long, default_value = PROGRAM_ACCOUNT_ID_HEX, env = "PROGRAM_ACCOUNT_ID")]
     program_account_id: String,
-    /// LEZ source: `sequencer` = the LEZ Sequencer's JSON-RPC (closed blocks, events derived
-    /// from the program's transactions); `indexer` = a LEZ Indexer's JSON-RPC (`getEvents`,
-    /// finalized blocks); `ticking` = stand-in clock with empty blocks.
-    #[arg(long, default_value = "ticking", env = "LEZ_SOURCE")]
-    lez_source: String,
-    /// LEZ Indexer JSON-RPC, the event source (`poc/lez-indexer/indexer_config.json`).
-    #[arg(long, default_value = "http://127.0.0.1:8779", env = "LEZ_INDEXER_URL")]
-    lez_indexer_url: String,
-    /// LEZ Sequencer JSON-RPC, for the latest closed block (`getLastBlockId`).
+    /// LEZ Sequencer JSON-RPC the blocks come from: the public testnet one, or
+    /// `http://127.0.0.1:3040` for a LEZ sequencer run next to it (`lez-sequencer/`).
     #[arg(
         long,
         default_value = "https://testnet.lez.logos.co",
         env = "LEZ_SEQUENCER_URL"
     )]
     lez_sequencer_url: String,
-    /// First LEZ block the registry covers: the block the program was deployed in (default
-    /// 49431 on the testnet). Ignored by the ticking source, which starts at first start.
-    #[arg(long, env = "FIRST_LEZ_BLOCK_ID")]
-    first_lez_block_id: Option<u64>,
-    /// Membership lifetime after the timestamp a `Register` carries, for the `sequencer`
-    /// source: the program computes the expiry itself and its rule is not confirmed yet.
-    /// Unset = memberships never expire in this PoC.
+    /// First LEZ block the registry covers: the block the program was deployed in.
+    #[arg(long, default_value_t = DEFAULT_FIRST_LEZ_BLOCK_ID, env = "FIRST_LEZ_BLOCK_ID")]
+    first_lez_block_id: u64,
+    /// Membership lifetime after the timestamp a `Register` carries: the program computes the
+    /// expiry itself and its rule is not confirmed yet. Unset = memberships never expire
+    /// here.
     #[arg(long, env = "ACTIVE_DURATION_MS")]
     active_duration_ms: Option<u64>,
-    /// Program name behind the event selectors (`sha256("<name>::Registered")[..8]`, ...).
-    /// Without it, events are told apart by their borsh length, which cannot separate
-    /// `Erased` from `Slashed` (both remove the leaf).
-    #[arg(long, env = "PROGRAM_NAME")]
-    program_name: Option<String>,
-    /// Seconds between LEZ polls (and the block period of the ticking source).
+    /// Seconds between LEZ polls.
     #[arg(long, default_value_t = 10, env = "POLL_SEC")]
     poll_sec: u64,
     /// Publish an empty batch after this long without one.
@@ -188,11 +171,16 @@ fn save_checkpoint(path: &PathBuf, checkpoint: &SequencerCheckpoint) -> Result<(
 }
 
 /// Fetch and apply LEZ blocks `from..=to` in spans the source accepts.
-async fn apply_range(source: &Source, registry: &Shared, from: u64, to: u64) -> Result<usize> {
+async fn apply_range(
+    source: &SequencerLez,
+    registry: &Shared,
+    from: u64,
+    to: u64,
+) -> Result<usize> {
     let mut applied = 0;
     let mut start = from;
     while start <= to {
-        let end = to.min(start + FETCH_SPAN - 1);
+        let end = to.min(start + SEQUENCER_RANGE - 1);
         let blocks = source.blocks(start, end).await?;
         let mut registry = registry.write().expect("registry lock");
         for block in &blocks {
@@ -223,57 +211,21 @@ async fn main() -> Result<()> {
 
     // LEZ source.
     let program_account_id = parse_32(&args.program_account_id, "PROGRAM_ACCOUNT_ID")?;
-    let source = match args.lez_source.as_str() {
-        "ticking" => Source::Ticking(TickingLez::new(args.poll_sec)),
-        "indexer" => {
-            if program_account_id != parse_32(PROGRAM_ACCOUNT_ID_HEX, "default")? {
-                bail!(
-                    "PROGRAM_ACCOUNT_ID differs from the built-in program; the indexer source \
-                     needs its base58 form, add it next to PROGRAM_ACCOUNT_ID_BASE58"
-                );
-            }
-            Source::Indexer(IndexerLez::new(
-                args.lez_indexer_url.clone(),
-                PROGRAM_ACCOUNT_ID_BASE58.to_owned(),
-                args.program_name
-                    .as_deref()
-                    .map(Selectors::from_program_name),
-            ))
-        }
-        "sequencer" => Source::Sequencer(SequencerLez::new(
-            args.lez_sequencer_url.clone(),
-            program_account_id,
-            args.active_duration_ms,
-        )),
-        other => bail!("unknown LEZ source {other:?}: `sequencer`, `indexer` or `ticking`"),
-    };
-    // The ticking stand-in numbers its blocks by wall clock, so the program's deploy block
-    // means nothing to it: it always starts at the block of the first start.
-    let ticking = args.lez_source == "ticking";
-    let first_block = if ticking {
-        None
-    } else {
-        Some(
-            args.first_lez_block_id
-                .unwrap_or(DEFAULT_FIRST_LEZ_BLOCK_ID),
-        )
-    };
+    let source = SequencerLez::new(
+        args.lez_sequencer_url.clone(),
+        program_account_id,
+        args.active_duration_ms,
+    );
 
     // Registry: resume the published batches, rebuild the trees from LEZ below.
     let tree_id = parse_32(&args.tree_id, "TREE_ID")?;
     let history = match History::load(&history_path)? {
         Some(history) => history,
-        None => {
-            let first_lez_block_id = match first_block {
-                Some(id) => id,
-                None => source.last_block_id().await?,
-            };
-            History {
-                first_lez_block_id,
-                covered_to: first_lez_block_id.saturating_sub(1),
-                published: vec![],
-            }
-        }
+        None => History {
+            first_lez_block_id: args.first_lez_block_id,
+            covered_to: args.first_lez_block_id.saturating_sub(1),
+            published: vec![],
+        },
     };
     let registry: Shared = Arc::new(RwLock::new(Registry::new(
         tree_id,
@@ -329,7 +281,7 @@ async fn main() -> Result<()> {
 
     {
         let registry = registry.read().expect("registry lock");
-        println!("RLN Membership Zone PoC");
+        println!("RLN Membership Zone sequencer");
         println!("  node      {node_url}");
         println!(
             "  channel   {} ({})",
