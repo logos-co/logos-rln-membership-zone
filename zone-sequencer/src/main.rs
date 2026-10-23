@@ -407,6 +407,10 @@ async fn main() -> Result<()> {
     let mut ready = false;
     // The batch waiting to land in a block (its message id), if any; after a restart, the
     // newest Pending batch of the history, which the SDK checkpoint keeps resubmitting.
+    // The SDK's view of the channel: its `tip_message` is how our own batches are seen landing,
+    // since an inscription we published is not echoed in `ChannelUpdate::adopted` on a plain
+    // chain extension (only on a branch change).
+    let channel_view = sdk.subscribe_channel_view();
     let mut in_flight: Option<[u8; 32]> = registry
         .read()
         .expect("registry lock")
@@ -442,6 +446,22 @@ async fn main() -> Result<()> {
                 Event::BlocksProcessed { checkpoint, channel_update, finalized, .. } => {
                     save_checkpoint(&registry, &checkpoint)?;
                     let mut changed = false;
+                    // The channel tip is one of our batches: it and every pending batch before
+                    // it (its ancestors in the channel) are in a Bedrock block.
+                    let tip = msg_bytes(&channel_view.borrow().tip_message);
+                    {
+                        let mut registry = registry.write().expect("registry lock");
+                        if let Some(at) = registry.history.published.iter().position(|p| p.msg_id == tip) {
+                            for entry in registry.history.published.iter_mut().take(at + 1) {
+                                if entry.status == Status::Pending {
+                                    entry.status = Status::Adopted;
+                                    println!("batch [{}..{}] msg {} adopted in a Bedrock block (channel tip)", entry.from_lez_block_id, entry.to_lez_block_id, hex::encode(&entry.msg_id[..4]));
+                                    changed = true;
+                                    if in_flight == Some(entry.msg_id) { in_flight = None; }
+                                }
+                            }
+                        }
+                    }
                     // Our batch is in a Bedrock block: its fee note is spent, the next may go.
                     for tx in channel_update.adopted() {
                         let Some(info) = tx.inscription() else { continue };
