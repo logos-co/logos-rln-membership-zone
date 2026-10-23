@@ -71,9 +71,9 @@ but that only pauses the registry at the Zone indexers until a correct batch arr
 docs/rfc-rln-membership-zone.md   the specification (raw LIP draft)
 zone-sequencer/                   the Zone sequencer, with its HTTP registry API
   src/lez.rs                      LEZ blocks and the program's events, derived from its transactions
-  src/reader.rs                   a reader: derivation rules over the events and the tree
+  src/reader.rs                   a reader: derivation rules over the events and the tree (sled-backed PmTree)
   src/batch.rs                    batch wire format (protobuf)
-  src/registry.rs                 published batches with their status on Bedrock, trees per batch, history file
+  src/registry.rs                 published batches with their status on Bedrock, kept in the tree store
   src/http.rs                     HTTP API: roots, Merkle proof path, leaf status
   src/main.rs                     Zone SDK loop: publish, follow to finality, poll LEZ
 lez-sequencer/                    config template to run your own LEZ sequencer as the block source
@@ -108,7 +108,7 @@ cargo run -p zone-sequencer
 
 curl -s localhost:3000/ | jq                 # channel, LEZ head, tree counters
 curl -s localhost:3000/roots/5 | jq          # newest roots with their status on Bedrock
-curl -s localhost:3000/merkle_proof/0 | jq   # proof path of leaf 0 (newest adopted root, or the head)
+curl -s localhost:3000/merkle_proof/0 | jq   # proof path of leaf 0 at the tree of the LEZ head
 curl -s localhost:3000/leaves | jq           # every leaf at the LEZ head
 ```
 
@@ -127,7 +127,7 @@ cargo clippy -p zone-sequencer --all-targets -- -D warnings
 
 The unit tests cover the derivation rules (a `Registered` event sets the leaf and the proof
 path, expiry removes it at the LEZ timestamp, events of other registries are ignored), the
-tree snapshot round trip, and the decoding of LEZ blocks and the program's instructions,
+tree store surviving a reopen, and the decoding of LEZ blocks and the program's instructions,
 including a real testnet block.
 
 ## References

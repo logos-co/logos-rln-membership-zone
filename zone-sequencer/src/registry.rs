@@ -1,16 +1,14 @@
 //! The registry the sequencer holds and the HTTP API serves: the tree at the LEZ head, the
-//! changes not yet in a batch, every batch published with the status of its Mantle
-//! Transaction on Bedrock, and the tree at each published batch so proof paths can be served
-//! at the newest root in a Bedrock block (or the newest Finalized one on request).
+//! changes not yet in a batch, and every batch published with the status of its Mantle
+//! Transaction on Bedrock. Everything is kept in the tree store (`data/tree/`): the tree and
+//! the reader's state by the reader, the batch history and the Zone SDK checkpoint as the
+//! reader's `extra`.
 
-use std::{
-    collections::HashMap,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, path::Path};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::{
     batch::{Batch, Change},
@@ -55,24 +53,7 @@ pub struct Published {
     pub status: Status,
 }
 
-/// Which root proof paths are served against.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ServeAt {
-    Head,
-    Adopted,
-    Finalized,
-}
-
-/// A root and the tree at it.
-pub struct Served<'a> {
-    pub root: [u8; 32],
-    pub to_lez_block_id: u64,
-    /// `{"status": "head" | "pending" | "adopted" | "orphaned" | "finalized", ...}`.
-    pub status: serde_json::Value,
-    pub reader: &'a Reader,
-}
-
-/// What survives a restart (`history.json`); the trees are rebuilt from LEZ.
+/// The published batches.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct History {
     pub first_lez_block_id: u64,
@@ -81,128 +62,75 @@ pub struct History {
     pub published: Vec<Published>,
 }
 
-impl History {
-    pub fn load(path: &Path) -> Result<Option<Self>> {
-        if !path.exists() {
-            return Ok(None);
-        }
-        let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        Ok(Some(
-            serde_json::from_str(&text).context("parse history.json")?,
-        ))
-    }
-
-    pub fn save(&self, path: &Path) -> Result<()> {
-        fs::write(path, serde_json::to_string_pretty(self)?)
-            .with_context(|| format!("write {}", path.display()))
-    }
-}
-
 pub struct Registry {
-    /// `snapshots/` under the data dir: the reader state at each published batch.
-    snapshot_dir: PathBuf,
     pub history: History,
     /// The tree at the latest LEZ block applied.
     pub head: Reader,
     /// Changes of the LEZ blocks after `covered_to`, in derivation-rule order.
     pub pending_changes: Vec<Change>,
-    /// The tree right after the last block of each published batch, by message id.
-    snapshots: HashMap<[u8; 32], Reader>,
+    /// The Zone SDK checkpoint, as JSON.
+    checkpoint: Option<Value>,
     /// The payload of each published batch, by message id, to publish it again after a reorg.
     payloads: HashMap<[u8; 32], Vec<u8>>,
 }
 
 impl Registry {
-    pub fn new(tree_id: [u8; 32], history: History, snapshot_dir: PathBuf) -> Self {
-        Self {
-            snapshot_dir,
-            head: Reader::new(tree_id, history.first_lez_block_id.saturating_sub(1)),
+    /// Open the tree store under `data_dir` and the batch history kept with it; a fresh store
+    /// starts at `first_lez_block_id`.
+    pub fn open(data_dir: &Path, tree_id: [u8; 32], first_lez_block_id: u64) -> Result<Self> {
+        let (head, extra) = Reader::open(
+            &data_dir.join("tree"),
+            tree_id,
+            first_lez_block_id.saturating_sub(1),
+        )?;
+        let history = match extra.get("history") {
+            Some(h) => {
+                serde_json::from_value(h.clone()).context("batch history in the tree store")?
+            }
+            None => History {
+                first_lez_block_id,
+                covered_to: first_lez_block_id.saturating_sub(1),
+                published: vec![],
+            },
+        };
+        let checkpoint = extra.get("checkpoint").filter(|c| !c.is_null()).cloned();
+        Ok(Self {
             history,
+            head,
             pending_changes: vec![],
-            snapshots: HashMap::new(),
+            checkpoint,
             payloads: HashMap::new(),
-        }
+        })
     }
 
-    fn snapshot_path(&self, msg_id: &[u8; 32]) -> PathBuf {
-        self.snapshot_dir
-            .join(format!("{}.json", hex::encode(msg_id)))
+    /// Write the reader's state, the history and the checkpoint into the tree store.
+    pub fn save(&mut self) -> Result<()> {
+        let extra = json!({ "history": self.history, "checkpoint": self.checkpoint });
+        self.head.persist(extra)
     }
 
-    /// Store the head as the snapshot of `msg_id`, in memory and on disk.
-    fn take_snapshot(&mut self, msg_id: [u8; 32]) {
-        self.snapshots.insert(msg_id, self.head.clone());
-        let path = self.snapshot_path(&msg_id);
-        let written = fs::create_dir_all(&self.snapshot_dir).and_then(|()| {
-            fs::write(
-                &path,
-                serde_json::to_string(&self.head.snapshot()).unwrap_or_default(),
-            )
-        });
-        if let Err(e) = written {
-            println!("snapshot {} not written: {e}", path.display());
-        }
+    pub fn close(&mut self) -> Result<()> {
+        self.head.close()
     }
 
-    /// Load the snapshots of the published batches from disk; the head becomes the newest
-    /// one, so only the LEZ blocks after `covered_to` have to be read again. Returns the
-    /// block the head is at, or `None` when nothing was loaded (a fresh start, or snapshots
-    /// missing: then the blocks are replayed).
-    pub fn load_snapshots(&mut self) -> Option<u64> {
-        let mut newest: Option<(u64, Reader)> = None;
-        for published in &self.history.published {
-            if published.status == Status::Orphaned {
-                continue;
-            }
-            let path = self.snapshot_path(&published.msg_id);
-            let Ok(text) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let reader = serde_json::from_str(&text)
-                .map_err(|e| e.to_string())
-                .and_then(|snapshot| Reader::from_snapshot(&snapshot));
-            match reader {
-                Ok(reader) => {
-                    if newest
-                        .as_ref()
-                        .is_none_or(|(at, _)| reader.applied_block_id > *at)
-                    {
-                        newest = Some((reader.applied_block_id, reader.clone()));
-                    }
-                    self.snapshots.insert(published.msg_id, reader);
-                }
-                Err(e) => println!("snapshot {} unusable: {e}", path.display()),
-            }
-        }
-        let (at, head) = newest?;
-        if at != self.history.covered_to {
-            // The newest snapshot is older than the last published batch: replay instead.
-            self.snapshots.clear();
-            return None;
-        }
-        self.head = head;
-        Some(at)
+    pub fn checkpoint(&self) -> Option<&Value> {
+        self.checkpoint.as_ref()
     }
 
-    /// Apply closed LEZ blocks to the head tree; blocks up to `covered_to` are a replay after
-    /// a restart and take the snapshots of the published batches again.
-    pub fn apply_blocks(&mut self, blocks: &[Block]) {
+    pub fn set_checkpoint(&mut self, checkpoint: Value) {
+        self.checkpoint = Some(checkpoint);
+    }
+
+    /// Apply closed LEZ blocks to the head tree; the changes of blocks after `covered_to` wait
+    /// for the next batch.
+    pub fn apply_blocks(&mut self, blocks: &[Block]) -> Result<()> {
         for block in blocks {
-            let changes = self.head.apply_block(block);
+            let changes = self.head.apply_block(block)?;
             if block.block_id > self.history.covered_to {
                 self.pending_changes.extend(changes);
             }
-            let at_this_block: Vec<[u8; 32]> = self
-                .history
-                .published
-                .iter()
-                .filter(|p| p.to_lez_block_id == block.block_id && p.status != Status::Orphaned)
-                .map(|p| p.msg_id)
-                .collect();
-            for msg_id in at_this_block {
-                self.take_snapshot(msg_id);
-            }
         }
+        Ok(())
     }
 
     /// The next batch: every LEZ block after `covered_to` up to the head, with the pending
@@ -241,7 +169,6 @@ impl Registry {
         });
         self.history.covered_to = batch.to_lez_block_id;
         self.pending_changes.clear();
-        self.take_snapshot(msg_id);
         self.payloads.insert(msg_id, payload);
     }
 
@@ -258,10 +185,6 @@ impl Registry {
         again.status = Status::Pending;
         again.published_at_unix = now_unix();
         self.history.published.push(again);
-        if let Some(snapshot) = self.snapshots.remove(&old) {
-            self.snapshots.insert(new_msg_id, snapshot);
-            let _ = fs::rename(self.snapshot_path(&old), self.snapshot_path(&new_msg_id));
-        }
         if let Some(payload) = self.payloads.remove(&old) {
             self.payloads.insert(new_msg_id, payload);
         }
@@ -278,8 +201,7 @@ impl Registry {
             .find(|p| p.msg_id == *msg_id)
     }
 
-    /// The newest batch in a Bedrock block (Adopted or Finalized): the RFC's reference for
-    /// Zone indexers, finality being the later audit.
+    /// The newest batch in a Bedrock block (Adopted or Finalized).
     pub fn newest_adopted(&self) -> Option<&Published> {
         self.history
             .published
@@ -295,32 +217,6 @@ impl Registry {
             .iter()
             .rev()
             .find(|p| matches!(p.status, Status::Finalized { .. }))
-    }
-
-    /// The tree proof paths are served against, by `at`: `Head` = the tree at the LEZ head
-    /// (nothing from Bedrock needed); `Adopted` = the newest root in a Bedrock block, as the
-    /// RFC has Zone indexers act on a batch once it is in a block, falling back to the head
-    /// while no batch is in a block yet; `Finalized` = the newest root in finalized history.
-    pub fn served(&self, at: ServeAt) -> Option<Served<'_>> {
-        let published = match at {
-            ServeAt::Head => None,
-            ServeAt::Adopted => self.newest_adopted(),
-            ServeAt::Finalized => Some(self.newest_finalized()?),
-        };
-        match published {
-            Some(p) => Some(Served {
-                root: p.root_after,
-                to_lez_block_id: p.to_lez_block_id,
-                status: serde_json::to_value(&p.status).unwrap_or_default(),
-                reader: self.snapshots.get(&p.msg_id)?,
-            }),
-            None => Some(Served {
-                root: self.head.root(),
-                to_lez_block_id: self.head.applied_block_id,
-                status: serde_json::json!({ "status": "head" }),
-                reader: &self.head,
-            }),
-        }
     }
 
     /// The published batches newest first, at most `window_size`, Orphaned ones left out.

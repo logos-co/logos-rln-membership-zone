@@ -86,7 +86,7 @@ sed -i "s/^FUNDING_PK=.*/FUNDING_PK=$(yq .public_keys.PoWClaim ~/keystore.yaml)/
 | `POLL_SEC` | 10 | Seconds between LEZ polls |
 | `HEARTBEAT_SEC` | 600 | Publish an empty batch after this long without one |
 | `STALE_REFUND_SLOTS` | 0 | LIB slots an unmined batch waits before the Zone SDK re-funds it under a new transaction (0 disables). Off: the mempool is FIFO, a re-funded transaction goes to the back of the queue; the SDK default, 30, re-funded at every finalized block |
-| `DATA_DIR` | `zone-sequencer/data` | Key, checkpoint, history, snapshots |
+| `DATA_DIR` | `zone-sequencer/data` | `key.hex` and the tree store `tree/` |
 | `HTTP_ADDR` | `127.0.0.1:3000` | HTTP API bind address |
 
 ### Run
@@ -105,11 +105,13 @@ What happens, in order:
    only be written by this key. The channel id is `sha256(CHANNEL_NAME)`; there is no
    create step, the first inscription to an unused id creates the channel with the signing
    key as its only accredited key (`posting_timeframe` and `posting_timeout` 0: one writer).
-2. The tree is restored from `zone-sequencer/data/snapshots/` or, on a fresh start, built by reading
-   every LEZ block from `FIRST_LEZ_BLOCK_ID` to the head: every registration made before the
-   sequencer existed is applied, the first batch covers all of them.
+2. The tree store `zone-sequencer/data/tree/` (sled) is opened: on a fresh start the tree is
+   built by reading every LEZ block from `FIRST_LEZ_BLOCK_ID` to the head, so every
+   registration made before the sequencer existed is applied and the first batch covers all
+   of them; later starts continue from the block the store is at.
 3. The Zone SDK backfills the channel from the node: from slot 0 the first time (30 to 60
-   minutes on the testnet), from `zone-sequencer/data/checkpoint.json` after that (seconds to minutes).
+   minutes on the testnet), from the checkpoint kept in the tree store after that (seconds
+   to minutes).
    Then `ready`.
 4. Every `POLL_SEC` the new LEZ blocks are applied; a batch goes out when there are
    changes, when `HEARTBEAT_SEC` passed without one, or when none was ever published; at
@@ -118,8 +120,9 @@ What happens, in order:
    once in finalized history (8 to 10 hours later, the log prints the L1 slot), or
    `orphaned` after a reorg, in which case it is published again.
 
-Ctrl-C stops it. The next start resumes: checkpoint for the channel, `history.json` for the
-batches, snapshots for the tree, and only the LEZ blocks after the last batch are read again.
+Ctrl-C stops it. The next start opens the tree store and continues: the Zone SDK from its
+checkpoint, the batches from the history, the tree from where it was, and only the LEZ
+blocks closed since are read.
 A batch still `pending` from the previous run is kept in flight, no second batch is published
 over it. Events that happened while the sequencer was down are picked up the same way: the
 next batch spans the whole gap.
@@ -129,11 +132,9 @@ next batch spans the whole gap.
 | File | Content | Lose it and |
 | --- | --- | --- |
 | `zone-sequencer/data/key.hex` | accredited key | the channel is lost; start a new one with a new `CHANNEL_NAME` |
-| `zone-sequencer/data/checkpoint.json` | Zone SDK resume point (channel tip, pending txs) | backfill from slot 0 again; pending txs are forgotten |
-| `zone-sequencer/data/history.json` | published batches: range, root, status, msg and tx hash | the sequencer thinks nothing was published and publishes from `FIRST_LEZ_BLOCK_ID` again; Zone indexers would reject the overlap. Do not delete it alone |
-| `zone-sequencer/data/snapshots/<msg_id>.json` | reader state at each batch | the tree is replayed from LEZ, nothing lost |
+| `zone-sequencer/data/tree/` | sled store: the tree, the reader's state, the published batches, the Zone SDK checkpoint | the sequencer starts fresh: backfill from slot 0, tree rebuilt from LEZ, and on a channel that already has batches the next batch chains on the root and is refused (below) |
 
-Rule: never delete `checkpoint.json` on a channel that has batches. The Zone SDK learns the
+Rule: never delete the tree store on a channel that has batches. The Zone SDK learns the
 channel tip from finalized history only (8 to 10 hours behind on the testnet), so without
 the checkpoint it chains the next batch on the root; the chain refuses it (`InvalidParent`),
 silently, and every later batch too. The sequencer checks `GET /channel/:id` on the node at
@@ -148,8 +149,7 @@ that never got mined), change the name and start clean:
 
 ```bash
 sed -i 's/^CHANNEL_NAME=.*/CHANNEL_NAME=rln-membership-zone:testnet:v0.3.0-1/' .env
-rm -f zone-sequencer/data/checkpoint.json zone-sequencer/data/history.json
-rm -rf zone-sequencer/data/snapshots
+rm -rf zone-sequencer/data/tree
 ```
 
 `key.hex` can stay. The old channel costs nothing abandoned.
@@ -159,18 +159,16 @@ rm -rf zone-sequencer/data/snapshots
 ```bash
 curl -s localhost:3000/ | jq                  # channel, LEZ head, covered block, batch count, tree counters
 curl -s localhost:3000/roots/5 | jq           # newest 5 roots with status, msg_id, tx_hash, l1_slot
-curl -s localhost:3000/merkle_proof/0 | jq    # proof path of leaf 0 at the newest adopted root, or at the head while none is in a block
-curl -s "localhost:3000/merkle_proof/0?at=head" | jq        # at the tree of the LEZ head
-curl -s "localhost:3000/merkle_proof/0?at=finalized" | jq   # at the newest finalized root
+curl -s localhost:3000/merkle_proof/0 | jq    # proof path of leaf 0 at the tree of the LEZ head
 curl -s localhost:3000/leaf/<id_commitment hex> | jq
 curl -s localhost:3000/leaves | jq            # every live leaf with expiry, removed leaves with cause
 curl -s localhost:3000/health
 ```
 
-`/merkle_proof` answers 404 when the index holds no leaf at the served root, 503 for
-`?at=finalized` while nothing is finalized. The answer carries the `status` of the root:
-`head` (the sequencer's own tree, nothing on Bedrock yet), `adopted` or `finalized`. `path_elements` and `identity_path_index` are the
-`RLNMerkleProof` of Zerokit; `root` is the root to prove against.
+`/merkle_proof` answers 404 when the index holds no leaf. The answer carries the head root
+the path is for, plus `newest_adopted` and `newest_finalized`, the latest roots a batch took
+to Bedrock, for a validator to compare. `path_elements` and `identity_path_index` are the
+`RLNMerkleProof` of Zerokit.
 
 Exposing the API: `ngrok http 3000` from the same box (inside WSL is fine). Do not expose
 8080.
@@ -258,7 +256,6 @@ The home (`lez-sequencer/home/`) is gitignored.
 # Zone sequencer
 curl -s localhost:3000/ | jq
 watch -n 10 'curl -s localhost:3000/roots/3 | jq -c ".roots[] | {to_lez_block_id, status, l1_slot}"'
-cat ~/logos-rln-membership-zone/zone-sequencer/data/history.json | jq
 
 # Node
 curl -s localhost:8080/cryptarchia/info | jq '.cryptarchia_info | {slot, height, lib_slot, state}'
@@ -316,8 +313,7 @@ Zone sequencer data (keeps the key):
 
 ```bash
 cd ~/logos-rln-membership-zone
-rm -f zone-sequencer/data/checkpoint.json zone-sequencer/data/history.json
-rm -rf zone-sequencer/data/snapshots
+rm -rf zone-sequencer/data/tree
 ```
 
 Everything of the Zone sequencer, including the key and the build:

@@ -8,8 +8,8 @@
 //! Bedrock block.
 //!
 //! Everything it must keep lives in `--data-dir`: `key.hex` (the accredited key; the channel id
-//! is its public key), `checkpoint.json` (Zone SDK resume point), `history.json` (the published
-//! batches). The trees are rebuilt from LEZ at start.
+//! is `sha256(CHANNEL_NAME)`) and `tree/`, a sled store holding the tree, the reader's state,
+//! the published batches and the Zone SDK checkpoint, so a restart opens it and continues.
 
 mod batch;
 mod http;
@@ -48,7 +48,7 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     http::{AppState, Shared},
     lez::{SEQUENCER_RANGE, SequencerLez},
-    registry::{History, Registry, Status, now_unix},
+    registry::{Registry, Status, now_unix},
 };
 
 /// The registration program on the testnet LEZ: its account id
@@ -170,9 +170,11 @@ fn tx_bytes(tx_hash: &TxHash) -> [u8; 32] {
     tx_hash.0
 }
 
-fn save_checkpoint(path: &PathBuf, checkpoint: &SequencerCheckpoint) -> Result<()> {
-    fs::write(path, serde_json::to_string(checkpoint)?)
-        .with_context(|| format!("write {}", path.display()))
+/// Keep the Zone SDK checkpoint with the tree store.
+fn save_checkpoint(registry: &Shared, checkpoint: &SequencerCheckpoint) -> Result<()> {
+    let mut registry = registry.write().expect("registry lock");
+    registry.set_checkpoint(serde_json::to_value(checkpoint)?);
+    registry.save()
 }
 
 /// What the node holds for a channel (`GET /channel/:id`), the fields this check reads.
@@ -238,9 +240,9 @@ async fn check_channel_on_chain(
             Ok(())
         }
         Some(msg) if msg == tip => anyhow::bail!(
-            "channel tip {}.. is our newest batch but checkpoint.json is missing: the Zone SDK \
-             would chain on the root and every batch would be invalid; restore checkpoint.json \
-             or pick another CHANNEL_NAME",
+            "channel tip {}.. is our newest batch but the data dir holds no Zone SDK checkpoint: \
+             the SDK would chain on the root and every batch would be invalid; restore the data \
+             dir or pick another CHANNEL_NAME",
             &tip[..8]
         ),
         Some(msg) => anyhow::bail!(
@@ -278,7 +280,8 @@ async fn apply_range(
                 println!("LEZ block {}: events {}", block.block_id, names.join(", "));
             }
         }
-        registry.apply_blocks(&blocks);
+        registry.apply_blocks(&blocks)?;
+        registry.save()?;
         applied += blocks.len();
         start = end + 1;
     }
@@ -295,8 +298,6 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     fs::create_dir_all(&args.data_dir)?;
     let key_path = args.data_dir.join("key.hex");
-    let checkpoint_path = args.data_dir.join("checkpoint.json");
-    let history_path = args.data_dir.join("history.json");
 
     // LEZ source.
     let program_account_id = parse_32(&args.program_account_id, "PROGRAM_ACCOUNT_ID")?;
@@ -306,21 +307,13 @@ async fn main() -> Result<()> {
         args.active_duration_ms,
     );
 
-    // Registry: resume the published batches, rebuild the trees from LEZ below.
+    // Registry: the tree store under the data dir, with the batch history and the checkpoint.
     let tree_id = parse_32(&args.tree_id, "TREE_ID")?;
-    let history = match History::load(&history_path)? {
-        Some(history) => history,
-        None => History {
-            first_lez_block_id: args.first_lez_block_id,
-            covered_to: args.first_lez_block_id.saturating_sub(1),
-            published: vec![],
-        },
-    };
-    let registry: Shared = Arc::new(RwLock::new(Registry::new(
+    let registry: Shared = Arc::new(RwLock::new(Registry::open(
+        &args.data_dir,
         tree_id,
-        history,
-        args.data_dir.join("snapshots"),
-    )));
+        args.first_lez_block_id,
+    )?));
 
     // Zone SDK sequencer on the node.
     let signing_key = load_or_create_key(&key_path)?;
@@ -338,13 +331,13 @@ async fn main() -> Result<()> {
     };
     let node_url: Url = args.node_url.parse().context("invalid NODE_URL")?;
     let node = NodeHttpClient::new(CommonHttpClient::new(None), node_url.clone());
-    let checkpoint: Option<SequencerCheckpoint> = if checkpoint_path.exists() {
-        Some(serde_json::from_str(&fs::read_to_string(
-            &checkpoint_path,
-        )?)?)
-    } else {
-        None
-    };
+    let checkpoint: Option<SequencerCheckpoint> = registry
+        .read()
+        .expect("registry lock")
+        .checkpoint()
+        .map(|c| serde_json::from_value(c.clone()))
+        .transpose()
+        .context("Zone SDK checkpoint in the tree store")?;
     let resumed = checkpoint.is_some();
     check_channel_on_chain(
         &node_url,
@@ -401,16 +394,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    // The trees: from the snapshots taken at each published batch, or, without them, by
-    // applying every LEZ block up to the last covered one again.
-    let (first, covered_to) = {
-        let registry = registry.read().expect("registry lock");
-        (
-            registry.history.first_lez_block_id,
-            registry.history.covered_to,
-        )
-    };
-    let loaded = registry.write().expect("registry lock").load_snapshots();
     source.set_registered_count(
         registry
             .read()
@@ -419,14 +402,6 @@ async fn main() -> Result<()> {
             .stats
             .registered,
     );
-    match loaded {
-        Some(at) => println!("tree restored from the snapshot at LEZ block {at}"),
-        None if covered_to >= first => {
-            let count = apply_range(&source, &registry, first, covered_to).await?;
-            println!("replayed {count} LEZ blocks up to {covered_to}");
-        }
-        None => {}
-    }
     println!("waiting for the Zone sequencer to be ready...");
 
     let mut ready = false;
@@ -465,7 +440,7 @@ async fn main() -> Result<()> {
                     ready = true;
                 }
                 Event::BlocksProcessed { checkpoint, channel_update, finalized, .. } => {
-                    save_checkpoint(&checkpoint_path, &checkpoint)?;
+                    save_checkpoint(&registry, &checkpoint)?;
                     let mut changed = false;
                     // Our batch is in a Bedrock block: its fee note is spent, the next may go.
                     for tx in channel_update.adopted() {
@@ -495,7 +470,7 @@ async fn main() -> Result<()> {
                                 let new_msg = msg_bytes(&result.tx.inscription().this_msg);
                                 let new_tx = tx_bytes(&result.inscription_id());
                                 registry.write().expect("registry lock").on_republished(old, new_msg, new_tx);
-                                save_checkpoint(&checkpoint_path, &checkpoint)?;
+                                save_checkpoint(&registry, &checkpoint)?;
                                 in_flight = Some(new_msg);
                                 println!("batch msg {} orphaned by a reorg, published again as msg {}", hex::encode(&old[..4]), hex::encode(&new_msg[..4]));
                                 changed = true;
@@ -511,7 +486,7 @@ async fn main() -> Result<()> {
                         changed = true;
                     }
                     if changed {
-                        registry.read().expect("registry lock").history.save(&history_path)?;
+                        registry.write().expect("registry lock").save()?;
                     }
                 }
                 _ => {}
@@ -552,9 +527,9 @@ async fn main() -> Result<()> {
                         {
                             let mut registry = registry.write().expect("registry lock");
                             registry.on_published(msg, tx_hash, &batch, payload);
-                            registry.history.save(&history_path)?;
+                            registry.save()?;
                         }
-                        save_checkpoint(&checkpoint_path, &checkpoint)?;
+                        save_checkpoint(&registry, &checkpoint)?;
                         in_flight = Some(msg);
                         last_publish_unix = now_unix();
                         let described: Vec<_> = batch.changes.iter().map(|c| c.describe()).collect();
@@ -575,6 +550,7 @@ async fn main() -> Result<()> {
             _ = tokio::signal::ctrl_c() => break,
         }
     }
+    registry.write().expect("registry lock").close()?;
     println!("stopped; state in {}", args.data_dir.display());
     Ok(())
 }

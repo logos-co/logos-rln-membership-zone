@@ -5,7 +5,7 @@ logs/
 .env
 
 
-# zone sequencer: accredited key, Zone SDK checkpoint, batch history, tree snapshots
+# zone sequencer: accredited key and the tree store (tree, reader state, batches, SDK checkpoint)
 /zone-sequencer/data/
 # own LEZ sequencer: its home (RocksDB, keys)
 /lez-sequencer/home/

@@ -1,20 +1,20 @@
 //! The HTTP API a Module's node reads (its registry access): the roots with the status of
-//! their transaction on Bedrock, the Merkle proof path of a leaf at the served root (the newest
-//! root in a Bedrock block, or the newest Finalized one on request), a leaf's status.
+//! their transaction on Bedrock, the Merkle proof path of a leaf at the tree of the LEZ head,
+//! a leaf's status.
 //! 32-byte values are hex, little-endian (RLN-API Appendix B).
 
 use std::sync::{Arc, RwLock};
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
     routing::get,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::registry::{Registry, ServeAt, Status};
+use crate::registry::{Registry, Status};
 
 pub type Shared = Arc<RwLock<Registry>>;
 
@@ -34,29 +34,6 @@ pub fn router(state: AppState) -> Router {
         .route("/leaf/{id_commitment}", get(leaf))
         .route("/leaves", get(leaves))
         .with_state(state)
-}
-
-/// `?at=adopted` (default): the newest root in a Bedrock block, as the RFC has Zone indexers
-/// act on a batch once it is in a block, or the head while no batch is in a block yet;
-/// `?at=head`: the tree at the LEZ head; `?at=finalized`: the newest root in finalized history.
-#[derive(Deserialize)]
-struct At {
-    #[serde(default)]
-    at: Option<String>,
-}
-
-impl At {
-    fn serve_at(&self) -> Result<ServeAt, (StatusCode, Json<Value>)> {
-        match self.at.as_deref() {
-            None | Some("adopted") => Ok(ServeAt::Adopted),
-            Some("head") => Ok(ServeAt::Head),
-            Some("finalized") => Ok(ServeAt::Finalized),
-            Some(_) => Err(error(
-                StatusCode::BAD_REQUEST,
-                "at must be head, adopted or finalized",
-            )),
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -95,7 +72,7 @@ async fn summary(State(state): State<AppState>) -> Json<Value> {
         "newest_adopted_to_lez_block_id": adopted.map(|p| p.to_lez_block_id),
         "newest_finalized_root": finalized.map(|p| hex::encode(p.root_after)),
         "newest_finalized_to_lez_block_id": finalized.map(|p| p.to_lez_block_id),
-        "endpoints": ["/roots/{window_size}", "/merkle_proof/{leaf_index}[?at=head|adopted|finalized]", "/leaf/{id_commitment}[?at=head|adopted|finalized]", "/leaves", "/health"],
+        "endpoints": ["/roots/{window_size}", "/merkle_proof/{leaf_index}", "/leaf/{id_commitment}", "/leaves", "/health"],
     }))
 }
 
@@ -125,52 +102,39 @@ async fn roots(State(state): State<AppState>, Path(window_size): Path<usize>) ->
     }))
 }
 
-/// The Merkle proof path of the leaf at `leaf_index` at the served root.
+/// The Merkle proof path of the leaf at `leaf_index` at the tree of the LEZ head, with the
+/// newest roots a batch carried to Bedrock, for a validator to compare.
 async fn merkle_proof(
     State(state): State<AppState>,
     Path(leaf_index): Path<u64>,
-    Query(at): Query<At>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let at = at.serve_at()?;
     let registry = state.registry.read().expect("registry lock");
-    let Some(served) = registry.served(at) else {
-        return Err(error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no finalized batch yet",
-        ));
-    };
-    let Some(path) = served.reader.proof_path(leaf_index) else {
+    let Some(path) = registry.head.proof_path(leaf_index) else {
         return Err(error(
             StatusCode::NOT_FOUND,
-            "no leaf at this index at the served root",
+            "no leaf at this index at the LEZ head",
         ));
     };
-    let mut body = json!({
-        "root": hex::encode(served.root),
-        "to_lez_block_id": served.to_lez_block_id,
+    Ok(Json(json!({
+        "root": hex::encode(registry.head.root()),
+        "lez_block_id": registry.head.applied_block_id,
+        "newest_adopted": registry.newest_adopted().map(root_ref),
+        "newest_finalized": registry.newest_finalized().map(root_ref),
         "leaf_index": path.leaf_index,
         "rate_commitment": hex::encode(path.rate_commitment),
         "path_elements": path.path_elements.iter().map(hex::encode).collect::<Vec<_>>(),
         "identity_path_index": path.identity_path_index,
-    });
-    merge(&mut body, &served.status);
-    Ok(Json(body))
+    })))
 }
 
-/// Copy the fields of `extra` (an object) into `body`.
-fn merge(body: &mut Value, extra: &Value) {
-    if let (Some(into), Some(from)) = (body.as_object_mut(), extra.as_object()) {
-        for (k, v) in from {
-            into.insert(k.clone(), v.clone());
-        }
-    }
+fn root_ref(p: &crate::registry::Published) -> Value {
+    json!({ "root": hex::encode(p.root_after), "to_lez_block_id": p.to_lez_block_id })
 }
 
-/// Where a membership stands at the LEZ head and at the served root.
+/// Where a membership stands at the LEZ head.
 async fn leaf(
     State(state): State<AppState>,
     Path(id_commitment): Path<String>,
-    Query(at): Query<At>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let bytes = hex::decode(id_commitment.trim_start_matches("0x"))
         .ok()
@@ -181,26 +145,16 @@ async fn leaf(
             "id_commitment must be 32 bytes of hex",
         ));
     };
-    let at = at.serve_at()?;
     let registry = state.registry.read().expect("registry lock");
-    let at_head = registry.head.live_leaf(&id_commitment);
-    let served = registry.served(at).map(|served| {
-        let mut body = json!({
-            "root": hex::encode(served.root),
-            "to_lez_block_id": served.to_lez_block_id,
-            "leaf_index": served.reader.live_leaf(&id_commitment).map(|l| l.leaf_index),
-        });
-        merge(&mut body, &served.status);
-        body
-    });
+    let live = registry.head.live_leaf(&id_commitment);
     Ok(Json(json!({
-        "at_head": {
-            "lez_block_id": registry.head.applied_block_id,
-            "leaf_index": at_head.map(|l| l.leaf_index),
-            "expiry_timestamp_ms": at_head.map(|l| l.expiry_timestamp_ms),
-            "removed": registry.head.removed(&id_commitment).map(|r| format!("{r:?}")),
-        },
-        "at_served_root": served,
+        "lez_block_id": registry.head.applied_block_id,
+        "root": hex::encode(registry.head.root()),
+        "leaf_index": live.map(|l| l.leaf_index),
+        "expiry_timestamp_ms": live.map(|l| l.expiry_timestamp_ms),
+        "removed": registry.head.removed(&id_commitment).map(|r| format!("{r:?}")),
+        "newest_adopted": registry.newest_adopted().map(root_ref),
+        "newest_finalized": registry.newest_finalized().map(root_ref),
     })))
 }
 
