@@ -88,9 +88,7 @@ impl Registry {
         let dir = data_dir.join("tree");
         let mut kept = None;
         if rebuild && dir.exists() {
-            let (mut old, extra) = Reader::open(&dir, tree_id, 0)?;
-            old.close()?;
-            drop(old);
+            let extra = Reader::take_extra(&dir)?;
             std::fs::remove_dir_all(&dir).context("drop the tree store")?;
             kept = Some(extra);
             println!("tree store dropped; the tree is read again from LEZ");

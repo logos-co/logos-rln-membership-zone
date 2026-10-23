@@ -81,6 +81,7 @@ impl Member {
 
 /// Counts of what the derivation rules did so far, for monitoring.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Stats {
     pub registered: u64,
     pub extended: u64,
@@ -140,6 +141,29 @@ impl Reader {
             .build()
             .with_context(|| format!("tree store at {}", dir.display()))?;
         Self::open_with(config, tree_id, applied_block_id)
+    }
+
+    /// Only the owner's `extra` of the store at `dir`, read off the raw metadata so a store
+    /// written by an older layout still gives it up (for a rebuild).
+    pub fn take_extra(dir: &Path) -> Result<Value> {
+        let config = PmTreeSledConfig::new()
+            .path(dir.to_path_buf())
+            .temporary(false)
+            .build()
+            .with_context(|| format!("tree store at {}", dir.display()))?;
+        let mut tree = <PmTree<SledDB, PoseidonHash> as ZerokitMerkleTree>::new(
+            TREE_DEPTH,
+            Fr::default(),
+            config,
+        )
+        .context("open the tree store")?;
+        let bytes = tree.metadata().unwrap_or_default();
+        tree.close().context("close the tree store")?;
+        if bytes.is_empty() {
+            return Ok(Value::Null);
+        }
+        let meta: Value = serde_json::from_slice(&bytes).context("tree store metadata")?;
+        Ok(meta.get("extra").cloned().unwrap_or(Value::Null))
     }
 
     /// A throwaway store, for tests.
