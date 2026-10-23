@@ -54,8 +54,11 @@ pub fn fr_from_bytes_le(bytes: &[u8; 32]) -> Result<Fr, String> {
 pub enum Removed {
     /// Its expiry passed on the LEZ clock; the membership itself is not over (an `Extend`
     /// may still put it back).
+    #[serde(alias = "Expired")]
     Expired,
+    #[serde(alias = "Slashed")]
     Slashed,
+    #[serde(alias = "Erased")]
     Erased,
 }
 
@@ -567,6 +570,20 @@ mod test {
             Some(Removed::Slashed)
         );
         assert_eq!(reader.active_count(), 0);
+    }
+
+    #[test]
+    fn test_member_reads_the_previous_layout() {
+        let member: Member = serde_json::from_str(
+            r#"{"leaf_index":3,"expiry_timestamp_ms":5,"rate_commitment":"00000000000000000000000000000000000000000000000000000000000000ff","live":false,"removed":"Slashed"}"#,
+        )
+        .unwrap();
+        assert!(!member.active);
+        assert_eq!(member.removed, Some(Removed::Slashed));
+        assert_eq!(
+            serde_json::to_value(member.removed).unwrap(),
+            serde_json::json!("slashed")
+        );
     }
 
     #[test]
