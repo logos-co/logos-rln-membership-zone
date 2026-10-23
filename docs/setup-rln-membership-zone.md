@@ -133,7 +133,13 @@ next batch spans the whole gap.
 | `zone-sequencer/data/history.json` | published batches: range, root, status, msg and tx hash | the sequencer thinks nothing was published and publishes from `FIRST_LEZ_BLOCK_ID` again; Zone indexers would reject the overlap. Do not delete it alone |
 | `zone-sequencer/data/snapshots/<msg_id>.json` | reader state at each batch | the tree is replayed from LEZ, nothing lost |
 
-Rule: delete all of `checkpoint.json`, `history.json` and `snapshots/` together, or none.
+Rule: never delete `checkpoint.json` on a channel that has batches. The Zone SDK learns the
+channel tip from finalized history only (8 to 10 hours behind on the testnet), so without
+the checkpoint it chains the next batch on the root; the chain refuses it (`InvalidParent`),
+silently, and every later batch too. The sequencer checks `GET /channel/:id` on the node at
+start and refuses to run when the channel on chain does not match its data dir (another key,
+a tip it does not know, or no batch at all); the fix is to restore the data dir or to start a
+new channel.
 
 ### Start a new channel
 
@@ -278,6 +284,12 @@ fee per batch), `lib_slot` against `slot` (finality), the time from `pending` to
 - `unzip: not found` while building: `sudo apt-get install -y unzip`.
 - `missing manifest in toolchain '1.98.1-...'`: a half-installed toolchain;
   `rustup toolchain uninstall 1.98.1 && rustup toolchain install 1.98.1`.
+- A batch stays `pending` and `curl localhost:8080/mempool/view` does not list its tx hash:
+  the node dropped it as invalid at block building (no log at the default level). Check
+  `curl localhost:8080/channel/<channel id hex>`: a `tip_message` that is not your newest
+  batch means the batch chained on the wrong parent (see the data files rule above); the
+  start-up check now catches this. `curl localhost:8080/cryptarchia/transaction/<tx hash>`
+  tells whether a transaction was mined.
 - A batch stays `pending` for more than a few minutes: run the three node commands of
   section 6 (`mempool/view`, `gas-prices`, `cryptarchia/info`). A long `mempool/view` with
   the batch still in it means a congested mempool: block builders take it in FIFO order up to

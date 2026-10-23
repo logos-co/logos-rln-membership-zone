@@ -175,6 +175,90 @@ fn save_checkpoint(path: &PathBuf, checkpoint: &SequencerCheckpoint) -> Result<(
         .with_context(|| format!("write {}", path.display()))
 }
 
+/// What the node holds for a channel (`GET /channel/:id`), the fields this check reads.
+#[derive(serde::Deserialize)]
+struct ChannelOnChain {
+    accredited_keys: Vec<String>,
+    tip_message: String,
+}
+
+/// Refuse to start on a channel this data dir cannot continue. The Zone SDK learns a
+/// channel's tip from finalized history only, so without a checkpoint it chains the next
+/// batch on the root; on a channel that already has messages that batch is invalid
+/// (`InvalidParent`) and vanishes without a trace. Likewise another key cannot write at all.
+async fn check_channel_on_chain(
+    node_url: &Url,
+    channel_id: ChannelId,
+    our_key: &[u8; 32],
+    registry: &Shared,
+    resumed: bool,
+) -> Result<()> {
+    let url = node_url.join(&format!("channel/{}", hex::encode(channel_id.as_ref())))?;
+    let response = reqwest::get(url.clone())
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        println!("  chain     channel not on chain yet; the first batch creates it");
+        return Ok(());
+    }
+    let channel: ChannelOnChain = response
+        .error_for_status()
+        .with_context(|| format!("GET {url}"))?
+        .json()
+        .await
+        .with_context(|| format!("GET {url}: unexpected body"))?;
+    let ours = hex::encode(our_key);
+    if !channel
+        .accredited_keys
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(&ours))
+    {
+        anyhow::bail!(
+            "channel is on chain with accredited keys {:?}, not ours ({ours}): this key cannot \
+             write to it; restore the original key.hex or pick another CHANNEL_NAME",
+            channel.accredited_keys
+        );
+    }
+    let newest_msg = registry
+        .read()
+        .expect("registry lock")
+        .history
+        .published
+        .iter()
+        .rev()
+        .find(|p| p.status != Status::Orphaned)
+        .map(|p| hex::encode(p.msg_id));
+    let tip = channel.tip_message.to_ascii_lowercase();
+    match newest_msg {
+        Some(msg) if msg == tip && resumed => {
+            println!(
+                "  chain     channel tip {}.. is our newest batch",
+                &tip[..8]
+            );
+            Ok(())
+        }
+        Some(msg) if msg == tip => anyhow::bail!(
+            "channel tip {}.. is our newest batch but checkpoint.json is missing: the Zone SDK \
+             would chain on the root and every batch would be invalid; restore checkpoint.json \
+             or pick another CHANNEL_NAME",
+            &tip[..8]
+        ),
+        Some(msg) => anyhow::bail!(
+            "channel tip on chain is {}.., our newest batch is {}..: the history does not match \
+             the channel (a batch of ours may still be pending, or data from another run was \
+             lost); wait, or pick another CHANNEL_NAME",
+            &tip[..8],
+            &msg[..8]
+        ),
+        None => anyhow::bail!(
+            "channel is already on chain (tip {}..) but this data dir holds no batch: the next \
+             batch would chain on the root and be invalid; restore zone-sequencer/data from the \
+             run that wrote the channel, or pick another CHANNEL_NAME",
+            &tip[..8]
+        ),
+    }
+}
+
 /// Fetch and apply LEZ blocks `from..=to` in spans the source accepts.
 async fn apply_range(
     source: &SequencerLez,
@@ -262,6 +346,14 @@ async fn main() -> Result<()> {
         None
     };
     let resumed = checkpoint.is_some();
+    check_channel_on_chain(
+        &node_url,
+        channel_id,
+        &signing_key.public_key().to_bytes(),
+        &registry,
+        resumed,
+    )
+    .await?;
     let sdk_config = SequencerConfig {
         stale_refund_slots: args.stale_refund_slots,
         ..SequencerConfig::new(funding)
