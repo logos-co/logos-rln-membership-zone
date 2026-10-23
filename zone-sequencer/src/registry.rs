@@ -76,13 +76,33 @@ pub struct Registry {
 
 impl Registry {
     /// Open the tree store under `data_dir` and the batch history kept with it; a fresh store
-    /// starts at `first_lez_block_id`.
-    pub fn open(data_dir: &Path, tree_id: [u8; 32], first_lez_block_id: u64) -> Result<Self> {
-        let (head, extra) = Reader::open(
-            &data_dir.join("tree"),
-            tree_id,
-            first_lez_block_id.saturating_sub(1),
-        )?;
+    /// starts at `first_lez_block_id`. With `rebuild`, the tree and the reader's state are
+    /// dropped and read again from LEZ while the batch history and the checkpoint are kept:
+    /// the way out after a decoder that skipped transactions.
+    pub fn open(
+        data_dir: &Path,
+        tree_id: [u8; 32],
+        first_lez_block_id: u64,
+        rebuild: bool,
+    ) -> Result<Self> {
+        let dir = data_dir.join("tree");
+        let mut kept = None;
+        if rebuild && dir.exists() {
+            let (mut old, extra) = Reader::open(&dir, tree_id, 0)?;
+            old.close()?;
+            drop(old);
+            std::fs::remove_dir_all(&dir).context("drop the tree store")?;
+            kept = Some(extra);
+            println!("tree store dropped; the tree is read again from LEZ");
+        }
+        let (mut head, extra) = Reader::open(&dir, tree_id, first_lez_block_id.saturating_sub(1))?;
+        let extra = match kept {
+            Some(kept) => {
+                head.persist(kept.clone())?;
+                kept
+            }
+            None => extra,
+        };
         let history = match extra.get("history") {
             Some(h) => {
                 serde_json::from_value(h.clone()).context("batch history in the tree store")?
@@ -220,12 +240,26 @@ impl Registry {
     }
 
     /// The published batches newest first, at most `window_size`, Orphaned ones left out.
-    pub fn roots(&self, window_size: usize) -> Vec<&Published> {
+    pub fn batches(&self, window_size: usize) -> Vec<&Published> {
         self.history
             .published
             .iter()
             .rev()
             .filter(|p| p.status != Status::Orphaned)
+            .take(window_size)
+            .collect()
+    }
+
+    /// The distinct roots newest first, at most `window_size`: one entry per root, the newest
+    /// batch that carries it (so `to_lez_block_id` is the freshest block the root stands
+    /// for), heartbeats and Orphaned batches left out.
+    pub fn roots(&self, window_size: usize) -> Vec<&Published> {
+        let mut seen = std::collections::HashSet::new();
+        self.history
+            .published
+            .iter()
+            .rev()
+            .filter(|p| p.status != Status::Orphaned && seen.insert(p.root_after))
             .take(window_size)
             .collect()
     }

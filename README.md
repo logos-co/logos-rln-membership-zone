@@ -70,11 +70,11 @@ but that only pauses the registry at the Zone indexers until a correct batch arr
 ```text
 docs/rfc-rln-membership-zone.md   the specification (raw LIP draft)
 zone-sequencer/                   the Zone sequencer, with its HTTP registry API
-  src/lez.rs                      LEZ blocks and the program's events, derived from its transactions
+  src/lez.rs                      LEZ blocks and the program's events, derived from its transactions (rln-layouts)
   src/reader.rs                   a reader: derivation rules over the events and the tree (sled-backed PmTree)
   src/batch.rs                    batch wire format (protobuf)
   src/registry.rs                 published batches with their status on Bedrock, kept in the tree store
-  src/http.rs                     HTTP API: roots, Merkle proof path, leaf status
+  src/http.rs                     HTTP API: roots, batches, membership with its Merkle proof path, leaves
   src/main.rs                     Zone SDK loop: publish, follow to finality, poll LEZ
 lez-sequencer/                    config template to run your own LEZ sequencer as the block source
 docs/setup-rln-membership-zone.md setup, operation, monitoring, troubleshooting, cleanup
@@ -107,8 +107,9 @@ set -a; source .env; set +a      # clap reads process env vars, not the .env fil
 cargo run -p zone-sequencer
 
 curl -s localhost:3000/ | jq                 # channel, LEZ head, tree counters
-curl -s localhost:3000/roots/5 | jq          # newest roots with their status on Bedrock
-curl -s localhost:3000/merkle_proof/0 | jq   # proof path of leaf 0 at the tree of the LEZ head
+curl -s localhost:3000/roots/5 | jq          # newest distinct roots with their status on Bedrock
+curl -s localhost:3000/batches/5 | jq        # newest batches, heartbeats included
+curl -s localhost:3000/merkle_proof/0 | jq   # membership at leaf 0 (or by id_commitment) and its proof path
 curl -s localhost:3000/leaves | jq           # every leaf at the LEZ head
 ```
 

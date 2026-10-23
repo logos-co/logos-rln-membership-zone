@@ -82,9 +82,9 @@ sed -i "s/^FUNDING_PK=.*/FUNDING_PK=$(yq .public_keys.PoWClaim ~/keystore.yaml)/
 | `TREE_ID` | `47b2de4f...b4cf` | Registry the program serves, first field of every event |
 | `FIRST_LEZ_BLOCK_ID` | 49431 | Block the program was deployed in; nothing before it is read |
 | `LEZ_SEQUENCER_URL` | `https://testnet.lez.logos.co` | Where the LEZ blocks come from (section 4 or 5) |
-| `ACTIVE_DURATION_MS` | unset | Membership lifetime after the timestamp a `Register` carries; unset = leaves never expire (section 4) |
+| `REBUILD_TREE` | false | Drop the tree and read it again from LEZ, keeping the batch history and the checkpoint (after a decoder fix that had skipped transactions) |
 | `POLL_SEC` | 10 | Seconds between LEZ polls |
-| `HEARTBEAT_SEC` | 600 | Publish an empty batch after this long without one |
+| `HEARTBEAT_SEC` | 3600 | Publish an empty batch after this long without one |
 | `STALE_REFUND_SLOTS` | 0 | LIB slots an unmined batch waits before the Zone SDK re-funds it under a new transaction (0 disables). Off: the mempool is FIFO, a re-funded transaction goes to the back of the queue; the SDK default, 30, re-funded at every finalized block |
 | `DATA_DIR` | `zone-sequencer/data` | `key.hex` and the tree store `tree/` |
 | `HTTP_ADDR` | `127.0.0.1:3000` | HTTP API bind address |
@@ -159,19 +159,18 @@ rm -rf zone-sequencer/data/tree
 ```bash
 curl -s localhost:3000/ | jq                  # channel, LEZ head, covered block, batch count, tree counters
 curl -s localhost:3000/roots/5 | jq           # newest 5 roots with status, msg_id, tx_hash, l1_slot
-curl -s localhost:3000/merkle_proof/0 | jq    # proof path of leaf 0 at the tree of the LEZ head
-curl -s localhost:3000/leaf/<id_commitment hex> | jq
+curl -s localhost:3000/merkle_proof/0 | jq    # membership at leaf 0 and its proof path at the LEZ head
+curl -s localhost:3000/merkle_proof/<id_commitment hex> | jq   # the same, by identity commitment
 curl -s localhost:3000/leaves | jq            # every live leaf with expiry, removed leaves with cause
 curl -s localhost:3000/health
 ```
 
-`/merkle_proof` answers 404 when the index holds no leaf. The answer carries the head root
-the path is for, plus `newest_adopted` and `newest_finalized`, the latest roots a batch took
-to Bedrock, for a validator to compare. `path_elements` and `identity_path_index` are the
-`RLNMerkleProof` of Zerokit.
-
-Exposing the API: `ngrok http 3000` from the same box (inside WSL is fine). Do not expose
-8080.
+`/merkle_proof` answers 404 for an unknown leaf index or identity commitment. The answer
+carries the membership (`leaf_index`, `id_commitment`, `expiry_timestamp_ms`, `status`:
+`live`, `expired`, `slashed` or `erased`), the head root, `newest_adopted` and
+`newest_finalized` (the latest roots a batch took to Bedrock, for a validator to compare),
+and `proof` (`rate_commitment`, `path_elements`, `identity_path_index`, the `RLNMerkleProof`
+of Zerokit) while the leaf is in the tree, `null` otherwise.
 
 ## 4. LEZ source: the public LEZ Sequencer (default)
 
@@ -182,21 +181,40 @@ transactions: a block holds only transactions that succeeded, so every `Register
 program is a `Registered`, every `Slash` a `Slashed` of `poseidon(identity_secret)`, and so
 on. The tree is the same as from the events; only the input differs from the RFC's.
 
-The transaction layout was read off the testnet (`zone-sequencer/src/lez.rs`, `decode_instruction`):
+The instructions are decoded with the registration program's own layouts crate
+(`rln-layouts`: the `Instruction` enum, the membership timing helpers), so the sequencer never
+parses them by hand. For reference, borsh, variants in declaration order, durations in
+seconds; every value a handler needs travels in the instruction as a claim the chain asserts,
+so a transaction in a block carries true values, and the leaf index is the config's
+`next_leaf_index` at registration:
 
 ```text
-0 InitConfig { tree_id, price_per_unit u128, account [32], registration_fee u64,
-               grace_period_sec u32, withdrawal_delay_sec u32 }              no event
-1 Register   { tree_id, id_commitment, rate_limit u64, registered_at_ms u64,
-               deposit u128, grace_period_sec u32, withdrawal_delay_sec u32,
-               leaf_index u64 }                                             Registered
-2 Extend, 3 Erase, 4 Slash: assumed, RFC fields, none seen on chain yet
+0 Initialize { tree_id, price_per_unit u128, treasury_account_id [32],
+               max_total_rate_limit u64, active_duration_sec u32, grace_period_sec u32 }
+1 Register   { tree_id, id_commitment, rate_limit u64, now_ms u64, price_per_unit u128,
+               active_duration_sec u32, grace_period_sec u32, leaf_index u64 }   Registered
+2 Slash      { tree_id, id_commitment, identity_secret, rate_limit u64 }         Slashed
+3 Extend     { tree_id, id_commitment, now_ms u64, price_per_unit u128, rate_limit u64,
+               expiry_timestamp_ms u64 }                                         Extended
+4 Erase      { tree_id, id_commitment, rate_limit u64, now_ms u64 }              Erased
 ```
 
-A `Register` carries the client's timestamp, not the expiry the program computes, so the
-Zone sequencer cannot know when a leaf expires. `ACTIVE_DURATION_MS` sets the lifetime (expiry =
-`registered_at_ms` + lifetime); unset, leaves never expire. To be replaced by the program's
-rule once confirmed.
+The events are derived as the program's own `events` module defines them: `Registered` with
+the expiry `now + active + grace` (the end of the grace period, from which the membership is
+expired), `Extended` with the expiry the instruction claims, `Slashed`
+(`poseidon(identity_secret)` must be the `id_commitment`, checked), `Erased`. The reader
+applies them as the program's reference reader does: `Registered` inserts the leaf,
+`Extended` keeps the new expiry and puts the leaf back if the reader had already expired it
+(the chain accepts a clock claim a little behind its clock), `Slashed` and `Erased` end the
+membership and remove the leaf if still live, and after each block every live leaf whose
+expiry is at or before the block's timestamp is removed. On the testnet a membership lasts
+30 days plus a 7-day grace period.
+
+A transaction the decoder cannot read is reported with its bytes and skipped; the tree is then
+missing a change until the decoder is fixed and the sequencer restarted once with
+`--rebuild-tree` (the batch history and the checkpoint stay, the tree is read again from
+LEZ, and the missed change goes into the next batch when its block is after the last one
+covered).
 
 Check the source by hand:
 

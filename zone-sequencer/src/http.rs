@@ -30,8 +30,8 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(summary))
         .route("/health", get(|| async { "ok" }))
         .route("/roots/{window_size}", get(roots))
-        .route("/merkle_proof/{leaf_index}", get(merkle_proof))
-        .route("/leaf/{id_commitment}", get(leaf))
+        .route("/batches/{window_size}", get(batches))
+        .route("/merkle_proof/{leaf}", get(merkle_proof))
         .route("/leaves", get(leaves))
         .with_state(state)
 }
@@ -72,16 +72,35 @@ async fn summary(State(state): State<AppState>) -> Json<Value> {
         "newest_adopted_to_lez_block_id": adopted.map(|p| p.to_lez_block_id),
         "newest_finalized_root": finalized.map(|p| hex::encode(p.root_after)),
         "newest_finalized_to_lez_block_id": finalized.map(|p| p.to_lez_block_id),
-        "endpoints": ["/roots/{window_size}", "/merkle_proof/{leaf_index}", "/leaf/{id_commitment}", "/leaves", "/health"],
+        "endpoints": ["/roots/{window_size}", "/batches/{window_size}", "/merkle_proof/{leaf_index or id_commitment}", "/leaves", "/health"],
     }))
 }
 
-/// The newest `window_size` published roots, newest first, each with its status on Bedrock;
-/// the Finalized ones are the valid roots.
+/// The newest `window_size` distinct roots, newest first, each with the newest batch that
+/// carries it and that batch's status on Bedrock.
 async fn roots(State(state): State<AppState>, Path(window_size): Path<usize>) -> Json<Value> {
     let registry = state.registry.read().expect("registry lock");
-    let roots: Vec<RootEntry> = registry
-        .roots(window_size)
+    Json(json!({
+        "latest_lez_block_id": registry.head.applied_block_id,
+        "lez_timestamp_ms": registry.head.applied_timestamp_ms,
+        "covered_to_lez_block_id": registry.history.covered_to,
+        "roots": entries(registry.roots(window_size)),
+    }))
+}
+
+/// The newest `window_size` published batches, newest first, heartbeats included.
+async fn batches(State(state): State<AppState>, Path(window_size): Path<usize>) -> Json<Value> {
+    let registry = state.registry.read().expect("registry lock");
+    Json(json!({
+        "latest_lez_block_id": registry.head.applied_block_id,
+        "lez_timestamp_ms": registry.head.applied_timestamp_ms,
+        "covered_to_lez_block_id": registry.history.covered_to,
+        "batches": entries(registry.batches(window_size)),
+    }))
+}
+
+fn entries(published: Vec<&crate::registry::Published>) -> Vec<RootEntry> {
+    published
         .into_iter()
         .map(|p| RootEntry {
             root: hex::encode(p.root_after),
@@ -93,69 +112,66 @@ async fn roots(State(state): State<AppState>, Path(window_size): Path<usize>) ->
             tx_hash: hex::encode(p.tx_hash),
             msg_id: hex::encode(p.msg_id),
         })
-        .collect();
-    Json(json!({
-        "latest_lez_block_id": registry.head.applied_block_id,
-        "lez_timestamp_ms": registry.head.applied_timestamp_ms,
-        "covered_to_lez_block_id": registry.history.covered_to,
-        "roots": roots,
-    }))
+        .collect()
 }
 
-/// The Merkle proof path of the leaf at `leaf_index` at the tree of the LEZ head, with the
-/// newest roots a batch carried to Bedrock, for a validator to compare.
+/// A membership by its leaf index (decimal) or its identity commitment (64 hex): where it
+/// stands at the LEZ head and, while its leaf is in the tree, the Merkle proof path at the
+/// head's root, with the newest roots a batch carried to Bedrock for a validator to compare.
 async fn merkle_proof(
     State(state): State<AppState>,
-    Path(leaf_index): Path<u64>,
+    Path(leaf): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let registry = state.registry.read().expect("registry lock");
-    let Some(path) = registry.head.proof_path(leaf_index) else {
-        return Err(error(
-            StatusCode::NOT_FOUND,
-            "no leaf at this index at the LEZ head",
-        ));
+    let found = if let Ok(leaf_index) = leaf.parse::<u64>() {
+        registry.head.member_at(leaf_index)
+    } else {
+        let bytes = hex::decode(leaf.trim_start_matches("0x"))
+            .ok()
+            .and_then(|v| <[u8; 32]>::try_from(v).ok());
+        let Some(id_commitment) = bytes else {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "give a leaf index or an id_commitment of 32 bytes in hex",
+            ));
+        };
+        registry
+            .head
+            .member(&id_commitment)
+            .map(|m| (id_commitment, m))
     };
+    let Some((id_commitment, member)) = found else {
+        return Err(error(StatusCode::NOT_FOUND, "no such membership"));
+    };
+    let status = match member.removed {
+        None => "live",
+        Some(crate::reader::Removed::Expired) => "expired",
+        Some(crate::reader::Removed::Slashed) => "slashed",
+        Some(crate::reader::Removed::Erased) => "erased",
+    };
+    let proof = registry.head.proof_path(member.leaf_index).map(|path| {
+        json!({
+            "rate_commitment": hex::encode(path.rate_commitment),
+            "path_elements": path.path_elements.iter().map(hex::encode).collect::<Vec<_>>(),
+            "identity_path_index": path.identity_path_index,
+        })
+    });
     Ok(Json(json!({
+        "id_commitment": hex::encode(id_commitment),
+        "leaf_index": member.leaf_index,
+        "status": status,
+        "expiry_timestamp_ms": member.expiry_timestamp_ms,
         "root": hex::encode(registry.head.root()),
         "lez_block_id": registry.head.applied_block_id,
+        "lez_timestamp_ms": registry.head.applied_timestamp_ms,
         "newest_adopted": registry.newest_adopted().map(root_ref),
         "newest_finalized": registry.newest_finalized().map(root_ref),
-        "leaf_index": path.leaf_index,
-        "rate_commitment": hex::encode(path.rate_commitment),
-        "path_elements": path.path_elements.iter().map(hex::encode).collect::<Vec<_>>(),
-        "identity_path_index": path.identity_path_index,
+        "proof": proof,
     })))
 }
 
 fn root_ref(p: &crate::registry::Published) -> Value {
     json!({ "root": hex::encode(p.root_after), "to_lez_block_id": p.to_lez_block_id })
-}
-
-/// Where a membership stands at the LEZ head.
-async fn leaf(
-    State(state): State<AppState>,
-    Path(id_commitment): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let bytes = hex::decode(id_commitment.trim_start_matches("0x"))
-        .ok()
-        .and_then(|v| <[u8; 32]>::try_from(v).ok());
-    let Some(id_commitment) = bytes else {
-        return Err(error(
-            StatusCode::BAD_REQUEST,
-            "id_commitment must be 32 bytes of hex",
-        ));
-    };
-    let registry = state.registry.read().expect("registry lock");
-    let live = registry.head.live_leaf(&id_commitment);
-    Ok(Json(json!({
-        "lez_block_id": registry.head.applied_block_id,
-        "root": hex::encode(registry.head.root()),
-        "leaf_index": live.map(|l| l.leaf_index),
-        "expiry_timestamp_ms": live.map(|l| l.expiry_timestamp_ms),
-        "removed": registry.head.removed(&id_commitment).map(|r| format!("{r:?}")),
-        "newest_adopted": registry.newest_adopted().map(root_ref),
-        "newest_finalized": registry.newest_finalized().map(root_ref),
-    })))
 }
 
 /// Every leaf at the LEZ head: live ones with their expiry, removed ones with the cause.

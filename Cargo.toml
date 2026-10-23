@@ -17,6 +17,10 @@ lb-core                          = { default-features = false, package = "logos-
 lb-key-management-system-service = { default-features = false, package = "logos-blockchain-key-management-system-service", path = "./logos-blockchain/services/key-management-system" }
 lb-zone-sdk                      = { default-features = false, package = "logos-blockchain-zone-sdk", path = "./logos-blockchain/zone-sdk" }
 
+# the registration program's layouts (instructions, events, membership timing), from the
+# program's own repository
+rln-layouts   = { git = "https://github.com/doomcrack/logos-lez-rln", rev = "b175bc9a1d30e0123194e9e3003d6e1b9411fd6e" }
+
 # RLN (Zerokit, published 3.0.0: Poseidon BN254, Merkle trees, identity keys)
 rln           = { default-features = false, version = "3.0.0" }
 zerokit_utils = { default-features = false, version = "3.0.0" }
@@ -24,6 +28,7 @@ zerokit_utils = { default-features = false, version = "3.0.0" }
 # third party
 anyhow             = "1"
 base64             = "0.22"
+borsh              = "1"
 axum               = { default-features = false, features = ["http1", "json", "query", "tokio"], version = "0.8" }
 clap               = { features = ["derive", "env", "std"], version = "4" }
 hex                = "0.4"

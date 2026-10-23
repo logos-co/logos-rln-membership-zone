@@ -750,6 +750,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "borsh"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "553c5d846a6ba5150c65e3b1b8ec073bcf1abc20f9b7220de384a4443ea4e20a"
+dependencies = [
+ "borsh-derive",
+ "bytes",
+ "cfg_aliases",
+]
+
+[[package]]
+name = "borsh-derive"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12cdfe656708a01f89b451a7d36466e6fe6c414de0aa18fc54f864f6f9ca9f56"
+dependencies = [
+ "once_cell",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
+
+[[package]]
 name = "bs58"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -763,6 +787,26 @@ name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
+
+[[package]]
+name = "bytemuck"
+version = "1.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a1f896587b6f2c069c73d2f0913e2d590c3990285cd2f0b6aa02b786b4c679c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
 
 [[package]]
 name = "byteorder"
@@ -5140,6 +5184,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rln-layouts"
+version = "0.1.0"
+source = "git+https://github.com/doomcrack/logos-lez-rln?rev=b175bc9a1d30e0123194e9e3003d6e1b9411fd6e#b175bc9a1d30e0123194e9e3003d6e1b9411fd6e"
+dependencies = [
+ "borsh",
+ "bytemuck",
+ "serde",
+ "sha2",
+]
+
+[[package]]
 name = "rocksdb"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7221,6 +7276,7 @@ dependencies = [
  "anyhow",
  "axum 0.8.9",
  "base64 0.22.1",
+ "borsh",
  "clap",
  "hex",
  "logos-blockchain-common-http-client",
@@ -7231,6 +7287,7 @@ dependencies = [
  "rand 0.8.8",
  "reqwest 0.12.28",
  "rln",
+ "rln-layouts",
  "serde",
  "serde_json",
  "sha2",

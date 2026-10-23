@@ -109,16 +109,15 @@ struct Args {
     /// First LEZ block the registry covers: the block the program was deployed in.
     #[arg(long, default_value_t = DEFAULT_FIRST_LEZ_BLOCK_ID, env = "FIRST_LEZ_BLOCK_ID")]
     first_lez_block_id: u64,
-    /// Membership lifetime after the timestamp a `Register` carries: the program computes the
-    /// expiry itself and its rule is not confirmed yet. Unset = memberships never expire
-    /// here.
-    #[arg(long, env = "ACTIVE_DURATION_MS")]
-    active_duration_ms: Option<u64>,
+    /// Drop the tree and read it again from LEZ, keeping the batch history and the Zone SDK
+    /// checkpoint: after a decoder change that skipped transactions.
+    #[arg(long, env = "REBUILD_TREE")]
+    rebuild_tree: bool,
     /// Seconds between LEZ polls.
     #[arg(long, default_value_t = 10, env = "POLL_SEC")]
     poll_sec: u64,
     /// Publish an empty batch after this long without one.
-    #[arg(long, default_value_t = 600, env = "HEARTBEAT_SEC")]
+    #[arg(long, default_value_t = 3_600, env = "HEARTBEAT_SEC")]
     heartbeat_sec: u64,
     /// LIB slots a published transaction may stay unmined before the Zone SDK re-funds it
     /// under a new transaction hash (same message id); 0 disables. Off by default: the
@@ -301,11 +300,7 @@ async fn main() -> Result<()> {
 
     // LEZ source.
     let program_account_id = parse_32(&args.program_account_id, "PROGRAM_ACCOUNT_ID")?;
-    let source = SequencerLez::new(
-        args.lez_sequencer_url.clone(),
-        program_account_id,
-        args.active_duration_ms,
-    );
+    let source = SequencerLez::new(args.lez_sequencer_url.clone(), program_account_id);
 
     // Registry: the tree store under the data dir, with the batch history and the checkpoint.
     let tree_id = parse_32(&args.tree_id, "TREE_ID")?;
@@ -313,6 +308,7 @@ async fn main() -> Result<()> {
         &args.data_dir,
         tree_id,
         args.first_lez_block_id,
+        args.rebuild_tree,
     )?));
 
     // Zone SDK sequencer on the node.

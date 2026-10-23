@@ -1,9 +1,20 @@
 //! A reader (RFC "Derivation Rules"): holds the tree and applies the rules to the registration
 //! program's events of every LEZ block. The Zone sequencer is a reader; so is every Zone
 //! indexer, which is why they hold the same roots. The tree is a sled-backed Zerokit
-//! `PmTree`; the reader's state beside it (live leaves, removed leaves, counters, the block it
-//! is at) and whatever its owner wants kept with it live in the tree store's metadata, so a
-//! restart opens the store and continues.
+//! `PmTree`; the reader's state beside it (memberships, counters, the block it is at) and
+//! whatever its owner wants kept with it live in the tree store's metadata, so a restart
+//! opens the store and continues.
+//!
+//! Rules, per event of a registry (`tree_id`):
+//! - `Registered` inserts `poseidon(id_commitment, rate_limit)` at `leaf_index`, with the
+//!   membership's expiry.
+//! - `Extended` keeps the new expiry; the tree does not change, unless the reader had already
+//!   expired the leaf (the chain accepts a clock claim a little behind its clock), in which
+//!   case the leaf goes back where it was.
+//! - `Slashed` and `Erased` end the membership and remove its leaf if it is still live
+//!   (`Erase` needs an expired membership, so the expiry step has normally removed it).
+//! - After a block's events, every live leaf whose expiry is at or before the block's
+//!   timestamp is removed, in leaf order.
 
 use std::{collections::HashMap, path::Path};
 
@@ -36,21 +47,36 @@ pub fn fr_from_bytes_le(bytes: &[u8; 32]) -> Result<Fr, String> {
     Fr::deserialize_compressed(&bytes[..]).map_err(|e| format!("not a field element: {e}"))
 }
 
-/// A live leaf as the reader tracks it; the expiry comes from the events, not from the batches.
-#[derive(Debug, Clone, Copy)]
-pub struct Leaf {
+/// Why a leaf left the tree.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Removed {
+    /// Its expiry passed on the LEZ clock; the membership itself is not over (an `Extend`
+    /// may still put it back).
+    Expired,
+    Slashed,
+    Erased,
+}
+
+/// A membership as the reader tracks it, live or not.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Member {
     pub leaf_index: u64,
     pub expiry_timestamp_ms: u64,
     /// The leaf value, `poseidon(id_commitment, rate_limit)`.
+    #[serde(with = "hex::serde")]
     pub rate_commitment: [u8; 32],
+    /// Whether its leaf is in the tree.
+    pub live: bool,
+    /// Why the leaf is not in the tree, when it is not.
+    pub removed: Option<Removed>,
 }
 
-/// Why a leaf left the tree. Read from the events and used for status only; batches do not
-/// carry it.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum Removed {
-    Expired,
-    Slashed,
+impl Member {
+    /// Slashed or erased: over for good; a later `Registered` of the same commitment is a
+    /// new membership.
+    fn ended(&self) -> bool {
+        matches!(self.removed, Some(Removed::Slashed | Removed::Erased))
+    }
 }
 
 /// Counts of what the derivation rules did so far, for monitoring.
@@ -62,15 +88,16 @@ pub struct Stats {
     pub slashed: u64,
     /// Leaves removed because their expiry passed on the LEZ clock.
     pub removed_expired: u64,
-    /// Leaves removed by a slash while live.
-    pub removed_slashed: u64,
+    /// Leaves removed by a slash or an erase while live.
+    pub removed_ended: u64,
+    /// Leaves put back by an `Extended` after the reader had expired them.
+    pub reinserted: u64,
     /// Events of other registries (another `tree_id`), ignored.
     pub other_tree: u64,
 }
 
 /// A Merkle proof path at one root, in RLN-API form.
 pub struct ProofPath {
-    pub leaf_index: u64,
     pub rate_commitment: [u8; 32],
     pub path_elements: Vec<[u8; 32]>,
     pub identity_path_index: Vec<u8>,
@@ -83,10 +110,8 @@ struct Meta {
     applied_block_id: u64,
     applied_timestamp_ms: u64,
     stats: Stats,
-    /// `(id_commitment, leaf_index, expiry_timestamp_ms, rate_commitment)`, hex.
-    live: Vec<(String, u64, u64, String)>,
-    /// `(id_commitment, cause)`.
-    removed: Vec<(String, Removed)>,
+    /// By `id_commitment`, hex.
+    members: HashMap<String, Member>,
     #[serde(default)]
     extra: Value,
 }
@@ -95,9 +120,8 @@ pub struct Reader {
     /// The registry this reader follows; events of other registries are ignored.
     tree_id: [u8; 32],
     tree: PmTree<SledDB, PoseidonHash>,
-    /// Live leaves by identity commitment.
-    live: HashMap<[u8; 32], Leaf>,
-    removed: HashMap<[u8; 32], Removed>,
+    /// Memberships by identity commitment, the latest per commitment.
+    members: HashMap<[u8; 32], Member>,
     pub stats: Stats,
     /// Last LEZ `block_id` applied.
     pub applied_block_id: u64,
@@ -139,8 +163,7 @@ impl Reader {
         let mut reader = Self {
             tree_id,
             tree,
-            live: HashMap::new(),
-            removed: HashMap::new(),
+            members: HashMap::new(),
             stats: Stats::default(),
             applied_block_id,
             applied_timestamp_ms: 0,
@@ -157,18 +180,8 @@ impl Reader {
                 hex::encode(tree_id)
             ));
         }
-        for (id, leaf_index, expiry_timestamp_ms, rate_commitment) in &meta.live {
-            reader.live.insert(
-                parse_32(id)?,
-                Leaf {
-                    leaf_index: *leaf_index,
-                    expiry_timestamp_ms: *expiry_timestamp_ms,
-                    rate_commitment: parse_32(rate_commitment)?,
-                },
-            );
-        }
-        for (id, cause) in &meta.removed {
-            reader.removed.insert(parse_32(id)?, *cause);
+        for (id, member) in &meta.members {
+            reader.members.insert(parse_32(id)?, *member);
         }
         reader.stats = meta.stats;
         reader.applied_block_id = meta.applied_block_id;
@@ -183,23 +196,10 @@ impl Reader {
             applied_block_id: self.applied_block_id,
             applied_timestamp_ms: self.applied_timestamp_ms,
             stats: self.stats,
-            live: self
-                .live_leaves()
-                .into_iter()
-                .map(|(index, id, expiry)| {
-                    let leaf = self.live[&id];
-                    (
-                        hex::encode(id),
-                        index,
-                        expiry,
-                        hex::encode(leaf.rate_commitment),
-                    )
-                })
-                .collect(),
-            removed: self
-                .removed_leaves()
-                .into_iter()
-                .map(|(id, cause)| (hex::encode(id), cause))
+            members: self
+                .members
+                .iter()
+                .map(|(id, m)| (hex::encode(id), *m))
                 .collect(),
             extra,
         };
@@ -218,23 +218,28 @@ impl Reader {
     }
 
     pub fn live_count(&self) -> usize {
-        self.live.len()
+        self.members.values().filter(|m| m.live).count()
     }
 
     /// Live leaves by `leaf_index`: `(leaf_index, id_commitment, expiry_timestamp_ms)`.
     pub fn live_leaves(&self) -> Vec<(u64, [u8; 32], u64)> {
         let mut leaves: Vec<_> = self
-            .live
+            .members
             .iter()
-            .map(|(id, leaf)| (leaf.leaf_index, *id, leaf.expiry_timestamp_ms))
+            .filter(|(_, m)| m.live)
+            .map(|(id, m)| (m.leaf_index, *id, m.expiry_timestamp_ms))
             .collect();
         leaves.sort();
         leaves
     }
 
-    /// Removed leaves: `(id_commitment, cause)`.
+    /// Memberships whose leaf is not in the tree: `(id_commitment, cause)`.
     pub fn removed_leaves(&self) -> Vec<([u8; 32], Removed)> {
-        let mut removed: Vec<_> = self.removed.iter().map(|(id, c)| (*id, *c)).collect();
+        let mut removed: Vec<_> = self
+            .members
+            .iter()
+            .filter_map(|(id, m)| m.removed.map(|c| (*id, c)))
+            .collect();
         removed.sort_by_key(|(id, _)| *id);
         removed
     }
@@ -253,17 +258,25 @@ impl Reader {
                     leaf_index,
                 } if *tree_id == self.tree_id => {
                     self.stats.registered += 1;
-                    // Leaf = rate commitment = poseidon(identity_commitment, rate_limit).
+                    if self.members.get(id_commitment).is_some_and(|m| !m.ended()) {
+                        println!(
+                            "Registered {}.. again while its membership is not over; the new \
+                             leaf {leaf_index} replaces it",
+                            hex::encode(&id_commitment[..4])
+                        );
+                    }
                     let leaf = rate_commitment(id_commitment, *rate_limit)?;
                     self.tree
                         .set(*leaf_index as usize, leaf)
                         .with_context(|| format!("set leaf {leaf_index}"))?;
-                    self.live.insert(
+                    self.members.insert(
                         *id_commitment,
-                        Leaf {
+                        Member {
                             leaf_index: *leaf_index,
                             expiry_timestamp_ms: *expiry_timestamp_ms,
                             rate_commitment: fr_to_bytes_le(&leaf),
+                            live: true,
+                            removed: None,
                         },
                     );
                     changes.push(Change::insert(*leaf_index, fr_to_bytes_le(&leaf).to_vec()));
@@ -274,67 +287,100 @@ impl Reader {
                     expiry_timestamp_ms,
                 } if *tree_id == self.tree_id => {
                     self.stats.extended += 1;
-                    // No change: the tree is untouched, only the expiry the reader tracks moves.
-                    if let Some(leaf) = self.live.get_mut(id_commitment) {
-                        leaf.expiry_timestamp_ms = *expiry_timestamp_ms;
+                    let Some(member) = self.members.get_mut(id_commitment) else {
+                        println!(
+                            "Extended {}.. without a registration; ignored",
+                            hex::encode(&id_commitment[..4])
+                        );
+                        continue;
+                    };
+                    if member.ended() {
+                        println!(
+                            "Extended {}.. after its membership ended; ignored",
+                            hex::encode(&id_commitment[..4])
+                        );
+                        continue;
+                    }
+                    member.expiry_timestamp_ms = *expiry_timestamp_ms;
+                    if !member.live {
+                        // Expired by this reader, extended on chain: back where it was.
+                        let leaf = fr_from_bytes_le(&member.rate_commitment)
+                            .map_err(|e| anyhow!("stored leaf: {e}"))?;
+                        let leaf_index = member.leaf_index;
+                        member.live = true;
+                        member.removed = None;
+                        self.stats.reinserted += 1;
+                        self.tree
+                            .set(leaf_index as usize, leaf)
+                            .with_context(|| format!("set leaf {leaf_index} again"))?;
+                        changes.push(Change::insert(leaf_index, member.rate_commitment.to_vec()));
                     }
                 }
-                // Normally no change: `Erase` needs `now >= expiry + withdrawal delay`, and
-                // the previous block, whose timestamp is `now`, already expired the leaf.
-                // A still-live leaf means the program allowed an early `Erase`; remove it.
                 Event::Erased {
                     tree_id,
                     id_commitment,
                 } if *tree_id == self.tree_id => {
                     self.stats.erased += 1;
-                    changes.extend(self.remove(*id_commitment, Removed::Expired)?);
+                    changes.extend(self.end(id_commitment, Removed::Erased)?);
                 }
                 Event::Slashed {
                     tree_id,
                     id_commitment,
                 } if *tree_id == self.tree_id => {
                     self.stats.slashed += 1;
-                    match self.remove(*id_commitment, Removed::Slashed)? {
-                        Some(change) => changes.push(change),
-                        // Slashed during the withdrawal delay: the leaf already expired, so no
-                        // change, but the membership is reported as slashed.
-                        None => {
-                            self.removed.insert(*id_commitment, Removed::Slashed);
-                        }
-                    }
+                    changes.extend(self.end(id_commitment, Removed::Slashed)?);
                 }
                 _ => self.stats.other_tree += 1,
             }
         }
-        // Expiry after the block's events, in leaf order, at most once per leaf.
+        // The expiry step: every live leaf expired at the block's timestamp, in leaf order.
         let mut expired: Vec<_> = self
-            .live
+            .members
             .iter()
-            .filter(|(_, leaf)| leaf.expiry_timestamp_ms <= block.timestamp_ms)
-            .map(|(key, leaf)| (leaf.leaf_index, *key))
+            .filter(|(_, m)| m.live && block.timestamp_ms >= m.expiry_timestamp_ms)
+            .map(|(id, m)| (m.leaf_index, *id))
             .collect();
         expired.sort();
-        for (_, key) in expired {
-            changes.extend(self.remove(key, Removed::Expired)?);
+        for (_, id) in expired {
+            let member = self.members.get_mut(&id).expect("listed above");
+            member.live = false;
+            member.removed = Some(Removed::Expired);
+            self.stats.removed_expired += 1;
+            let leaf_index = member.leaf_index;
+            self.tree
+                .delete(leaf_index as usize)
+                .with_context(|| format!("delete leaf {leaf_index}"))?;
+            changes.push(Change::remove(leaf_index));
         }
         self.applied_block_id = block.block_id;
         self.applied_timestamp_ms = block.timestamp_ms;
         Ok(changes)
     }
 
-    fn remove(&mut self, key: [u8; 32], cause: Removed) -> Result<Option<Change>> {
-        let Some(leaf) = self.live.remove(&key) else {
+    /// Slashed or erased: the membership is over; its leaf leaves the tree if still there.
+    fn end(&mut self, id_commitment: &[u8; 32], cause: Removed) -> Result<Option<Change>> {
+        let Some(member) = self.members.get_mut(id_commitment) else {
+            println!(
+                "{cause:?} {}.. without a registration; ignored",
+                hex::encode(&id_commitment[..4])
+            );
             return Ok(None);
         };
-        self.tree
-            .delete(leaf.leaf_index as usize)
-            .with_context(|| format!("delete leaf {}", leaf.leaf_index))?;
-        match cause {
-            Removed::Expired => self.stats.removed_expired += 1,
-            Removed::Slashed => self.stats.removed_slashed += 1,
+        if member.ended() {
+            return Ok(None);
         }
-        self.removed.insert(key, cause);
-        Ok(Some(Change::remove(leaf.leaf_index)))
+        let was_live = member.live;
+        member.live = false;
+        member.removed = Some(cause);
+        if !was_live {
+            return Ok(None);
+        }
+        self.stats.removed_ended += 1;
+        let leaf_index = member.leaf_index;
+        self.tree
+            .delete(leaf_index as usize)
+            .with_context(|| format!("delete leaf {leaf_index}"))?;
+        Ok(Some(Change::remove(leaf_index)))
     }
 
     /// The Merkle proof path of the leaf at `leaf_index` at this reader's root, if the leaf is
@@ -347,7 +393,6 @@ impl Reader {
         }
         let proof = self.tree.proof(index).ok()?;
         Some(ProofPath {
-            leaf_index,
             rate_commitment: fr_to_bytes_le(&leaf),
             path_elements: proof
                 .get_path_elements()
@@ -358,12 +403,17 @@ impl Reader {
         })
     }
 
-    pub fn live_leaf(&self, id_commitment: &[u8; 32]) -> Option<Leaf> {
-        self.live.get(id_commitment).copied()
+    /// The membership of an identity commitment, live or not.
+    pub fn member(&self, id_commitment: &[u8; 32]) -> Option<Member> {
+        self.members.get(id_commitment).copied()
     }
 
-    pub fn removed(&self, id_commitment: &[u8; 32]) -> Option<Removed> {
-        self.removed.get(id_commitment).copied()
+    /// The membership at a leaf index, live or not: `(id_commitment, member)`.
+    pub fn member_at(&self, leaf_index: u64) -> Option<([u8; 32], Member)> {
+        self.members
+            .iter()
+            .find(|(_, m)| m.leaf_index == leaf_index)
+            .map(|(id, m)| (*id, *m))
     }
 }
 
@@ -386,12 +436,16 @@ fn rate_commitment(id_commitment: &[u8; 32], rate_limit: u64) -> Result<Fr> {
 mod test {
     use super::*;
 
-    fn registered(id: u8, leaf_index: u64, expiry_timestamp_ms: u64) -> Event {
+    fn id(n: u8) -> [u8; 32] {
         let mut id_commitment = [0u8; 32];
-        id_commitment[0] = id;
+        id_commitment[0] = n;
+        id_commitment
+    }
+
+    fn registered(n: u8, leaf_index: u64, expiry_timestamp_ms: u64) -> Event {
         Event::Registered {
             tree_id: [0; 32],
-            id_commitment,
+            id_commitment: id(n),
             rate_limit: 100,
             expiry_timestamp_ms,
             leaf_index,
@@ -424,6 +478,59 @@ mod test {
         assert_eq!(changes.len(), 1);
         assert_eq!(reader.root(), empty);
         assert!(reader.proof_path(0).is_none());
+        assert_eq!(
+            reader.member(&id(1)).and_then(|m| m.removed),
+            Some(Removed::Expired)
+        );
+    }
+
+    #[test]
+    fn test_extend_after_expiry_puts_the_leaf_back_and_slash_ends_it() {
+        let (mut reader, _) = Reader::open_temporary([0; 32], 0).unwrap();
+        reader
+            .apply_block(&block(1, 1_000, vec![registered(1, 0, 5_000)]))
+            .unwrap();
+        let with_leaf = reader.root();
+        reader.apply_block(&block(2, 5_000, vec![])).unwrap();
+        // The extension dated before the expiry lands late: the leaf comes back.
+        let changes = reader
+            .apply_block(&block(
+                3,
+                6_000,
+                vec![Event::Extended {
+                    tree_id: [0; 32],
+                    id_commitment: id(1),
+                    expiry_timestamp_ms: 9_000,
+                }],
+            ))
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(reader.root(), with_leaf);
+        assert_eq!(reader.stats.reinserted, 1);
+        // Slashed: removed for good; a later Extended changes nothing.
+        let changes = reader
+            .apply_block(&block(
+                4,
+                7_000,
+                vec![
+                    Event::Slashed {
+                        tree_id: [0; 32],
+                        id_commitment: id(1),
+                    },
+                    Event::Extended {
+                        tree_id: [0; 32],
+                        id_commitment: id(1),
+                        expiry_timestamp_ms: 20_000,
+                    },
+                ],
+            ))
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            reader.member(&id(1)).and_then(|m| m.removed),
+            Some(Removed::Slashed)
+        );
+        assert_eq!(reader.live_count(), 0);
     }
 
     #[test]
@@ -442,16 +549,21 @@ mod test {
                 .unwrap();
             reader.apply_block(&block(2, 5_000, vec![])).unwrap();
             reader.persist(serde_json::json!({ "note": 7 })).unwrap();
+            let root = reader.root();
             reader.close().unwrap();
-            reader.root()
+            root
         };
-        let (reader, extra) = Reader::open(&dir, [0; 32], 0).unwrap();
-        assert_eq!(reader.root(), root);
-        assert_eq!(reader.applied_block_id, 2);
-        assert_eq!(reader.live_count(), 1);
-        assert_eq!(reader.removed_leaves().len(), 1);
-        assert!(reader.proof_path(1).is_some());
-        assert_eq!(extra["note"], 7);
+        {
+            let (reader, extra) = Reader::open(&dir, [0; 32], 0).unwrap();
+            assert_eq!(reader.root(), root);
+            assert_eq!(reader.applied_block_id, 2);
+            assert_eq!(reader.live_count(), 1);
+            assert_eq!(reader.removed_leaves().len(), 1);
+            assert!(reader.proof_path(1).is_some());
+            assert_eq!(extra["note"], 7);
+        }
+        // Another registry's reader refuses the store (sled holds one lock per store, so the
+        // previous reader is dropped first).
         assert!(Reader::open(&dir, [9; 32], 0).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
