@@ -13,11 +13,12 @@ use serde_json::{Value, json};
 
 use crate::reader::{fr_from_bytes_le, fr_to_bytes_le};
 
-/// One event of the registration program (RFC "LEZ Requirements / Events").
+/// One event of the registration program (RFC "LEZ Requirements / Events") for the registry
+/// this sequencer follows; the source drops the events of any other `tree_id` the program
+/// serves, so the events carry none.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     Registered {
-        tree_id: [u8; 32],
         id_commitment: [u8; 32],
         rate_limit: u64,
         /// The end of the membership's grace period, from which it is expired.
@@ -25,17 +26,14 @@ pub enum Event {
         leaf_index: u64,
     },
     Extended {
-        tree_id: [u8; 32],
         id_commitment: [u8; 32],
         /// The membership's expiry after the extension.
         expiry_timestamp_ms: u64,
     },
     Erased {
-        tree_id: [u8; 32],
         id_commitment: [u8; 32],
     },
     Slashed {
-        tree_id: [u8; 32],
         id_commitment: [u8; 32],
     },
 }
@@ -71,6 +69,8 @@ pub struct SequencerLez {
     client: reqwest::Client,
     url: String,
     program_account_id: [u8; 32],
+    /// The registry followed; the program's transactions for another `tree_id` are dropped.
+    tree_id: [u8; 32],
     /// `Registered` seen so far, the next `leaf_index`.
     registered: AtomicU64,
 }
@@ -79,11 +79,12 @@ pub struct SequencerLez {
 pub const SEQUENCER_RANGE: u64 = 1024;
 
 impl SequencerLez {
-    pub fn new(url: String, program_account_id: [u8; 32]) -> Self {
+    pub fn new(url: String, program_account_id: [u8; 32], tree_id: [u8; 32]) -> Self {
         Self {
             client: reqwest::Client::new(),
             url,
             program_account_id,
+            tree_id,
             registered: AtomicU64::new(0),
         }
     }
@@ -227,16 +228,26 @@ impl SequencerLez {
     /// with the expiry the instruction claims, `Slashed` (`poseidon(identity_secret)` must be
     /// the `id_commitment`), `Erased`; `Initialize` emits none. Every value a handler needs
     /// travels in the instruction as a claim the chain asserts, so a transaction in a block
-    /// carries true values. A transaction that does not decode is reported with its bytes and
-    /// skipped; the tree is then wrong until a restart with `--rebuild-tree`.
+    /// carries true values. An instruction for another registry (`tree_id`) is dropped. A
+    /// transaction that does not decode is reported with its bytes and skipped; the tree is
+    /// then wrong until a restart with `--rebuild-tree`.
     fn decode_instruction(&self, data: &[u8]) -> Result<Option<Event>> {
         use rln_layouts::{Instruction, expiry_ms, secs_to_millis};
         let instruction: Instruction =
             borsh::from_slice(data).context("not an instruction of the program")?;
+        let tree_id = match &instruction {
+            Instruction::Initialize { tree_id, .. }
+            | Instruction::Register { tree_id, .. }
+            | Instruction::Slash { tree_id, .. }
+            | Instruction::Extend { tree_id, .. }
+            | Instruction::Erase { tree_id, .. } => *tree_id,
+        };
+        if tree_id != self.tree_id {
+            return Ok(None);
+        }
         Ok(Some(match instruction {
             Instruction::Initialize { .. } => return Ok(None),
             Instruction::Register {
-                tree_id,
                 id_commitment,
                 rate_limit,
                 now_ms,
@@ -255,7 +266,6 @@ impl SequencerLez {
                 }
                 let grace_start_ms = now_ms.saturating_add(secs_to_millis(active_duration_sec));
                 Event::Registered {
-                    tree_id,
                     id_commitment,
                     rate_limit,
                     expiry_timestamp_ms: expiry_ms(
@@ -266,7 +276,6 @@ impl SequencerLez {
                 }
             }
             Instruction::Slash {
-                tree_id,
                 id_commitment,
                 identity_secret,
                 ..
@@ -281,29 +290,17 @@ impl SequencerLez {
                         hex::encode(id_commitment)
                     );
                 }
-                Event::Slashed {
-                    tree_id,
-                    id_commitment,
-                }
+                Event::Slashed { id_commitment }
             }
             Instruction::Extend {
-                tree_id,
                 id_commitment,
                 expiry_timestamp_ms,
                 ..
             } => Event::Extended {
-                tree_id,
                 id_commitment,
                 expiry_timestamp_ms,
             },
-            Instruction::Erase {
-                tree_id,
-                id_commitment,
-                ..
-            } => Event::Erased {
-                tree_id,
-                id_commitment,
-            },
+            Instruction::Erase { id_commitment, .. } => Event::Erased { id_commitment },
         }))
     }
 }
@@ -346,7 +343,7 @@ mod test {
     #[test]
     fn test_decode_every_instruction() {
         use rln_layouts::Instruction;
-        let lez = SequencerLez::new("http://unused".into(), [1; 32]);
+        let lez = SequencerLez::new("http://unused".into(), [1; 32], [7; 32]);
         let keys = rln::prelude::IdentityKeys::generate::<PoseidonHash, rand::rngs::ThreadRng>(
             &mut rand::thread_rng(),
         );
@@ -396,10 +393,7 @@ mod test {
         .unwrap();
         assert_eq!(
             lez.decode_instruction(&slash).unwrap(),
-            Some(Event::Slashed {
-                tree_id: [7; 32],
-                id_commitment: id,
-            })
+            Some(Event::Slashed { id_commitment: id })
         );
         let wrong_secret = borsh::to_vec(&Instruction::Slash {
             tree_id: [7; 32],
@@ -421,7 +415,6 @@ mod test {
         assert_eq!(
             lez.decode_instruction(&extend).unwrap(),
             Some(Event::Extended {
-                tree_id: [7; 32],
                 id_commitment: [8; 32],
                 expiry_timestamp_ms: 9_000,
             })
@@ -436,16 +429,24 @@ mod test {
         assert_eq!(
             lez.decode_instruction(&erase).unwrap(),
             Some(Event::Erased {
-                tree_id: [7; 32],
                 id_commitment: [8; 32],
             })
         );
+        // Another registry of the same program: no event.
+        let other = borsh::to_vec(&Instruction::Erase {
+            tree_id: [9; 32],
+            id_commitment: [8; 32],
+            rate_limit: 100,
+            now_ms: 5_000,
+        })
+        .unwrap();
+        assert_eq!(lez.decode_instruction(&other).unwrap(), None);
     }
 
     #[test]
     fn test_decode_block_with_two_public_transactions() {
         let program = [1u8; 32];
-        let lez = SequencerLez::new("http://unused".into(), program);
+        let lez = SequencerLez::new("http://unused".into(), program, [7; 32]);
         let tx = |to: [u8; 32], data: &[u8]| {
             let mut b = vec![0u8];
             b.extend(to);
@@ -488,14 +489,18 @@ mod test {
                 .unwrap(),
         )
         .unwrap();
-        let lez = SequencerLez::new("http://unused".into(), program);
+        let tree_id = <[u8; 32]>::try_from(
+            hex::decode("47b2de4f08080e74e2d4beffe8e5e87e709dd598619c9b322b64f2756979b4cf")
+                .unwrap(),
+        )
+        .unwrap();
+        let lez = SequencerLez::new("http://unused".into(), program, tree_id);
         let bytes = BASE64.decode(BLOCK_50056).unwrap();
         let block = lez.decode_block(&bytes).unwrap();
         assert_eq!(block.block_id, 50056);
         assert_eq!(block.timestamp_ms, 1_792_597_956_640);
         assert_eq!(block.events.len(), 1);
         let Event::Registered {
-            tree_id,
             id_commitment,
             rate_limit,
             expiry_timestamp_ms,
@@ -504,10 +509,6 @@ mod test {
         else {
             panic!("expected Registered");
         };
-        assert_eq!(
-            hex::encode(tree_id),
-            "47b2de4f08080e74e2d4beffe8e5e87e709dd598619c9b322b64f2756979b4cf"
-        );
         assert!(hex::encode(id_commitment).starts_with("a878f8b554fabd"));
         assert_eq!(*rate_limit, 100);
         // now_ms 1792597876639 + active 30 days + grace 7 days.

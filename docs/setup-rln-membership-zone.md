@@ -157,20 +157,43 @@ rm -rf zone-sequencer/data/tree
 ### HTTP API
 
 ```bash
-curl -s localhost:3000/ | jq                  # channel, LEZ head, covered block, batch count, tree counters
-curl -s localhost:3000/roots/5 | jq           # newest 5 roots with status, msg_id, tx_hash, l1_slot
+curl -s localhost:3000/ | jq                  # channel, LEZ head, covered block, counters, newest roots
+curl -s localhost:3000/roots/5 | jq           # newest 5 distinct roots, the batch that produced each
+curl -s localhost:3000/batches/5 | jq         # newest 5 batches as published, heartbeats included
 curl -s localhost:3000/merkle_proof/0 | jq    # membership at leaf 0 and its proof path at the LEZ head
 curl -s localhost:3000/merkle_proof/<id_commitment hex> | jq   # the same, by identity commitment
-curl -s localhost:3000/leaves | jq            # every live leaf with expiry, removed leaves with cause
+curl -s localhost:3000/leaves | jq            # active memberships with expiry, removed ones with why
 curl -s localhost:3000/health
 ```
 
+Words used the same way in every answer: `lez_block_id` and `lez_timestamp_ms` are the LEZ
+block the tree is at (its timestamp is the clock expiry runs on) and `root` the tree's root
+there; `status` is always a batch's status on Bedrock (`pending`, `adopted`, `orphaned`,
+`finalized` with its `l1_slot`); a membership is `active` (its leaf is in the tree and it
+proves, through its grace period included) or `removed` for `expired`, `slashed` or `erased`.
+32-byte values are hex, little-endian.
+
+`/` adds `zone_channel_id`, `lez_source`, `first_lez_block_id` and `covered_to_lez_block_id`
+(the last block a published batch covers), `lez_events` (the program's events applied:
+`registered`, `extended`, `slashed`, `erased`), `tree` (`active_leaves`, `removed_leaves`,
+and `changes` the rules made beyond the one insert per `Registered`: `removed_expired` by the
+LEZ clock, `removed_ended` by a slash or an erase while active, `reinserted` by an `Extended`
+that landed after the reader had expired the leaf), `pending_changes` (waiting for the next
+batch), `published_batches`, `newest_adopted` and `newest_finalized` (root and
+`to_lez_block_id` of the newest batch in a Bedrock block, and in finalized history).
+
+A batch entry (`/batches`, `/roots`) carries `root`, `from_lez_block_id`, `to_lez_block_id`,
+`change_count`, `published_at_unix`, `status`, `tx_hash` and `msg_id`. `/batches` lists the
+batches as published, so a heartbeat shows the previous root with `change_count` 0. `/roots`
+lists distinct roots: each with the batch that produced it (its `change_count` is what made
+the root, and it is the first of that root's batches to reach `adopted` and `finalized`) plus
+`carried_to_lez_block_id`, the `to_lez_block_id` of the newest batch carrying the root.
+
 `/merkle_proof` answers 404 for an unknown leaf index or identity commitment. The answer
-carries the membership (`leaf_index`, `id_commitment`, `expiry_timestamp_ms`, `status`:
-`live`, `expired`, `slashed` or `erased`), the head root, `newest_adopted` and
-`newest_finalized` (the latest roots a batch took to Bedrock, for a validator to compare),
-and `proof` (`rate_commitment`, `path_elements`, `identity_path_index`, the `RLNMerkleProof`
-of Zerokit) while the leaf is in the tree, `null` otherwise.
+carries the membership (`leaf_index`, `id_commitment`, `active`, `removed`,
+`expiry_timestamp_ms`), `newest_adopted` and `newest_finalized` (for a validator to compare
+with `root`), and `proof` (`rate_commitment`, `path_elements`, `identity_path_index`, the
+`RLNMerkleProof` of Zerokit) while the membership is active, `null` otherwise.
 
 ## 4. LEZ source: the public LEZ Sequencer (default)
 
@@ -206,15 +229,20 @@ expired), `Extended` with the expiry the instruction claims, `Slashed`
 applies them as the program's reference reader does: `Registered` inserts the leaf,
 `Extended` keeps the new expiry and puts the leaf back if the reader had already expired it
 (the chain accepts a clock claim a little behind its clock), `Slashed` and `Erased` end the
-membership and remove the leaf if still live, and after each block every live leaf whose
-expiry is at or before the block's timestamp is removed. On the testnet a membership lasts
-30 days plus a 7-day grace period.
+membership and remove the leaf if still active, and after each block every active leaf whose
+expiry is at or before the block's timestamp is removed. The expiry is the end of the grace
+period, so a membership stays in the tree and keeps proving through its grace period; only
+the chain's view of it changes there (it can be extended, not yet erased). On the testnet a
+membership lasts 30 days plus a 7-day grace period. A transaction for another `tree_id` of
+the same program is dropped.
 
 A transaction the decoder cannot read is reported with its bytes and skipped; the tree is then
 missing a change until the decoder is fixed and the sequencer restarted once with
 `--rebuild-tree` (the batch history and the checkpoint stay, the tree is read again from
-LEZ, and the missed change goes into the next batch when its block is after the last one
-covered).
+LEZ). A change found again in a block after the last one covered goes into the next batch; a
+change in a block already covered is in no batch's change list, so the next batch carries the
+corrected root with a `change_count` that does not account for it (a Zone indexer replaying
+the batches would reject it; the rebuild is an operator's repair, not a protocol path).
 
 Check the source by hand:
 

@@ -1,7 +1,10 @@
 //! The HTTP API a Module's node reads (its registry access): the roots with the status of
 //! their transaction on Bedrock, the Merkle proof path of a leaf at the tree of the LEZ head,
-//! a leaf's status.
-//! 32-byte values are hex, little-endian (RLN-API Appendix B).
+//! a membership's state.
+//! 32-byte values are hex, little-endian (RLN-API Appendix B). Every answer carries
+//! `lez_block_id` and `lez_timestamp_ms`, the LEZ block the tree is at, and the tree's `root`
+//! there; `status` is always a batch's status on Bedrock (`pending`, `adopted`, `orphaned`,
+//! `finalized` with `l1_slot`), a membership is `active` or not.
 
 use std::sync::{Arc, RwLock};
 
@@ -14,7 +17,10 @@ use axum::{
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::registry::{Registry, Status};
+use crate::{
+    reader::Removed,
+    registry::{Published, Registry, RootEntry, Status},
+};
 
 pub type Shared = Arc<RwLock<Registry>>;
 
@@ -36,11 +42,16 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// A published batch as the API shows it: the root it carried, the LEZ blocks it covers, how
+/// many changes it listed and where its transaction stands on Bedrock. In `/roots`,
+/// `carried_to_lez_block_id` is added: the last LEZ block the root stood for.
 #[derive(Serialize)]
-struct RootEntry {
+struct BatchEntry {
     root: String,
     from_lez_block_id: u64,
     to_lez_block_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    carried_to_lez_block_id: Option<u64>,
     change_count: usize,
     published_at_unix: u64,
     #[serde(flatten)]
@@ -49,75 +60,106 @@ struct RootEntry {
     msg_id: String,
 }
 
-async fn summary(State(state): State<AppState>) -> Json<Value> {
-    let registry = state.registry.read().expect("registry lock");
-    let adopted = registry.newest_adopted();
-    let finalized = registry.newest_finalized();
-    Json(json!({
-        "zone_channel_id": state.channel_id,
-        "lez_source": state.lez_source,
-        "first_lez_block_id": registry.history.first_lez_block_id,
-        "latest_lez_block_id": registry.head.applied_block_id,
-        "lez_timestamp_ms": registry.head.applied_timestamp_ms,
-        "covered_to_lez_block_id": registry.history.covered_to,
-        "tree": {
-            "live_leaves": registry.head.live_count(),
-            "removed_leaves": registry.head.removed_leaves().len(),
-            "root_at_head": hex::encode(registry.head.root()),
-            "events": registry.head.stats,
-        },
-        "pending_changes": registry.pending_changes.len(),
-        "published_batches": registry.history.published.len(),
-        "newest_adopted_root": adopted.map(|p| hex::encode(p.root_after)),
-        "newest_adopted_to_lez_block_id": adopted.map(|p| p.to_lez_block_id),
-        "newest_finalized_root": finalized.map(|p| hex::encode(p.root_after)),
-        "newest_finalized_to_lez_block_id": finalized.map(|p| p.to_lez_block_id),
-        "endpoints": ["/roots/{window_size}", "/batches/{window_size}", "/merkle_proof/{leaf_index or id_commitment}", "/leaves", "/health"],
-    }))
-}
-
-/// The newest `window_size` distinct roots, newest first, each with the newest batch that
-/// carries it and that batch's status on Bedrock.
-async fn roots(State(state): State<AppState>, Path(window_size): Path<usize>) -> Json<Value> {
-    let registry = state.registry.read().expect("registry lock");
-    Json(json!({
-        "latest_lez_block_id": registry.head.applied_block_id,
-        "lez_timestamp_ms": registry.head.applied_timestamp_ms,
-        "covered_to_lez_block_id": registry.history.covered_to,
-        "roots": entries(registry.roots(window_size)),
-    }))
-}
-
-/// The newest `window_size` published batches, newest first, heartbeats included.
-async fn batches(State(state): State<AppState>, Path(window_size): Path<usize>) -> Json<Value> {
-    let registry = state.registry.read().expect("registry lock");
-    Json(json!({
-        "latest_lez_block_id": registry.head.applied_block_id,
-        "lez_timestamp_ms": registry.head.applied_timestamp_ms,
-        "covered_to_lez_block_id": registry.history.covered_to,
-        "batches": entries(registry.batches(window_size)),
-    }))
-}
-
-fn entries(published: Vec<&crate::registry::Published>) -> Vec<RootEntry> {
-    published
-        .into_iter()
-        .map(|p| RootEntry {
+impl BatchEntry {
+    fn new(p: &Published) -> Self {
+        Self {
             root: hex::encode(p.root_after),
             from_lez_block_id: p.from_lez_block_id,
             to_lez_block_id: p.to_lez_block_id,
+            carried_to_lez_block_id: None,
             change_count: p.change_count,
             published_at_unix: p.published_at_unix,
             status: p.status.clone(),
             tx_hash: hex::encode(p.tx_hash),
             msg_id: hex::encode(p.msg_id),
-        })
-        .collect()
+        }
+    }
+
+    fn root(entry: RootEntry<'_>) -> Self {
+        Self {
+            carried_to_lez_block_id: Some(entry.carried_to_lez_block_id),
+            ..Self::new(entry.produced_by)
+        }
+    }
 }
 
-/// A membership by its leaf index (decimal) or its identity commitment (64 hex): where it
-/// stands at the LEZ head and, while its leaf is in the tree, the Merkle proof path at the
-/// head's root, with the newest roots a batch carried to Bedrock for a validator to compare.
+/// `body` plus where the tree is: `lez_block_id` (the LEZ block applied last),
+/// `lez_timestamp_ms` and the `root` there.
+fn with_head(registry: &Registry, mut body: Value) -> Json<Value> {
+    if let Value::Object(map) = &mut body {
+        map.insert("lez_block_id".into(), registry.head.applied_block_id.into());
+        map.insert(
+            "lez_timestamp_ms".into(),
+            registry.head.applied_timestamp_ms.into(),
+        );
+        map.insert("root".into(), hex::encode(registry.head.root()).into());
+    }
+    Json(body)
+}
+
+async fn summary(State(state): State<AppState>) -> Json<Value> {
+    let registry = state.registry.read().expect("registry lock");
+    with_head(
+        &registry,
+        json!({
+            "zone_channel_id": state.channel_id,
+            "lez_source": state.lez_source,
+            "first_lez_block_id": registry.history.first_lez_block_id,
+            "covered_to_lez_block_id": registry.history.covered_to,
+            "lez_events": registry.head.stats.lez_events(),
+            "tree": {
+                "active_leaves": registry.head.active_count(),
+                "removed_leaves": registry.head.removed_leaves().len(),
+                "changes": registry.head.stats.tree_changes(),
+            },
+            "pending_changes": registry.pending_changes.len(),
+            "published_batches": registry.history.published.len(),
+            "newest_adopted": registry.newest_adopted().map(root_ref),
+            "newest_finalized": registry.newest_finalized().map(root_ref),
+            "endpoints": ["/roots/{window_size}", "/batches/{window_size}", "/merkle_proof/{leaf_index or id_commitment}", "/leaves", "/health"],
+        }),
+    )
+}
+
+/// The newest `window_size` distinct roots, newest first, each with the batch that produced
+/// it (its status on Bedrock, its `change_count`) and the last LEZ block it stood for.
+async fn roots(State(state): State<AppState>, Path(window_size): Path<usize>) -> Json<Value> {
+    let registry = state.registry.read().expect("registry lock");
+    let roots: Vec<_> = registry
+        .roots(window_size)
+        .into_iter()
+        .map(BatchEntry::root)
+        .collect();
+    with_head(
+        &registry,
+        json!({
+            "covered_to_lez_block_id": registry.history.covered_to,
+            "roots": roots,
+        }),
+    )
+}
+
+/// The newest `window_size` published batches, newest first, heartbeats included.
+async fn batches(State(state): State<AppState>, Path(window_size): Path<usize>) -> Json<Value> {
+    let registry = state.registry.read().expect("registry lock");
+    let batches: Vec<_> = registry
+        .batches(window_size)
+        .into_iter()
+        .map(BatchEntry::new)
+        .collect();
+    with_head(
+        &registry,
+        json!({
+            "covered_to_lez_block_id": registry.history.covered_to,
+            "batches": batches,
+        }),
+    )
+}
+
+/// A membership by its leaf index (decimal) or its identity commitment (64 hex): whether it
+/// is `active` (its leaf is in the tree) or why it was `removed`, and while active the Merkle
+/// proof path at the head's root, with the newest roots a batch carried to Bedrock for a
+/// validator to compare.
 async fn merkle_proof(
     State(state): State<AppState>,
     Path(leaf): Path<String>,
@@ -143,12 +185,6 @@ async fn merkle_proof(
     let Some((id_commitment, member)) = found else {
         return Err(error(StatusCode::NOT_FOUND, "no such membership"));
     };
-    let status = match member.removed {
-        None => "live",
-        Some(crate::reader::Removed::Expired) => "expired",
-        Some(crate::reader::Removed::Slashed) => "slashed",
-        Some(crate::reader::Removed::Erased) => "erased",
-    };
     let proof = registry.head.proof_path(member.leaf_index).map(|path| {
         json!({
             "rate_commitment": hex::encode(path.rate_commitment),
@@ -156,30 +192,32 @@ async fn merkle_proof(
             "identity_path_index": path.identity_path_index,
         })
     });
-    Ok(Json(json!({
-        "id_commitment": hex::encode(id_commitment),
-        "leaf_index": member.leaf_index,
-        "status": status,
-        "expiry_timestamp_ms": member.expiry_timestamp_ms,
-        "root": hex::encode(registry.head.root()),
-        "lez_block_id": registry.head.applied_block_id,
-        "lez_timestamp_ms": registry.head.applied_timestamp_ms,
-        "newest_adopted": registry.newest_adopted().map(root_ref),
-        "newest_finalized": registry.newest_finalized().map(root_ref),
-        "proof": proof,
-    })))
+    Ok(with_head(
+        &registry,
+        json!({
+            "id_commitment": hex::encode(id_commitment),
+            "leaf_index": member.leaf_index,
+            "active": member.active,
+            "removed": member.removed,
+            "expiry_timestamp_ms": member.expiry_timestamp_ms,
+            "newest_adopted": registry.newest_adopted().map(root_ref),
+            "newest_finalized": registry.newest_finalized().map(root_ref),
+            "proof": proof,
+        }),
+    ))
 }
 
-fn root_ref(p: &crate::registry::Published) -> Value {
+fn root_ref(p: &Published) -> Value {
     json!({ "root": hex::encode(p.root_after), "to_lez_block_id": p.to_lez_block_id })
 }
 
-/// Every leaf at the LEZ head: live ones with their expiry, removed ones with the cause.
+/// Every membership at the LEZ head: the active leaves with their expiry, the removed ones
+/// with why (`expired`, `slashed`, `erased`).
 async fn leaves(State(state): State<AppState>) -> Json<Value> {
     let registry = state.registry.read().expect("registry lock");
-    let live: Vec<Value> = registry
+    let active: Vec<Value> = registry
         .head
-        .live_leaves()
+        .active_leaves()
         .into_iter()
         .map(|(leaf_index, id, expiry)| {
             json!({
@@ -194,16 +232,21 @@ async fn leaves(State(state): State<AppState>) -> Json<Value> {
         .head
         .removed_leaves()
         .into_iter()
-        .map(|(id, cause)| json!({ "id_commitment": hex::encode(id), "cause": format!("{cause:?}") }))
+        .map(|(leaf_index, id, cause): (u64, [u8; 32], Removed)| {
+            json!({
+                "leaf_index": leaf_index,
+                "id_commitment": hex::encode(id),
+                "removed": cause,
+            })
+        })
         .collect();
-    Json(json!({
-        "lez_block_id": registry.head.applied_block_id,
-        "lez_timestamp_ms": registry.head.applied_timestamp_ms,
-        "root_at_head": hex::encode(registry.head.root()),
-        "events": registry.head.stats,
-        "live": live,
-        "removed": removed,
-    }))
+    with_head(
+        &registry,
+        json!({
+            "active": active,
+            "removed": removed,
+        }),
+    )
 }
 
 fn error(code: StatusCode, message: &str) -> (StatusCode, Json<Value>) {

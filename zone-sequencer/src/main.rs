@@ -300,10 +300,10 @@ async fn main() -> Result<()> {
 
     // LEZ source.
     let program_account_id = parse_32(&args.program_account_id, "PROGRAM_ACCOUNT_ID")?;
-    let source = SequencerLez::new(args.lez_sequencer_url.clone(), program_account_id);
+    let tree_id = parse_32(&args.tree_id, "TREE_ID")?;
+    let source = SequencerLez::new(args.lez_sequencer_url.clone(), program_account_id, tree_id);
 
     // Registry: the tree store under the data dir, with the batch history and the checkpoint.
-    let tree_id = parse_32(&args.tree_id, "TREE_ID")?;
     let registry: Shared = Arc::new(RwLock::new(Registry::open(
         &args.data_dir,
         tree_id,

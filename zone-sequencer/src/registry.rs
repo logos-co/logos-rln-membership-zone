@@ -248,19 +248,41 @@ impl Registry {
             .collect()
     }
 
-    /// The distinct roots newest first, at most `window_size`: one entry per root, the newest
-    /// batch that carries it (so `to_lez_block_id` is the freshest block the root stands
-    /// for), heartbeats and Orphaned batches left out.
-    pub fn roots(&self, window_size: usize) -> Vec<&Published> {
-        let mut seen = std::collections::HashSet::new();
-        self.history
+    /// The distinct roots newest first, at most `window_size`: one entry per root, the batch
+    /// that produced it (its `change_count` is what made the root, and it is the first of the
+    /// root's batches to be adopted or finalized) with `carried_to_lez_block_id`, the last LEZ
+    /// block the root stood for (the `to_lez_block_id` of the newest batch carrying it, a
+    /// heartbeat as a rule). Orphaned batches are left out.
+    pub fn roots(&self, window_size: usize) -> Vec<RootEntry<'_>> {
+        let mut entries: Vec<RootEntry<'_>> = vec![];
+        for p in self
+            .history
             .published
             .iter()
-            .rev()
-            .filter(|p| p.status != Status::Orphaned && seen.insert(p.root_after))
-            .take(window_size)
-            .collect()
+            .filter(|p| p.status != Status::Orphaned)
+        {
+            match entries
+                .iter_mut()
+                .find(|e| e.produced_by.root_after == p.root_after)
+            {
+                Some(entry) => entry.carried_to_lez_block_id = p.to_lez_block_id,
+                None => entries.push(RootEntry {
+                    produced_by: p,
+                    carried_to_lez_block_id: p.to_lez_block_id,
+                }),
+            }
+        }
+        entries.reverse();
+        entries.truncate(window_size);
+        entries
     }
+}
+
+/// A root of the valid-root window: the batch that produced it and how far it was carried.
+pub struct RootEntry<'a> {
+    pub produced_by: &'a Published,
+    /// `to_lez_block_id` of the newest batch carrying this root.
+    pub carried_to_lez_block_id: u64,
 }
 
 pub fn now_unix() -> u64 {

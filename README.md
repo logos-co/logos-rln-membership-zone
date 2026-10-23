@@ -106,11 +106,11 @@ cp .env.example .env             # set FUNDING_PK to the node's PoWClaim public 
 set -a; source .env; set +a      # clap reads process env vars, not the .env file
 cargo run -p zone-sequencer
 
-curl -s localhost:3000/ | jq                 # channel, LEZ head, tree counters
-curl -s localhost:3000/roots/5 | jq          # newest distinct roots with their status on Bedrock
+curl -s localhost:3000/ | jq                 # channel, LEZ head, event and tree counters
+curl -s localhost:3000/roots/5 | jq          # newest distinct roots: the batch that produced each, its status on Bedrock
 curl -s localhost:3000/batches/5 | jq        # newest batches, heartbeats included
 curl -s localhost:3000/merkle_proof/0 | jq   # membership at leaf 0 (or by id_commitment) and its proof path
-curl -s localhost:3000/leaves | jq           # every leaf at the LEZ head
+curl -s localhost:3000/leaves | jq           # active and removed memberships at the LEZ head
 ```
 
 The first start creates the channel (the key in `zone-sequencer/data/key.hex`, the id
@@ -127,8 +127,8 @@ cargo clippy -p zone-sequencer --all-targets -- -D warnings
 ```
 
 The unit tests cover the derivation rules (a `Registered` event sets the leaf and the proof
-path, expiry removes it at the LEZ timestamp, events of other registries are ignored), the
-tree store surviving a reopen, and the decoding of LEZ blocks and the program's instructions,
+path, expiry removes it at the LEZ timestamp), the tree store surviving a reopen, and the
+decoding of LEZ blocks and the program's instructions (another registry's are dropped),
 including a real testnet block.
 
 ## References
