@@ -628,7 +628,7 @@ High blocks a sound deployment, Medium must be settled before implementation, Lo
 
 ### Q1. Leaf capacity exhaustion (High)
 
-**Problem.** Leaf indices are never reused (`next_index` never goes back, and Zerokit's trees are append-only),
+**Problem.** Leaf indices are never reused (`next_leaf_index` never goes back),
 so the registry holds 2^20 memberships over its lifetime,
 and deposits come back:
 register at the minimum `rate_limit`, wait out the active duration and the withdrawal delay,
@@ -650,6 +650,18 @@ use up the registry at about `2^20 × registration_fee`.
   Each tree has its own root; a proof is made against the root of the member's tree,
   and validators keep one valid-root window per tree that still has live leaves.
   No circuit change and no hard capacity, at the cost of several roots in the registry view.
+- **Index reuse by the readers** (considered, not preferred). Readers could assign indices themselves
+  ("lowest free index") and reuse one after `Erase` or `Slash`; nothing in Zerokit or the circuit forbids it,
+  and the cap would count concurrent memberships instead of lifetime ones.
+  It is not free: the free set is no longer derivable from the tree (an expired membership that nobody erased
+  has an empty leaf yet still owns its index, since an `Extend` can bring it back), so every reader and every
+  snapshot sync carries the free set as extra state rebuilt from LEZ membership accounts;
+  "free" becomes a rule the program and every reader must mirror exactly (freed by `Erase` and `Slash` only,
+  never by expiry, so the program can still count for the atomic capacity check);
+  an expired membership blocks its slot until someone erases it;
+  and the on-chain `leaf_index`, the one anchor a reader checks itself against, is gone.
+  The monotonic index keeps the registry's state at the tree plus one on-chain counter and makes the
+  auto-scaling tree a pure function of the index, which is why pricing plus auto-scaling is preferred.
 
 ### Q2. Registry accesses that disagree (High)
 
