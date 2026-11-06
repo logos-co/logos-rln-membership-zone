@@ -1,7 +1,5 @@
 [workspace]
 members  = ["zone-sequencer"]
-# The submodule is its own workspace; keep Cargo from treating its crates as ours.
-exclude  = ["logos-blockchain"]
 resolver = "2"
 
 [workspace.package]
@@ -11,15 +9,17 @@ repository = "https://github.com/logos-co/logos-rln-membership-zone"
 version    = "0.1.0"
 
 [workspace.dependencies]
-# logos-blockchain crates, pinned through the git submodule (tag 0.3.2 = node release in use)
-lb-common-http-client            = { default-features = false, package = "logos-blockchain-common-http-client", path = "./logos-blockchain/nodes/node/http-client" }
-lb-core                          = { default-features = false, package = "logos-blockchain-core", path = "./logos-blockchain/core" }
-lb-key-management-system-service = { default-features = false, package = "logos-blockchain-key-management-system-service", path = "./logos-blockchain/services/key-management-system" }
-lb-zone-sdk                      = { default-features = false, package = "logos-blockchain-zone-sdk", path = "./logos-blockchain/zone-sdk" }
+# logos-blockchain crates (unpublished), pinned to the node release in use by git tag; the
+# tag and rust-toolchain.toml move together with the node
+lb-common-http-client            = { default-features = false, package = "logos-blockchain-common-http-client", git = "https://github.com/logos-blockchain/logos-blockchain", tag = "0.3.2" }
+lb-core                          = { default-features = false, package = "logos-blockchain-core", git = "https://github.com/logos-blockchain/logos-blockchain", tag = "0.3.2" }
+lb-key-management-system-service = { default-features = false, package = "logos-blockchain-key-management-system-service", git = "https://github.com/logos-blockchain/logos-blockchain", tag = "0.3.2" }
+lb-zone-sdk                      = { default-features = false, package = "logos-blockchain-zone-sdk", git = "https://github.com/logos-blockchain/logos-blockchain", tag = "0.3.2" }
 
 # the registration program's layouts (instructions, events, membership timing), from the
-# program's own repository
-rln-layouts   = { git = "https://github.com/doomcrack/logos-lez-rln", rev = "b175bc9a1d30e0123194e9e3003d6e1b9411fd6e" }
+# program's own repository: branch feat/rln-zone-events, the revision the testnet program
+# was deployed from (its rln-layouts sources are byte-identical to the earlier pin)
+rln-layouts   = { git = "https://github.com/logos-co/logos-lez-rln", rev = "15ff472a0e9b9b4b2c5da3ecab5b7cbd9d5a5a87" }
 
 # RLN (Zerokit, published 3.0.0: Poseidon BN254, Merkle trees, identity keys)
 rln           = { default-features = false, version = "3.0.0" }

@@ -12,7 +12,7 @@
         },
         "channel_id": "0101010101010101010101010101010101010101010101010101010101010101",
         "node_url": "http://127.0.0.1:8080",
-        "funding_key": "<unused by a follower: the key setup_sequencer.py writes into the home>",
+        "funding_key": "<any public key of the Bedrock node's wallet: a follower inscribes nothing>",
         "channel_params": {
             "minimum_sequencer_stake": 149,
             "posting_timeframe": 300,

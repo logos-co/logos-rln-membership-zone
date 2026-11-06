@@ -56,6 +56,19 @@ pub struct Block {
     pub block_id: u64,
     pub timestamp_ms: u64,
     pub events: Vec<Event>,
+    /// Privacy-preserving transactions in the block (any program). They carry no instruction
+    /// and emit no event, so the reader learns nothing from them; one that calls the
+    /// registration program changes the registry without this reader seeing it, which is why
+    /// the count is reported.
+    pub private_transaction_count: u32,
+}
+
+/// One transaction of a block as the decoder classifies it.
+enum Transaction {
+    /// A public transaction: the program's event, if the transaction called the program.
+    Public(Option<Event>),
+    /// A privacy-preserving transaction, skipped.
+    Private,
 }
 
 /// The LEZ Sequencer's JSON-RPC (`getLastBlockId`, `getBlockRange`, at most 1024 blocks per
@@ -163,10 +176,12 @@ impl SequencerLez {
         let timestamp_ms = c.u64()?;
         let tx_count = c.u32()?;
         let mut events = vec![];
+        let mut private_transaction_count = 0;
         for tx_index in 0..tx_count {
             match self.decode_transaction(&mut c) {
-                Ok(Some(event)) => events.push(event),
-                Ok(None) => {}
+                Ok(Transaction::Public(Some(event))) => events.push(event),
+                Ok(Transaction::Public(None)) => {}
+                Ok(Transaction::Private) => private_transaction_count += 1,
                 // The rest of the body cannot be located after a bad transaction.
                 Err(e) => bail!("LEZ block {block_id} tx {tx_index}: {e}"),
             }
@@ -175,17 +190,24 @@ impl SequencerLez {
             block_id,
             timestamp_ms,
             events,
+            private_transaction_count,
         })
     }
 
-    /// One `LeeTransaction`: `0` = Public(`PublicTransaction{message{program_account_id [32],
-    /// shard_selectors: Vec<[64]>, nonces: Vec<u128>, instruction_data: Vec<u8>, fee:
-    /// Option<FeeDeclaration>}, witness_set}`), `1` = PrivacyPreserving, whose layout is not
-    /// decoded here: a block holding one cannot be read past it (LEZ v0.3.1 layouts).
-    fn decode_transaction(&self, c: &mut Cursor<'_>) -> Result<Option<Event>> {
+    /// One `LeeTransaction` (LEZ v0.3.1 layouts): `0` = Public(`PublicTransaction{message{
+    /// program_account_id [32], shard_selectors: Vec<[64]>, nonces: Vec<u128>,
+    /// instruction_data: Vec<u8>, fee: Option<FeeDeclaration>}, witness_set}`), `1` =
+    /// PrivacyPreserving, skipped field by field (`skip_privacy_transaction`) so the
+    /// transactions after it still decode.
+    fn decode_transaction(&self, c: &mut Cursor<'_>) -> Result<Transaction> {
         let tag = c.take(1)?[0];
-        if tag != 0 {
-            bail!("privacy-preserving transactions are not decoded here");
+        match tag {
+            0 => {}
+            1 => {
+                skip_privacy_transaction(c)?;
+                return Ok(Transaction::Private);
+            }
+            other => bail!("unknown LeeTransaction tag {other}"),
         }
         let program = c.bytes32()?;
         let selectors = c.u32()?;
@@ -196,17 +218,17 @@ impl SequencerLez {
         let data = c.take(data_len)?.to_vec();
         self.skip_fee_and_witnesses(c)?;
         if program != self.program_account_id {
-            return Ok(None);
+            return Ok(Transaction::Public(None));
         }
         match self.decode_instruction(&data) {
-            Ok(event) => Ok(event),
+            Ok(event) => Ok(Transaction::Public(event)),
             Err(e) => {
                 println!(
                     "transaction to the program skipped ({} bytes): {e}; instruction {}",
                     data.len(),
                     hex::encode(&data)
                 );
-                Ok(None)
+                Ok(Transaction::Public(None))
             }
         }
     }
@@ -305,6 +327,54 @@ impl SequencerLez {
     }
 }
 
+/// Skip one `PrivacyPreservingTransaction` after its tag (LEZ v0.3.1, every struct
+/// borsh-derived in declaration order): `Message{public_actions: Vec<PublicActionWithID{
+/// account_id [32], effects: Vec<DeferredPublicEffect{program_account_id [32],
+/// shard_program_account_id [32], data: Vec<u8>}>}>, nonces: Vec<u128>, private_actions:
+/// Vec<PrivateAction{nullifier [32], root [32], commitment [32], encrypted_post_state{
+/// ciphertext: Vec<u8>, epk: Vec<u8>, view_tag u8}}>, block_validity_window{from: Option<u64>,
+/// to: Option<u64>}, timestamp_validity_window{same}, program_image_claims:
+/// Vec<ProgramImageClaim: 0 Disclosed{account_id [32], image_id [32]} | 1 Undisclosed{root
+/// [32]}>}` then `WitnessSet{signatures_and_public_keys: Vec<([64], [32])>, proof: Vec<u8>}`.
+/// Nothing in it is read: the transaction carries no instruction and emits no event.
+fn skip_privacy_transaction(c: &mut Cursor<'_>) -> Result<()> {
+    // Message.public_actions
+    for _ in 0..c.u32()? {
+        c.take(32)?;
+        for _ in 0..c.u32()? {
+            c.take(64)?;
+            c.skip_bytes()?;
+        }
+    }
+    // Message.nonces
+    let nonces = c.u32()?;
+    c.take(nonces as usize * 16)?;
+    // Message.private_actions
+    for _ in 0..c.u32()? {
+        c.take(96)?;
+        c.skip_bytes()?;
+        c.skip_bytes()?;
+        c.take(1)?;
+    }
+    // Message.block_validity_window, Message.timestamp_validity_window
+    for _ in 0..4 {
+        c.skip_option(8)?;
+    }
+    // Message.program_image_claims
+    for _ in 0..c.u32()? {
+        match c.take(1)?[0] {
+            0 => c.take(64)?,
+            1 => c.take(32)?,
+            other => bail!("unknown ProgramImageClaim tag {other}"),
+        };
+    }
+    // WitnessSet
+    let witnesses = c.u32()?;
+    c.take(witnesses as usize * 96)?;
+    c.skip_bytes()?;
+    Ok(())
+}
+
 /// A borsh reader over fixed layouts: everything decoded here is fixed size or
 /// length-prefixed, so a plain field-by-field read is the whole decoder.
 struct Cursor<'a>(&'a [u8]);
@@ -333,6 +403,22 @@ impl Cursor<'_> {
 
     fn bytes32(&mut self) -> Result<[u8; 32]> {
         Ok(<[u8; 32]>::try_from(self.take(32)?).expect("32 bytes"))
+    }
+
+    /// Skip a borsh `Vec<u8>`: `u32` length, then the bytes.
+    fn skip_bytes(&mut self) -> Result<()> {
+        let len = self.u32()? as usize;
+        self.take(len)?;
+        Ok(())
+    }
+
+    /// Skip a borsh `Option<T>` of a `T` that is `len` bytes: a `0` tag, or `1` then `T`.
+    fn skip_option(&mut self, len: usize) -> Result<()> {
+        match self.take(1)?[0] {
+            0 => Ok(()),
+            1 => self.take(len).map(|_| ()),
+            other => bail!("invalid Option tag {other}"),
+        }
     }
 }
 
@@ -478,6 +564,100 @@ mod test {
         assert_eq!(decoded.block_id, 42);
         assert_eq!(decoded.timestamp_ms, 1_234);
         assert!(decoded.events.is_empty());
+        assert_eq!(decoded.private_transaction_count, 0);
+    }
+
+    /// A privacy-preserving transaction (every field populated) between two public ones: it
+    /// is skipped field by field, counted, and the `Register` after it still decodes.
+    #[test]
+    fn test_decode_block_skips_a_privacy_preserving_transaction() {
+        use rln_layouts::Instruction;
+        let program = [1u8; 32];
+        let lez = SequencerLez::new("http://unused".into(), program, [7; 32]);
+        let bytes = |n: u32, fill: u8| {
+            let mut b = n.to_le_bytes().to_vec();
+            b.extend(vec![fill; n as usize]);
+            b
+        };
+        let mut private = vec![1u8];
+        // Message.public_actions: one action with one effect
+        private.extend(1u32.to_le_bytes());
+        private.extend([10u8; 32]);
+        private.extend(1u32.to_le_bytes());
+        private.extend([11u8; 32]);
+        private.extend([12u8; 32]);
+        private.extend(bytes(3, 13));
+        // Message.nonces: one
+        private.extend(1u32.to_le_bytes());
+        private.extend(9u128.to_le_bytes());
+        // Message.private_actions: one
+        private.extend(1u32.to_le_bytes());
+        private.extend([14u8; 96]);
+        private.extend(bytes(5, 15));
+        private.extend(bytes(33, 16));
+        private.push(17);
+        // Message.block_validity_window {Some(7), None}, timestamp_validity_window {None, Some(8)}
+        private.push(1);
+        private.extend(7u64.to_le_bytes());
+        private.push(0);
+        private.push(0);
+        private.push(1);
+        private.extend(8u64.to_le_bytes());
+        // Message.program_image_claims: Disclosed then Undisclosed
+        private.extend(2u32.to_le_bytes());
+        private.push(0);
+        private.extend([18u8; 64]);
+        private.push(1);
+        private.extend([19u8; 32]);
+        // WitnessSet: one signature + key, then the proof
+        private.extend(1u32.to_le_bytes());
+        private.extend([20u8; 96]);
+        private.extend(bytes(4, 21));
+
+        let public = |to: [u8; 32], data: &[u8]| {
+            let mut b = vec![0u8];
+            b.extend(to);
+            b.extend(0u32.to_le_bytes());
+            b.extend(1u32.to_le_bytes());
+            b.extend(1u128.to_le_bytes());
+            b.extend((data.len() as u32).to_le_bytes());
+            b.extend(data);
+            b.push(0);
+            b.extend(1u32.to_le_bytes());
+            b.extend([3u8; 96]);
+            b
+        };
+        let register = borsh::to_vec(&Instruction::Register {
+            tree_id: [7; 32],
+            id_commitment: fr_to_bytes_le(&rln::prelude::Fr::from(5u64)),
+            rate_limit: 100,
+            now_ms: 5_000,
+            price_per_unit: 10_000,
+            active_duration_sec: 2,
+            grace_period_duration_sec: 1,
+            leaf_index: 0,
+        })
+        .unwrap();
+        let mut block = vec![];
+        block.extend(43u64.to_le_bytes());
+        block.extend([0u8; 64]);
+        block.extend(2_345u64.to_le_bytes());
+        block.extend(3u32.to_le_bytes());
+        block.extend(public([4u8; 32], b"other program"));
+        block.extend(private);
+        block.extend(public(program, &register));
+        block.push(0);
+        let decoded = lez.decode_block(&block).unwrap();
+        assert_eq!(decoded.private_transaction_count, 1);
+        assert_eq!(decoded.events.len(), 1);
+        assert!(matches!(
+            decoded.events[0],
+            Event::Registered {
+                leaf_index: 0,
+                rate_limit: 100,
+                ..
+            }
+        ));
     }
 
     /// LEZ testnet block 50056 as `getBlockRange` returns it: three public

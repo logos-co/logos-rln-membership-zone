@@ -78,15 +78,17 @@ zone-sequencer/                   the Zone sequencer, with its HTTP registry API
   src/main.rs                     Zone SDK loop: publish, follow to finality, poll LEZ
 lez-sequencer/                    config template to run your own LEZ sequencer as the block source
 docs/setup-rln-membership-zone.md setup, operation, monitoring, troubleshooting, cleanup
-logos-blockchain/                 git submodule pinned to node release 0.3.2 (Zone SDK path dependencies)
 ```
+
+The Zone SDK and the other `logos-blockchain` crates are git dependencies in `Cargo.toml`,
+pinned to the tag of the node release in use (0.3.2).
 
 ## Quick start
 
 ### Prerequisites
 
 - Rust, with the toolchain pinned in `rust-toolchain.toml`
-  to the channel of the `logos-blockchain` submodule.
+  to the channel the pinned `logos-blockchain` tag builds with.
 - Build tools the `logos-blockchain` crates need on Linux:
   `build-essential pkg-config libssl-dev clang cmake protobuf-compiler unzip`
   (`rust-rapidsnark` downloads a prebuilt library and unzips it at build time).
@@ -99,7 +101,7 @@ Needs a synced Logos Blockchain testnet node on `127.0.0.1:8080` whose wallet ho
 (mined PoW rewards on the `PoWClaim` key are enough).
 
 ```bash
-git clone --recurse-submodules https://github.com/logos-co/logos-rln-membership-zone
+git clone https://github.com/logos-co/logos-rln-membership-zone
 cd logos-rln-membership-zone
 
 cp .env.example .env             # set FUNDING_PK to the node's PoWClaim public key
@@ -128,8 +130,8 @@ cargo clippy -p zone-sequencer --all-targets -- -D warnings
 
 The unit tests cover the derivation rules (a `Registered` event sets the leaf and the proof
 path, expiry removes it at the LEZ timestamp), the tree store surviving a reopen, and the
-decoding of LEZ blocks and the program's instructions (another registry's are dropped),
-including a real testnet block.
+decoding of LEZ blocks and the program's instructions (another registry's are dropped, a
+privacy-preserving transaction is skipped and counted), including a real testnet block.
 
 ## References
 

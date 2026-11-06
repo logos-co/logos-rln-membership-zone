@@ -52,10 +52,11 @@ A batch costs one `CHANNEL_INSCRIBE` (59 exec gas) plus the fee `TRANSFER` (590)
 bytes of the transaction, capped by `MAX_TX_FEE` (default 1,000,000 atomic = 0.001 LGO per
 publish, the real fee is far lower). No funds are moved anywhere else.
 
-The Zone SDK version must match the node release: the git submodule `logos-blockchain` is
-pinned to the tag of the node in use (0.3.2 today). A newer node answers the backfill with
-blocks the older SDK cannot parse (`Failed to fetch immutable blocks ... Failed to parse
-response`, repeating forever); bump the submodule and `rust-toolchain.toml` then.
+The Zone SDK version must match the node release: the `logos-blockchain` crates in
+`Cargo.toml` are git dependencies pinned to the tag of the node in use (0.3.2 today). A
+newer node answers the backfill with blocks the older SDK cannot parse (`Failed to fetch
+immutable blocks ... Failed to parse response`, repeating forever); bump the tag and
+`rust-toolchain.toml` then.
 
 ## 3. Zone sequencer
 
@@ -63,7 +64,7 @@ response`, repeating forever); bump the submodule and `rust-toolchain.toml` then
 
 ```bash
 cd ~
-git clone --recurse-submodules https://github.com/logos-co/logos-rln-membership-zone
+git clone https://github.com/logos-co/logos-rln-membership-zone
 cd logos-rln-membership-zone
 cp .env.example .env
 sed -i "s/^FUNDING_PK=.*/FUNDING_PK=$(yq .public_keys.PoWClaim ~/keystore.yaml)/" .env
@@ -175,7 +176,10 @@ proves, through its grace period included) or `removed` for `expired`, `slashed`
 
 `/` adds `zone_channel_id`, `lez_source`, `first_lez_block_id` and `covered_to_lez_block_id`
 (the last block a published batch covers), `lez_events` (the program's events applied:
-`registered`, `extended`, `slashed`, `erased`), `tree` (`active_leaves`, `removed_leaves`,
+`registered`, `extended`, `slashed`, `erased`, and `private_transactions`: privacy-preserving
+transactions seen in the LEZ blocks, any program; they carry no instruction and emit no
+event, so the reader skips them with a warning in the log, and a registry change made
+through one is not in this tree), `tree` (`active_leaves`, `removed_leaves`,
 and `changes` the rules made beyond the one insert per `Registered`: `removed_expired` by the
 LEZ clock, `removed_ended` by a slash or an erase while active, `reinserted` by an `Extended`
 that landed after the reader had expired the leaf), `pending_changes` (waiting for the next
@@ -261,20 +265,42 @@ finality. A LEZ sequencer whose key holds no stake does not produce blocks (log:
 entry for our own sequencer key; aborting block production`) but follows the channel and
 serves the same JSON-RPC. It is a full LEZ node: RISC Zero execution, RocksDB, a few GB.
 
+What it costs and how it compares to the public endpoint:
+
+- Latency: a follower sees a block once its inscription is in a Bedrock block (the channel's
+  adopted view, before finality), so it trails the public sequencer by the L1 inclusion time
+  of the inscription (Bedrock slot plus mempool) but leads the LEZ indexer, which waits for
+  finality. Sequencer gossip carries transactions, slash approvals and channel-config
+  messages, not blocks, so `gossip.bootstrap_peers` does not make a follower faster.
+- Initial sync: the channel is replayed from its genesis, every block re-executed through
+  RISC Zero (execution only, no proving). Expect hours for the testnet's history, not
+  minutes; nothing is measured yet.
+- Resources: a Bedrock node of your own (the one the Zone SDK already uses, port 8080), the
+  RISC Zero toolchain for the build (the first build takes long; `cargo-risczero` and
+  `r0vm` per the LEZ README), RocksDB for the chain, a few GB.
+- Events: the sequencer RPC serves none at v0.3.x and v0.4.0-rc1, so a follower feeds the
+  Zone sequencer exactly like the public endpoint does (section 4): the program's
+  transactions, decoded with `rln-layouts`. A `getEvents` method mirroring the indexer's
+  exists as a local LEZ branch (`feat/sequencer-rpc-events`, not proposed upstream yet); if
+  it ever ships, the events become a second input of the same derivation.
+
+Versions: run the tag the testnet runs. LEZ `dev` carries the v0.4 wire format
+(`BlockBody.reverted`, public transactions as `PublicExecution`) and does not follow the
+v0.3.x testnet channel.
+
 What you need from the LEZ team: the testnet genesis (the `genesis` section of their
-sequencer config), the tag the testnet runs, and optionally `gossip.bootstrap_peers` to
-receive blocks live instead of only through Bedrock.
+sequencer config) and the tag the testnet runs.
 
 ```bash
 cd ~
-git clone --depth 1 --branch v0.3.1 https://github.com/logos-blockchain/logos-execution-zone
+git clone --depth 1 --branch v0.3.2 https://github.com/logos-blockchain/logos-execution-zone
 cd logos-execution-zone
 
-# A home with its own wallet and Bedrock identity; no funds needed to follow.
-tools/setup_sequencer.py ~/logos-rln-membership-zone/lez-sequencer/home \
-    --node-url http://127.0.0.1:8080
-
-# Replace the home's config with the template, then fill in the testnet genesis.
+# The home from the template, then fill in the testnet genesis and `funding_key` (any public
+# key of the Bedrock node's wallet: a follower inscribes nothing, the field is only required).
+# The node writes its `bedrock_signing_key` into the home on first start; no funds needed to
+# follow. (`tools/setup_sequencer.py` of v0.3.1 is gone in v0.3.2.)
+mkdir -p ~/logos-rln-membership-zone/lez-sequencer/home
 cp ~/logos-rln-membership-zone/lez-sequencer/sequencer_config.json \
    ~/logos-rln-membership-zone/lez-sequencer/home/sequencer_config.json
 $EDITOR ~/logos-rln-membership-zone/lez-sequencer/home/sequencer_config.json
@@ -323,7 +349,7 @@ fee per batch), `lib_slot` against `slot` (finality), the time from `pending` to
 ## 7. Troubleshooting
 
 - `Failed to fetch immutable blocks ... Failed to parse response` repeating: Zone SDK older
-  than the node. Bump the `logos-blockchain` submodule to the node's tag.
+  than the node. Bump the `logos-blockchain` git tag in `Cargo.toml` to the node's tag.
 - `unzip: not found` while building: `sudo apt-get install -y unzip`.
 - `missing manifest in toolchain '1.98.1-...'`: a half-installed toolchain;
   `rustup toolchain uninstall 1.98.1 && rustup toolchain install 1.98.1`.

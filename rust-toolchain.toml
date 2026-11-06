@@ -1,4 +1,4 @@
-# Same channel as logos-blockchain/rust-toolchain.toml at the pinned submodule tag.
+# Same channel as logos-blockchain/rust-toolchain.toml at the tag pinned in Cargo.toml.
 [toolchain]
 channel = "1.99.0"
 components = ["clippy", "rustfmt"]

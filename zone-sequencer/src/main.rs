@@ -278,6 +278,13 @@ async fn apply_range(
                 let names: Vec<_> = block.events.iter().map(|e| e.name()).collect();
                 println!("LEZ block {}: events {}", block.block_id, names.join(", "));
             }
+            if block.private_transaction_count > 0 {
+                println!(
+                    "WARNING: LEZ block {}: {} privacy-preserving transaction(s) skipped; a \
+                     registry change made through one is not in this tree",
+                    block.block_id, block.private_transaction_count
+                );
+            }
         }
         registry.apply_blocks(&blocks)?;
         registry.save()?;

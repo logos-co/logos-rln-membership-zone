@@ -100,16 +100,22 @@ pub struct Stats {
     pub removed_ended: u64,
     /// Leaves put back by an `Extended` that landed after the reader had expired them.
     pub reinserted: u64,
+    /// Privacy-preserving transactions seen in the LEZ blocks applied (any program): they
+    /// carry no instruction and emit no event, so a registry change made through one is not
+    /// in this tree.
+    pub private_transactions: u64,
 }
 
 impl Stats {
-    /// The program's events applied, by name.
+    /// The program's events applied, by name, and the privacy-preserving transactions the
+    /// reader could not read.
     pub fn lez_events(&self) -> Value {
         serde_json::json!({
             "registered": self.registered,
             "extended": self.extended,
             "slashed": self.slashed,
             "erased": self.erased,
+            "private_transactions": self.private_transactions,
         })
     }
 
@@ -300,6 +306,7 @@ impl Reader {
     /// order.
     pub fn apply_block(&mut self, block: &Block) -> Result<Vec<Change>> {
         let mut changes = vec![];
+        self.stats.private_transactions += u64::from(block.private_transaction_count);
         for event in &block.events {
             match event {
                 Event::Registered {
@@ -499,6 +506,7 @@ mod test {
             block_id,
             timestamp_ms,
             events,
+            private_transaction_count: 0,
         }
     }
 
