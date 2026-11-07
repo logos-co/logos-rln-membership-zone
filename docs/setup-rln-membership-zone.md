@@ -21,6 +21,7 @@ Bedrock node (channel) and HTTP API (Modules).
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential pkg-config libssl-dev clang cmake protobuf-compiler unzip git curl jq
+sudo apt-get install -y libpcsclite-dev    # lez-rln bins (mint_payer, register_member): pcsc-sys via the LEZ wallet
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source ~/.cargo/env
 ```
@@ -87,7 +88,7 @@ sed -i "s/^FUNDING_PK=.*/FUNDING_PK=$(yq .public_keys.PoWClaim ~/keystore.yaml)/
 | `POLL_SEC` | 10 | Seconds between LEZ polls |
 | `HEARTBEAT_SEC` | 3600 | Publish an empty batch after this long without one |
 | `STALE_REFUND_SLOTS` | 0 | LIB slots an unmined batch waits before the Zone SDK re-funds it under a new transaction (0 disables). Off: the mempool is FIFO, a re-funded transaction goes to the back of the queue; the SDK default, 30, re-funded at every finalized block |
-| `DATA_DIR` | `zone-sequencer/data` | `key.hex` and the tree store `tree/` |
+| `DATA_DIR` | `zone-sequencer/data` | `key.hex` and the tree store `tree/`. Gitignored: copy `key.hex` outside the checkout after the first start, a deleted or re-cloned checkout takes the channel key with it |
 | `HTTP_ADDR` | `127.0.0.1:3000` | HTTP API bind address |
 
 ### Run
