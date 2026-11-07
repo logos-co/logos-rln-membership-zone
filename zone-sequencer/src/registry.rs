@@ -50,6 +50,10 @@ pub struct Published {
     pub root_after: [u8; 32],
     pub change_count: usize,
     pub published_at_unix: u64,
+    /// The L1 slot at publish time: where the finality scan starts looking for it. `None` for
+    /// a batch published before the slot was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at_slot: Option<u64>,
     #[serde(flatten)]
     pub status: Status,
 }
@@ -61,6 +65,9 @@ pub struct History {
     /// Last LEZ block a published batch covers.
     pub covered_to: u64,
     pub published: Vec<Published>,
+    /// The L1 slot the finality scan has read the finalized blocks up to.
+    #[serde(default)]
+    pub finality_scanned_to: Option<u64>,
 }
 
 pub struct Registry {
@@ -110,6 +117,7 @@ impl Registry {
                 first_lez_block_id,
                 covered_to: first_lez_block_id.saturating_sub(1),
                 published: vec![],
+                finality_scanned_to: None,
             },
         };
         let checkpoint = extra.get("checkpoint").filter(|c| !c.is_null()).cloned();
@@ -224,6 +232,7 @@ impl Registry {
         tx_hash: [u8; 32],
         batch: &Batch,
         payload: Vec<u8>,
+        published_at_slot: Option<u64>,
     ) {
         let mut root_after = [0u8; 32];
         root_after.copy_from_slice(&batch.root_after);
@@ -235,6 +244,7 @@ impl Registry {
             root_after,
             change_count: batch.changes.len(),
             published_at_unix: now_unix(),
+            published_at_slot,
             status: Status::Pending,
         });
         self.history.covered_to = batch.to_lez_block_id;
@@ -267,6 +277,49 @@ impl Registry {
     /// A finalized batch is never published again nor compared again: its payload goes.
     pub fn drop_payload(&mut self, msg_id: &[u8; 32]) {
         self.payloads.remove(msg_id);
+    }
+
+    /// Bedrock finality reached the batch `msg_id` at `l1_slot`, carrying `tx_hash` and
+    /// `payload`: mark it, unless it is not ours, already final, or the payload on record (when
+    /// there is one) differs. Returns the entry marked.
+    pub fn on_finalized(
+        &mut self,
+        msg_id: &[u8; 32],
+        tx_hash: [u8; 32],
+        payload: &[u8],
+        l1_slot: u64,
+    ) -> Result<Option<&Published>, FinalizeRefused> {
+        // The message id is ours (it is in the history, signed by our key); the payload on
+        // record, when there is one, must be the one finalized.
+        if self.payload(msg_id).is_some_and(|p| p[..] != payload[..]) {
+            return Err(FinalizeRefused::PayloadDiffers);
+        }
+        let Some(entry) = self.published_mut(msg_id) else {
+            return Err(FinalizeRefused::NotOurs);
+        };
+        if matches!(entry.status, Status::Finalized { .. }) {
+            return Ok(None);
+        }
+        entry.status = Status::Finalized { l1_slot };
+        entry.tx_hash = tx_hash;
+        self.drop_payload(msg_id);
+        Ok(self.history.published.iter().find(|p| p.msg_id == *msg_id))
+    }
+
+    /// The L1 slot the finality scan starts at: after the last slot scanned, and no earlier
+    /// than the oldest batch still waiting with a slot on record; `None` when nothing waits.
+    pub fn finality_scan_from(&self) -> Option<u64> {
+        let oldest = self
+            .history
+            .published
+            .iter()
+            .filter(|p| !matches!(p.status, Status::Finalized { .. } | Status::Orphaned))
+            .filter_map(|p| p.published_at_slot)
+            .min()?;
+        Some(match self.history.finality_scanned_to {
+            Some(scanned) => oldest.max(scanned + 1),
+            None => oldest,
+        })
     }
 
     pub fn published_mut(&mut self, msg_id: &[u8; 32]) -> Option<&mut Published> {
@@ -336,6 +389,15 @@ impl Registry {
     }
 }
 
+/// Why `Registry::on_finalized` left a batch as it was.
+#[derive(Debug, PartialEq)]
+pub enum FinalizeRefused {
+    /// The message id is not in the history.
+    NotOurs,
+    /// The payload finalized is not the one published under that message id.
+    PayloadDiffers,
+}
+
 /// A root of the valid-root window: the batch that produced it and how far it was carried.
 pub struct RootEntry<'a> {
     pub produced_by: &'a Published,
@@ -376,7 +438,7 @@ mod test {
     }
 
     #[test]
-    fn test_roots_window_is_ordered_by_recency_when_a_root_comes_back() {
+    fn test_roots_window_finality_marks_and_payloads_survive_a_restart() {
         let dir = std::env::temp_dir().join(format!("zone-roots-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
@@ -387,7 +449,7 @@ mod test {
                 changes: vec![],
                 root_after: vec![root; 32],
             };
-            registry.on_published([n; 32], [n; 32], &batch, vec![]);
+            registry.on_published([n; 32], [n; 32], &batch, vec![root], Some(u64::from(n)));
         };
         // Root A, a heartbeat carrying A, root B, back to A (a leaf inserted then removed).
         publish(&mut registry, 1, 0xA);
@@ -407,7 +469,40 @@ mod test {
             .collect();
         assert_eq!(runs, vec![(0xA, 4, 4), (0xB, 3, 3), (0xA, 1, 2)]);
         assert_eq!(registry.roots(1)[0].produced_by.root_after[0], 0xA);
+        // Finality: the oldest waiting batch is where the scan starts; a wrong payload is
+        // refused; a batch marked final drops its payload and leaves the scan range.
+        assert_eq!(registry.finality_scan_from(), Some(1));
+        assert_eq!(
+            registry.on_finalized(&[1; 32], [9; 32], &[0xB], 500).err(),
+            Some(FinalizeRefused::PayloadDiffers)
+        );
+        assert_eq!(
+            registry.on_finalized(&[7; 32], [9; 32], &[], 500).err(),
+            Some(FinalizeRefused::NotOurs)
+        );
+        let marked = registry
+            .on_finalized(&[1; 32], [9; 32], &[0xA], 500)
+            .unwrap()
+            .unwrap();
+        assert_eq!(marked.status, Status::Finalized { l1_slot: 500 });
+        assert!(
+            registry
+                .on_finalized(&[1; 32], [9; 32], &[0xA], 500)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(registry.finality_scan_from(), Some(2));
+        registry.history.finality_scanned_to = Some(600);
+        assert_eq!(registry.finality_scan_from(), Some(601));
+        // The payloads of the batches not finalized yet survive a restart.
+        registry.save().unwrap();
         registry.close().unwrap();
+        drop(registry);
+        let registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
+        assert_eq!(registry.payload(&[1; 32]), None);
+        assert_eq!(registry.payload(&[4; 32]), Some(&vec![0xA]));
+        assert_eq!(registry.history.finality_scanned_to, Some(600));
+        drop(registry);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

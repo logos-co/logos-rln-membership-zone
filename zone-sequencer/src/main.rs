@@ -33,11 +33,11 @@ use lb_core::mantle::{
 };
 use lb_key_management_system_service::keys::{ED25519_SECRET_KEY_SIZE, Ed25519Key, ZkPublicKey};
 use lb_zone_sdk::{
-    CommonHttpClient,
-    adapter::NodeHttpClient,
+    CommonHttpClient, Slot,
+    adapter::{Node as _, NodeHttpClient},
     sequencer::{
         Error as SeqError, Event, FinalizedOp, FinalizedTx, FundingConfig, SequencerCheckpoint,
-        SequencerConfig, ZoneSequencer,
+        SequencerConfig, ZoneSequencer, channel_inscriptions,
     },
 };
 use prost::Message as _;
@@ -48,8 +48,14 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     http::{AppState, Shared},
     lez::{MAX_BLOCK_RANGE_LEN, SequencerLez},
-    registry::{Registry, Status, now_unix},
+    registry::{FinalizeRefused, Published, Registry, Status, now_unix},
 };
+
+/// Seconds between two finality scans (`reconcile_finality`).
+const FINALITY_SCAN_SEC: u64 = 300;
+/// L1 slots one `immutable_blocks` request covers in the finality scan (the Zone SDK's own
+/// backfill page).
+const FINALITY_SCAN_PAGE: u64 = 100;
 
 /// The registration program on the testnet LEZ: its account id
 /// (`HAxY9SiqUjJQHdtvazFDWFCxn1Jw1dtbUGio8DMC4bBw` in base58).
@@ -355,8 +361,13 @@ async fn main() -> Result<()> {
         stale_refund_slots: args.stale_refund_slots,
         ..SequencerConfig::new(funding)
     };
-    let mut sdk =
-        ZoneSequencer::init_with_config(channel_id, signing_key, node, sdk_config, checkpoint);
+    let mut sdk = ZoneSequencer::init_with_config(
+        channel_id,
+        signing_key,
+        node.clone(),
+        sdk_config,
+        checkpoint,
+    );
 
     // HTTP API.
     let state = AppState {
@@ -439,6 +450,8 @@ async fn main() -> Result<()> {
         .map_or(0, |p| p.published_at_unix);
     let mut tick = tokio::time::interval(Duration::from_secs(args.poll_sec.max(1)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut finality_tick = tokio::time::interval(Duration::from_secs(FINALITY_SCAN_SEC));
+    finality_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -544,13 +557,19 @@ async fn main() -> Result<()> {
                     Ok(inscription) => inscription,
                     Err(e) => { println!("batch [{}..{}] does not fit one inscription: {e:?}", batch.from_lez_block_id, batch.to_lez_block_id); continue; }
                 };
+                // The L1 slot now, where the finality scan will start looking for this batch;
+                // without it the scan skips the batch and the SDK stream alone reports it.
+                let published_at_slot = match node.consensus_info().await {
+                    Ok(info) => Some(u64::from(info.cryptarchia_info.slot)),
+                    Err(e) => { println!("cannot read the L1 slot from the node, the batch goes out without one: {e}"); None }
+                };
                 match sdk.handle().publish(inscription).await {
                     Ok((result, checkpoint)) => {
                         let msg = msg_bytes(&result.tx.inscription().this_msg);
                         let tx_hash = tx_bytes(&result.inscription_id());
                         {
                             let mut registry = registry.write().expect("registry lock");
-                            registry.on_published(msg, tx_hash, &batch, payload);
+                            registry.on_published(msg, tx_hash, &batch, payload, published_at_slot);
                             registry.save()?;
                         }
                         save_checkpoint(&registry, &checkpoint)?;
@@ -571,6 +590,13 @@ async fn main() -> Result<()> {
                     Err(e) => println!("publish failed: {e}"),
                 }
             },
+            _ = finality_tick.tick(), if ready => {
+                match reconcile_finality(&node, channel_id, &registry).await {
+                    Ok(0) => {}
+                    Ok(n) => println!("finality scan: {n} batch(es) marked finalized"),
+                    Err(e) => println!("finality scan failed: {e}"),
+                }
+            }
             _ = tokio::signal::ctrl_c() => break,
         }
     }
@@ -579,8 +605,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Mark our batches Finalized as Bedrock finality reaches them, with the L1 slot; returns
-/// the message ids that became Finalized now.
+/// Mark our batches Finalized as Bedrock finality reaches them (the Zone SDK stream), with
+/// the L1 slot; returns the message ids that became Finalized now.
 fn finalize(registry: &Shared, finalized: &[FinalizedTx]) -> Vec<[u8; 32]> {
     let mut done = vec![];
     for tx in finalized {
@@ -590,40 +616,118 @@ fn finalize(registry: &Shared, finalized: &[FinalizedTx]) -> Vec<[u8; 32]> {
             };
             let msg = msg_bytes(&info.this_msg);
             let mut registry = registry.write().expect("registry lock");
-            // The message id is ours (it is in the history, signed by our key); the payload
-            // on record, when there is one, must be the one finalized.
-            let payload_differs = registry
-                .payload(&msg)
-                .is_some_and(|p| p[..] != info.payload[..]);
-            let Some(entry) = registry.published_mut(&msg) else {
-                println!(
-                    "finalized inscription msg {} is not one of ours",
-                    hex::encode(&msg[..4])
-                );
-                continue;
-            };
-            if matches!(entry.status, Status::Finalized { .. }) {
-                continue;
-            }
-            if payload_differs {
-                println!(
-                    "finalized msg {} carries a different payload than we published; left as is",
-                    hex::encode(&msg[..4])
-                );
-                continue;
-            }
             let l1_slot = tx.l1_slot.into_inner();
-            entry.status = Status::Finalized { l1_slot };
-            entry.tx_hash = tx_bytes(&tx.tx_hash);
-            println!(
-                "batch [{}..{}] FINALIZED at L1 slot {l1_slot}: root {}.. is a valid root",
-                entry.from_lez_block_id,
-                entry.to_lez_block_id,
-                hex::encode(&entry.root_after[..4])
-            );
-            registry.drop_payload(&msg);
-            done.push(msg);
+            if mark_finalized(
+                &mut registry,
+                &msg,
+                tx_bytes(&tx.tx_hash),
+                &info.payload,
+                l1_slot,
+                "",
+            ) {
+                done.push(msg);
+            }
         }
     }
     done
+}
+
+/// `Registry::on_finalized` with its outcome logged; true when the batch was marked now.
+fn mark_finalized(
+    registry: &mut Registry,
+    msg: &[u8; 32],
+    tx_hash: [u8; 32],
+    payload: &[u8],
+    l1_slot: u64,
+    how: &str,
+) -> bool {
+    match registry.on_finalized(msg, tx_hash, payload, l1_slot) {
+        Ok(Some(Published {
+            from_lez_block_id,
+            to_lez_block_id,
+            root_after,
+            ..
+        })) => {
+            println!(
+                "batch [{from_lez_block_id}..{to_lez_block_id}] FINALIZED at L1 slot {l1_slot}{how}: \
+                 root {}.. is a valid root",
+                hex::encode(&root_after[..4])
+            );
+            true
+        }
+        Ok(None) => false,
+        Err(FinalizeRefused::NotOurs) => {
+            println!(
+                "finalized inscription msg {} is not one of ours",
+                hex::encode(&msg[..4])
+            );
+            false
+        }
+        Err(FinalizeRefused::PayloadDiffers) => {
+            println!(
+                "finalized msg {} carries a different payload than we published; left as is",
+                hex::encode(&msg[..4])
+            );
+            false
+        }
+    }
+}
+
+/// The finality the SDK stream may have missed (a restart between the event and the save, a
+/// bug like the one of 2026-11-08): read the finalized L1 blocks from the oldest batch still
+/// waiting up to the LIB and mark every batch of ours found there. Idempotent with the stream
+/// path; the scan cursor is kept in the history so a slot is read once.
+async fn reconcile_finality(
+    node: &NodeHttpClient,
+    channel_id: ChannelId,
+    registry: &Shared,
+) -> Result<usize> {
+    let Some(from) = registry.read().expect("registry lock").finality_scan_from() else {
+        return Ok(0);
+    };
+    let lib = u64::from(
+        node.consensus_info()
+            .await
+            .map_err(|e| anyhow!("consensus info: {e}"))?
+            .cryptarchia_info
+            .lib_slot,
+    );
+    if from > lib {
+        return Ok(0);
+    }
+    let mut marked = 0;
+    let mut page_from = from;
+    while page_from <= lib {
+        let page_to = lib.min(page_from + FINALITY_SCAN_PAGE - 1);
+        let blocks = node
+            .immutable_blocks(Slot::from(page_from), Slot::from(page_to))
+            .await
+            .map_err(|e| anyhow!("immutable blocks {page_from}..{page_to}: {e}"))?;
+        let mut registry = registry.write().expect("registry lock");
+        for block in &blocks {
+            let l1_slot = u64::from(block.header.slot);
+            for tx in &block.transactions {
+                for info in channel_inscriptions(tx, channel_id) {
+                    let msg = msg_bytes(&info.this_msg);
+                    if registry.published_mut(&msg).is_none() {
+                        continue;
+                    }
+                    if mark_finalized(
+                        &mut registry,
+                        &msg,
+                        tx_bytes(&info.tx_hash),
+                        &info.payload,
+                        l1_slot,
+                        " (finality scan)",
+                    ) {
+                        marked += 1;
+                    }
+                }
+            }
+        }
+        registry.history.finality_scanned_to = Some(page_to);
+        registry.save()?;
+        page_from = page_to + 1;
+    }
+    Ok(marked)
 }

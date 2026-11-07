@@ -120,7 +120,10 @@ What happens, in order:
    most one batch in flight.
 5. Each batch is `pending` from publish, `adopted` once in a Bedrock block, `finalized`
    once in finalized history (8 to 10 hours later, the log prints the L1 slot), or
-   `orphaned` after a reorg, in which case it is published again.
+   `orphaned` after a reorg, in which case it is published again. Finality comes from the
+   Zone SDK stream, and every 5 minutes a scan of the finalized L1 blocks from the oldest
+   batch still waiting up to the LIB marks what the stream may have missed (a restart in
+   between); the log says `(finality scan)` then.
 
 Ctrl-C stops it. The next start opens the tree store and continues: the Zone SDK from its
 checkpoint, the batches from the history, the tree from where it was, and only the LEZ
