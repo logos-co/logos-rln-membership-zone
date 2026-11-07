@@ -33,18 +33,27 @@ funding_key() {
     echo "$key"
 }
 
+# The wallet config in every shape a LEZ wallet has read it: `sequencer` (v0.3.1, the
+# lez-rln pin), `sequencers` (v0.3.0), flat `sequencer_addr` (the module). No struct denies
+# unknown fields, so one file serves all (as lez-rln's own tools/deployments do).
+write_wallet_config() {
+    jq -n --arg s "$LEZ_SEQUENCER_URL/" '{sequencer_addr:$s, sequencer:{sequencer_addr:$s},
+        sequencers:[{sequencer_addr:$s}], seq_poll_timeout:"30s", seq_tx_poll_max_blocks:15,
+        seq_poll_max_retries:10, seq_block_poll_max_amount:100, gas_limit:10000000,
+        multi_sequencer_client_config:{distribution_limit:1, calibration_limit:3}}' \
+        > "$PAYER_WALLET/wallet_config.json"
+}
+
 step_payer() {
     if [ -n "$(state_get payer)" ] && [ -f "$PAYER_WALLET/storage.json" ]; then
+        write_wallet_config
         say "payer $(state_get payer) (wallet $PAYER_WALLET)"
         return 0
     fi
     local mint_payer payer
     mint_payer=$(lez_rln_bin mint_payer)
     mkdir -p "$PAYER_WALLET"
-    jq -n --arg s "$LEZ_SEQUENCER_URL/" '{sequencers:[{sequencer_addr:$s}], seq_poll_timeout:"30s",
-        seq_tx_poll_max_blocks:15, seq_poll_max_retries:10, seq_block_poll_max_amount:100,
-        multi_sequencer_client_config:{distribution_limit:1, calibration_limit:3}}' \
-        > "$PAYER_WALLET/wallet_config.json"
+    write_wallet_config
     payer=$(HOME="$PAYER_WALLET" LEE_WALLET_HOME_DIR="$PAYER_WALLET" "$mint_payer") || die "mint_payer failed"
     chmod 600 "$PAYER_WALLET/storage.json"
     state_set payer "$payer"
