@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # e2e/lib.sh: shared by the e2e scripts. Source it after reading a networks env file.
 #
-# Needs: curl, jq, python3. State and secrets live under E2E_STATE
-# (default ~/.local/share/rln-zone-e2e/<NETWORK>): the payer wallet, state.json.
+# Needs: curl, jq, python3. State and secrets live under E2E_STATE (default
+# e2e/state/<NETWORK>, gitignored): the payer wallet, state.json.
 
 set -euo pipefail
 
 say() { printf '%s\n' "$*" >&2; }
 die() { say "error: $*"; exit 1; }
 
-E2E_STATE="${E2E_STATE:-$HOME/.local/share/rln-zone-e2e/${NETWORK:?NETWORK unset}}"
+E2E_STATE="${E2E_STATE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/state/${NETWORK:?NETWORK unset}}"
 STATE_JSON="$E2E_STATE/state.json"
 PAYER_WALLET="$E2E_STATE/payer-wallet"
 mkdir -p "$E2E_STATE"

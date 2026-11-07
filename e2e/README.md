@@ -1,8 +1,8 @@
 # e2e: the Zone end to end
 
 Bash + curl + jq + python3, one network env file per target, the lez-rln binaries for the
-chain side. Everything that holds funds or state lives under `E2E_STATE`
-(`~/.local/share/rln-zone-e2e/<network>`), never in the checkout.
+chain side. Everything that holds funds or state lives under `E2E_STATE` (default
+`e2e/state/<network>`, gitignored): the payer wallet holds real funds, back it up.
 
 | Target | Bedrock | LEZ | Program | Zone | Use |
 | --- | --- | --- | --- | --- | --- |

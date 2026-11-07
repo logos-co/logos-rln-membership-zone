@@ -9,3 +9,5 @@ logs/
 /zone-sequencer/data/
 # own LEZ sequencer: its home (RocksDB, keys)
 /lez-sequencer/home/
+# e2e: per-network state (the LEZ payer wallet, pending deposit)
+/e2e/state/
