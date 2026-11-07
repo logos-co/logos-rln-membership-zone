@@ -20,8 +20,11 @@ lez_rln_env
 [ -n "$LEZ_RLN_PAYER" ] || die "no payer: run provision-$NETWORK.sh first"
 ge "$(lez_balance "$LEZ_RLN_PAYER")" "$PAYER_MIN" || die "payer $LEZ_RLN_PAYER holds less than $PAYER_MIN"
 
-say "registering from $LEZ_RLN_PAYER"
+before=$(lez_balance "$LEZ_RLN_PAYER")
+say "registering from $LEZ_RLN_PAYER (balance $before)"
 out=$("$register_member") || die "register_member failed"
+after=$(lez_balance "$LEZ_RLN_PAYER")
+say "payer balance $before -> $after: the registration cost $((before - after)) atomic (price + fee)"
 printf '%s\n' "$out" >&2
 id_commitment=$(printf '%s\n' "$out" | sed -n 's/^ID_COMMITMENT=//p')
 leaf_index=$(printf '%s\n' "$out" | sed -n 's/^LEAF_INDEX=//p')
