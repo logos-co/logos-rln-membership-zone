@@ -24,6 +24,7 @@ membership=$(zone "/merkle_proof/$id_commitment") || die "the zone does not know
 [ "$(printf '%s' "$membership" | jq -r '.active')" = "true" ] || die "leaf $leaf_index is not active, nothing to slash"
 
 before=$(lez_balance "$LEZ_RLN_PAYER")
+slashed_at=$(date +%s)
 say "slashing leaf $leaf_index from $LEZ_RLN_PAYER (balance $before)"
 LEZ_RLN_ID_COMMITMENT="$id_commitment" LEZ_RLN_IDENTITY_SECRET="$identity_secret" "$slash_member" >&2 \
     || die "slash_member failed"
@@ -44,12 +45,15 @@ done
 root=$(printf '%s' "$membership" | jq -r '.root')
 say "leaf $leaf_index slashed, root $root"
 
-say "waiting for a batch carrying that root"
+# A removed leaf leaves its slot empty, so the root may be one the zone published before;
+# the proof is a NEW batch, published after the slash, carrying the change and that root.
+say "waiting for a batch published after the slash with that root"
 for _ in $(seq 1 90); do
-    status=$(zone /roots/5 | jq -r --arg r "$root" '.roots[] | select(.root == $r) | .status' | head -1)
+    status=$(zone /batches/5 | jq -r --arg r "$root" --argjson t "$slashed_at" \
+        '.batches[] | select(.root == $r and .published_at_unix >= $t and .change_count > 0) | .status' | head -1)
     [ -n "$status" ] && break
     sleep 10
 done
-[ -n "$status" ] || die "no batch with root $root within 15 minutes"
+[ -n "$status" ] || die "no batch with root $root published after the slash within 15 minutes"
 say "batch with root $root is $status"
 echo "ID_COMMITMENT=$id_commitment LEAF_INDEX=$leaf_index ROOT=$root STATUS=$status"
