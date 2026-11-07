@@ -47,7 +47,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     http::{AppState, Shared},
-    lez::{SEQUENCER_RANGE, SequencerLez},
+    lez::{MAX_BLOCK_RANGE_LEN, SequencerLez},
     registry::{Registry, Status, now_unix},
 };
 
@@ -270,7 +270,7 @@ async fn apply_range(
     let mut applied = 0;
     let mut start = from;
     while start <= to {
-        let end = to.min(start + SEQUENCER_RANGE - 1);
+        let end = to.min(start + MAX_BLOCK_RANGE_LEN - 1);
         let blocks = source.blocks(start, end).await?;
         let mut registry = registry.write().expect("registry lock");
         for block in &blocks {

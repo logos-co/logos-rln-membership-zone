@@ -13,6 +13,9 @@ use serde_json::{Value, json};
 
 use crate::reader::{fr_from_bytes_le, fr_to_bytes_le};
 
+/// `MAX_BLOCK_RANGE_LEN` of the LEZ Sequencer: the most blocks one `getBlockRange` returns.
+pub const MAX_BLOCK_RANGE_LEN: u64 = 1024;
+
 /// One event of the registration program (RFC "LEZ Requirements / Events") for the registry
 /// this sequencer follows; the source drops the events of any other `tree_id` the program
 /// serves, so the events carry none.
@@ -88,9 +91,6 @@ pub struct SequencerLez {
     registered: AtomicU64,
 }
 
-/// `MAX_BLOCK_RANGE_LEN` of the LEZ Sequencer.
-pub const SEQUENCER_RANGE: u64 = 1024;
-
 impl SequencerLez {
     pub fn new(url: String, program_account_id: [u8; 32], tree_id: [u8; 32]) -> Self {
         Self {
@@ -146,12 +146,24 @@ impl SequencerLez {
     }
 
     /// The blocks `from..=to`, in order, with the program's events of each.
+    ///
+    /// A call asks for up to `MAX_BLOCK_RANGE_LEN` blocks; when the sequencer refuses the answer
+    /// as too big (its 10 MiB response cap, code `-32008`, blocks with many transactions)
+    /// the range is halved and asked again, down to one block.
     pub async fn blocks(&self, from: u64, to: u64) -> Result<Vec<Block>> {
         let mut blocks = vec![];
         let mut start = from;
+        let mut range = MAX_BLOCK_RANGE_LEN;
         while start <= to {
-            let end = to.min(start + SEQUENCER_RANGE - 1);
-            let encoded: Vec<String> = self.rpc("getBlockRange", json!([start, end])).await?;
+            let end = to.min(start + range - 1);
+            let encoded: Vec<String> = match self.rpc("getBlockRange", json!([start, end])).await {
+                Ok(encoded) => encoded,
+                Err(e) if range > 1 && e.to_string().contains("\"code\":-32008") => {
+                    range /= 2;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             if encoded.len() as u64 != end - start + 1 {
                 bail!(
                     "getBlockRange {start}..{end} returned {} blocks",
