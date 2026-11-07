@@ -378,6 +378,17 @@ fee per batch), `lib_slot` against `slot` (finality), the time from `pending` to
   and sent the batch to the back of the mempool queue each time.
 - Two batches `pending` after a restart: fixed (the in-flight batch is restored from the
   history); if seen, start a new channel (section 3).
+- `LEZ read failed: getBlockRange: {"code":-32008,... "Response is too big"}` repeating:
+  fixed (the span is halved down to one block); an older build needs the fix, not a restart.
+- The first batch of a channel carries a root but `no changes` in the log (`change_count`
+  0 in `/batches`): fixed (the pending changes are persisted with the tree; before, a
+  restart between reading LEZ and publishing lost them). A channel whose first batch is
+  like that cannot be replayed by an indexer: start a new one (section 3).
+- `history N batches published ... (checkpoint resumed)` right after changing
+  `CHANNEL_NAME`: the old tree store is still there; stop, `rm -rf zone-sequencer/data/tree`
+  (keep `key.hex`), start again.
+- `LEZ unreachable: getLastBlockId` once in a while: network; the next poll retries, nothing
+  to do unless it repeats for long.
 - WSL2: `ngrok http 3000` inside WSL; from a Windows browser `http://localhost:3000` works
   with the default localhost forwarding.
 
@@ -409,7 +420,8 @@ rm -rf ~/logos-rln-membership-zone/poc
 ## 9. Open points this setup exposes
 
 - The LEZ Sequencer RPC serves no events; the LEZ Indexer serves them for finalized blocks
-  only (8 to 10 hours). Asked of the LEZ team: `getEvents` on the Sequencer RPC.
+  only (8 to 10 hours). A `getEvents` for the Sequencer RPC exists as a local LEZ branch
+  (section 5), not proposed upstream yet.
 - The program's expiry rule and the layouts of `Extend`, `Erase`, `Slash` are to be confirmed
   with the program's author; the decoder is a best-effort reading of the chain.
 - On restart the Zone sequencer continues from its local history, not from the channel as
