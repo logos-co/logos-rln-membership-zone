@@ -275,11 +275,13 @@ impl Registry {
             .collect()
     }
 
-    /// The distinct roots newest first, at most `window_size`: one entry per root, the batch
-    /// that produced it (its `change_count` is what made the root, and it is the first of the
-    /// root's batches to be adopted or finalized) with `carried_to_lez_block_id`, the last LEZ
-    /// block the root stood for (the `to_lez_block_id` of the newest batch carrying it, a
-    /// heartbeat as a rule). Orphaned batches are left out.
+    /// The roots newest first, at most `window_size`: one entry per run of batches carrying
+    /// the same root, the batch that produced it (its `change_count` is what made the root,
+    /// and it is the first of the run to be adopted or finalized) with
+    /// `carried_to_lez_block_id`, the last LEZ block the root stood for (the `to_lez_block_id`
+    /// of the newest batch of the run, a heartbeat as a rule). A root the tree comes back to
+    /// later (a leaf inserted then removed empties its slot again) is a new run, so the window
+    /// stays ordered by recency. Orphaned batches are left out.
     pub fn roots(&self, window_size: usize) -> Vec<RootEntry<'_>> {
         let mut entries: Vec<RootEntry<'_>> = vec![];
         for p in self
@@ -288,12 +290,11 @@ impl Registry {
             .iter()
             .filter(|p| p.status != Status::Orphaned)
         {
-            match entries
-                .iter_mut()
-                .find(|e| e.produced_by.root_after == p.root_after)
-            {
-                Some(entry) => entry.carried_to_lez_block_id = p.to_lez_block_id,
-                None => entries.push(RootEntry {
+            match entries.last_mut() {
+                Some(entry) if entry.produced_by.root_after == p.root_after => {
+                    entry.carried_to_lez_block_id = p.to_lez_block_id;
+                }
+                _ => entries.push(RootEntry {
                     produced_by: p,
                     carried_to_lez_block_id: p.to_lez_block_id,
                 }),
@@ -342,6 +343,42 @@ mod test {
             expiry_timestamp_ms: 9_000,
             leaf_index,
         }
+    }
+
+    #[test]
+    fn test_roots_window_is_ordered_by_recency_when_a_root_comes_back() {
+        let dir = std::env::temp_dir().join(format!("zone-roots-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
+        let publish = |registry: &mut Registry, n: u8, root: u8| {
+            let batch = Batch {
+                from_lez_block_id: u64::from(n),
+                to_lez_block_id: u64::from(n),
+                changes: vec![],
+                root_after: vec![root; 32],
+            };
+            registry.on_published([n; 32], [n; 32], &batch, vec![]);
+        };
+        // Root A, a heartbeat carrying A, root B, back to A (a leaf inserted then removed).
+        publish(&mut registry, 1, 0xA);
+        publish(&mut registry, 2, 0xA);
+        publish(&mut registry, 3, 0xB);
+        publish(&mut registry, 4, 0xA);
+        let roots = registry.roots(10);
+        let runs: Vec<(u8, u64, u64)> = roots
+            .iter()
+            .map(|e| {
+                (
+                    e.produced_by.root_after[0],
+                    e.produced_by.from_lez_block_id,
+                    e.carried_to_lez_block_id,
+                )
+            })
+            .collect();
+        assert_eq!(runs, vec![(0xA, 4, 4), (0xB, 3, 3), (0xA, 1, 2)]);
+        assert_eq!(registry.roots(1)[0].produced_by.root_after[0], 0xA);
+        registry.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

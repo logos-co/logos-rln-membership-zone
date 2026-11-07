@@ -160,7 +160,7 @@ rm -rf zone-sequencer/data/tree
 
 ```bash
 curl -s localhost:3000/ | jq                  # channel, LEZ head, covered block, counters, newest roots
-curl -s localhost:3000/roots/5 | jq           # newest 5 distinct roots, the batch that produced each
+curl -s localhost:3000/roots/5 | jq           # newest 5 roots, the batch that produced each
 curl -s localhost:3000/batches/5 | jq         # newest 5 batches as published, heartbeats included
 curl -s localhost:3000/merkle_proof/0 | jq    # membership at leaf 0 and its proof path at the LEZ head
 curl -s localhost:3000/merkle_proof/<id_commitment hex> | jq   # the same, by identity commitment
@@ -191,9 +191,11 @@ batch), `published_batches`, `newest_adopted` and `newest_finalized` (root and
 A batch entry (`/batches`, `/roots`) carries `root`, `from_lez_block_id`, `to_lez_block_id`,
 `change_count`, `published_at_unix`, `status`, `tx_hash` and `msg_id`. `/batches` lists the
 batches as published, so a heartbeat shows the previous root with `change_count` 0. `/roots`
-lists distinct roots: each with the batch that produced it (its `change_count` is what made
-the root, and it is the first of that root's batches to reach `adopted` and `finalized`) plus
-`carried_to_lez_block_id`, the `to_lez_block_id` of the newest batch carrying the root.
+lists the roots by recency, one entry per run of batches carrying the same root: the batch
+that produced it (its `change_count` is what made the root, and it is the first of the run to
+reach `adopted` and `finalized`) plus `carried_to_lez_block_id`, the `to_lez_block_id` of the
+newest batch of the run. A root the tree comes back to (a leaf inserted then removed empties
+its slot again) is a new entry, so the window is the newest roots, not the newest values.
 
 `/merkle_proof` answers 404 for an unknown leaf index or identity commitment. The answer
 carries the membership (`leaf_index`, `id_commitment`, `active`, `removed`,

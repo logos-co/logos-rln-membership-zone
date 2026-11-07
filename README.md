@@ -109,7 +109,7 @@ set -a; source .env; set +a      # clap reads process env vars, not the .env fil
 cargo run -p zone-sequencer
 
 curl -s localhost:3000/ | jq                 # channel, LEZ head, event and tree counters
-curl -s localhost:3000/roots/5 | jq          # newest distinct roots: the batch that produced each, its status on Bedrock
+curl -s localhost:3000/roots/5 | jq          # newest roots: the batch that produced each, its status on Bedrock
 curl -s localhost:3000/batches/5 | jq        # newest batches, heartbeats included
 curl -s localhost:3000/merkle_proof/0 | jq   # membership at leaf 0 (or by id_commitment) and its proof path
 curl -s localhost:3000/leaves | jq           # active and removed memberships at the LEZ head
