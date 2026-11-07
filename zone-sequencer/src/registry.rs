@@ -129,26 +129,51 @@ impl Registry {
             }
             _ => vec![],
         };
+        // The payloads of the batches not finalized yet, to publish one again after a reorg
+        // and to recognise it when Bedrock finality reaches it, keyed by message id (hex).
+        let payloads = match extra.get("payloads") {
+            Some(encoded) => {
+                let encoded: HashMap<String, String> = serde_json::from_value(encoded.clone())
+                    .context("payloads in the tree store")?;
+                encoded
+                    .iter()
+                    .map(|(msg_id, payload)| {
+                        let msg_id = hex::decode(msg_id)
+                            .ok()
+                            .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                            .context("payload message id is not 32 bytes of hex")?;
+                        Ok((msg_id, hex::decode(payload).context("payload is not hex")?))
+                    })
+                    .collect::<Result<_>>()?
+            }
+            None => HashMap::new(),
+        };
         Ok(Self {
             history,
             head,
             pending_changes,
             checkpoint,
-            payloads: HashMap::new(),
+            payloads,
         })
     }
 
-    /// Write the reader's state, the history, the pending changes and the checkpoint into the
-    /// tree store.
+    /// Write the reader's state, the history, the pending changes, the payloads of the
+    /// batches not finalized yet and the checkpoint into the tree store.
     pub fn save(&mut self) -> Result<()> {
         let pending_changes: Vec<String> = self
             .pending_changes
             .iter()
             .map(|change| hex::encode(change.encode_to_vec()))
             .collect();
+        let payloads: HashMap<String, String> = self
+            .payloads
+            .iter()
+            .map(|(msg_id, payload)| (hex::encode(msg_id), hex::encode(payload)))
+            .collect();
         let extra = json!({
             "history": self.history,
             "pending_changes": pending_changes,
+            "payloads": payloads,
             "checkpoint": self.checkpoint,
         });
         self.head.persist(extra)
@@ -237,6 +262,11 @@ impl Registry {
 
     pub fn payload(&self, msg_id: &[u8; 32]) -> Option<&Vec<u8>> {
         self.payloads.get(msg_id)
+    }
+
+    /// A finalized batch is never published again nor compared again: its payload goes.
+    pub fn drop_payload(&mut self, msg_id: &[u8; 32]) {
+        self.payloads.remove(msg_id);
     }
 
     pub fn published_mut(&mut self, msg_id: &[u8; 32]) -> Option<&mut Published> {

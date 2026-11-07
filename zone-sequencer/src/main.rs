@@ -590,9 +590,11 @@ fn finalize(registry: &Shared, finalized: &[FinalizedTx]) -> Vec<[u8; 32]> {
             };
             let msg = msg_bytes(&info.this_msg);
             let mut registry = registry.write().expect("registry lock");
-            let payload_matches = registry
+            // The message id is ours (it is in the history, signed by our key); the payload
+            // on record, when there is one, must be the one finalized.
+            let payload_differs = registry
                 .payload(&msg)
-                .is_some_and(|p| p[..] == info.payload[..]);
+                .is_some_and(|p| p[..] != info.payload[..]);
             let Some(entry) = registry.published_mut(&msg) else {
                 println!(
                     "finalized inscription msg {} is not one of ours",
@@ -603,7 +605,7 @@ fn finalize(registry: &Shared, finalized: &[FinalizedTx]) -> Vec<[u8; 32]> {
             if matches!(entry.status, Status::Finalized { .. }) {
                 continue;
             }
-            if !payload_matches {
+            if payload_differs {
                 println!(
                     "finalized msg {} carries a different payload than we published; left as is",
                     hex::encode(&msg[..4])
@@ -619,6 +621,7 @@ fn finalize(registry: &Shared, finalized: &[FinalizedTx]) -> Vec<[u8; 32]> {
                 entry.to_lez_block_id,
                 hex::encode(&entry.root_after[..4])
             );
+            registry.drop_payload(&msg);
             done.push(msg);
         }
     }
