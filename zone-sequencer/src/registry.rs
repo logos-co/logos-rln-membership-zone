@@ -1,12 +1,13 @@
 //! The registry the sequencer holds and the HTTP API serves: the tree at the LEZ head, the
 //! changes not yet in a batch, and every batch published with the status of its Mantle
 //! Transaction on Bedrock. Everything is kept in the tree store (`data/tree/`): the tree and
-//! the reader's state by the reader, the batch history and the Zone SDK checkpoint as the
-//! reader's `extra`.
+//! the reader's state by the reader, the batch history, the pending changes and the Zone SDK
+//! checkpoint as the reader's `extra`.
 
 use std::{collections::HashMap, path::Path};
 
 use anyhow::{Context as _, Result};
+use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -112,18 +113,44 @@ impl Registry {
             },
         };
         let checkpoint = extra.get("checkpoint").filter(|c| !c.is_null()).cloned();
+        // The changes applied but not yet published survive a restart with the tree they
+        // changed; a rebuild derives them again from LEZ.
+        let pending_changes = match extra.get("pending_changes") {
+            Some(encoded) if !rebuild => {
+                let encoded: Vec<String> = serde_json::from_value(encoded.clone())
+                    .context("pending changes in the tree store")?;
+                encoded
+                    .iter()
+                    .map(|hex| {
+                        let bytes = hex::decode(hex).context("pending change is not hex")?;
+                        Change::decode(bytes.as_slice()).context("pending change")
+                    })
+                    .collect::<Result<_>>()?
+            }
+            _ => vec![],
+        };
         Ok(Self {
             history,
             head,
-            pending_changes: vec![],
+            pending_changes,
             checkpoint,
             payloads: HashMap::new(),
         })
     }
 
-    /// Write the reader's state, the history and the checkpoint into the tree store.
+    /// Write the reader's state, the history, the pending changes and the checkpoint into the
+    /// tree store.
     pub fn save(&mut self) -> Result<()> {
-        let extra = json!({ "history": self.history, "checkpoint": self.checkpoint });
+        let pending_changes: Vec<String> = self
+            .pending_changes
+            .iter()
+            .map(|change| hex::encode(change.encode_to_vec()))
+            .collect();
+        let extra = json!({
+            "history": self.history,
+            "pending_changes": pending_changes,
+            "checkpoint": self.checkpoint,
+        });
         self.head.persist(extra)
     }
 
@@ -290,4 +317,59 @@ pub fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::lez::Event;
+
+    fn block(block_id: u64, events: Vec<Event>) -> Block {
+        Block {
+            block_id,
+            timestamp_ms: 1_000,
+            events,
+            private_transaction_count: 0,
+        }
+    }
+
+    fn registered(n: u8, leaf_index: u64) -> Event {
+        let mut id_commitment = [0u8; 32];
+        id_commitment[0] = n;
+        Event::Registered {
+            id_commitment,
+            rate_limit: 100,
+            expiry_timestamp_ms: 9_000,
+            leaf_index,
+        }
+    }
+
+    #[test]
+    fn test_reopen_keeps_the_pending_changes() {
+        let dir = std::env::temp_dir().join(format!("zone-registry-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let batch = {
+            let mut registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
+            registry
+                .apply_blocks(&[
+                    block(1, vec![registered(1, 0), registered(2, 1)]),
+                    block(2, vec![registered(3, 2)]),
+                ])
+                .unwrap();
+            registry.save().unwrap();
+            let batch = registry.next_batch().unwrap();
+            assert_eq!(batch.changes.len(), 3);
+            registry.close().unwrap();
+            batch
+        };
+        {
+            let registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
+            assert_eq!(registry.next_batch().unwrap(), batch);
+        }
+        {
+            let registry = Registry::open(&dir, [0; 32], 1, true).unwrap();
+            assert!(registry.pending_changes.is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
