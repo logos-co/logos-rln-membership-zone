@@ -307,14 +307,29 @@ impl Registry {
     }
 
     /// The L1 slot the finality scan starts at: after the last slot scanned, and no earlier
-    /// than the oldest batch still waiting with a slot on record; `None` when nothing waits.
+    /// than the oldest batch still waiting; `None` when nothing waits. A batch published
+    /// before the slot was recorded borrows one from a finalized batch: slots are seconds, so
+    /// its slot is about the finalized one's minus the seconds between the two publishes, with
+    /// a margin; without any finalized batch such a batch is left to the SDK stream.
     pub fn finality_scan_from(&self) -> Option<u64> {
+        let reference = self.history.published.iter().find_map(|p| match p.status {
+            Status::Finalized { l1_slot } => Some((l1_slot, p.published_at_unix)),
+            _ => None,
+        });
         let oldest = self
             .history
             .published
             .iter()
             .filter(|p| !matches!(p.status, Status::Finalized { .. } | Status::Orphaned))
-            .filter_map(|p| p.published_at_slot)
+            .filter_map(|p| {
+                p.published_at_slot.or_else(|| {
+                    let (slot, unix) = reference?;
+                    Some(
+                        slot.saturating_sub(unix.saturating_sub(p.published_at_unix))
+                            .saturating_sub(SLOT_ESTIMATE_MARGIN),
+                    )
+                })
+            })
             .min()?;
         Some(match self.history.finality_scanned_to {
             Some(scanned) => oldest.max(scanned + 1),
@@ -388,6 +403,9 @@ impl Registry {
         entries
     }
 }
+
+/// Slots the finality scan starts early when a batch's slot is estimated from another's.
+const SLOT_ESTIMATE_MARGIN: u64 = 600;
 
 /// Why `Registry::on_finalized` left a batch as it was.
 #[derive(Debug, PartialEq)]
@@ -494,6 +512,19 @@ mod test {
         assert_eq!(registry.finality_scan_from(), Some(2));
         registry.history.finality_scanned_to = Some(600);
         assert_eq!(registry.finality_scan_from(), Some(601));
+        // A batch without a slot borrows one from the finalized batch (slot 500, published
+        // now): published 100 s earlier, its slot is about 400, the scan starts 600 early.
+        registry.history.finality_scanned_to = None;
+        let now = now_unix();
+        registry.history.published[1].published_at_slot = None;
+        registry.history.published[1].published_at_unix = now - 100;
+        registry.history.published[0].published_at_unix = now;
+        registry.history.published[2].published_at_slot = Some(5000);
+        registry.history.published[3].published_at_slot = Some(5000);
+        assert_eq!(registry.finality_scan_from(), Some(0));
+        registry.history.published[0].status = Status::Finalized { l1_slot: 2000 };
+        assert_eq!(registry.finality_scan_from(), Some(2000 - 100 - 600));
+        registry.history.finality_scanned_to = Some(600);
         // The payloads of the batches not finalized yet survive a restart.
         registry.save().unwrap();
         registry.close().unwrap();
