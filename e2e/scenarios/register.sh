@@ -28,7 +28,12 @@ say "payer balance $before -> $after: the registration cost $((before - after)) 
 printf '%s\n' "$out" >&2
 id_commitment=$(printf '%s\n' "$out" | sed -n 's/^ID_COMMITMENT=//p')
 leaf_index=$(printf '%s\n' "$out" | sed -n 's/^LEAF_INDEX=//p')
+identity_secret=$(printf '%s\n' "$out" | sed -n 's/^IDENTITY_SECRET_HASH=//p')
 [ -n "$id_commitment" ] && [ -n "$leaf_index" ] || die "register_member printed no ID_COMMITMENT / LEAF_INDEX"
+# The last registration, for slash.sh.
+state_set last_id_commitment "$id_commitment"
+state_set last_leaf_index "$leaf_index"
+state_set last_identity_secret "$identity_secret"
 
 say "waiting for the zone to apply leaf $leaf_index"
 for _ in $(seq 1 60); do

@@ -14,8 +14,8 @@ chain side. Everything that holds funds or state lives under `E2E_STATE` (defaul
 - The Zone sequencer running (`docs/setup-rln-membership-zone.md`), its `.env` naming the
   same program and tree as the network env file.
 - A `logos-lez-rln` checkout on branch `feat/rln-zone-events` (the deployed program) with
-  `mint_payer`, `register_member` and `account_balance` built (`cargo build --bin ...` in its
-  `lez-rln/`; debug is fine). `LEZ_RLN_CHECKOUT` points to it, default `~/logos-lez-rln`.
+  `mint_payer`, `register_member`, `slash_member` and `account_balance` built (`cargo build
+  --bin ...` in its `lez-rln/`; debug is fine). `LEZ_RLN_CHECKOUT` points to it, default `~/logos-lez-rln`.
 - `curl`, `jq`, `python3`, `yq` (reads the node keystore).
 
 ## Testnet
@@ -37,4 +37,5 @@ then watches `/merkle_proof/<id_commitment>` for the leaf with the claimed index
 
 | Script | Checks |
 | --- | --- |
-| `scenarios/register.sh <env>` | registration -> leaf and proof at the zone -> root published |
+| `scenarios/register.sh <env>` | registration -> leaf and proof at the zone -> root published; records the membership for `slash.sh` |
+| `scenarios/slash.sh <env>` | slash of the last registration -> `removed: slashed`, no proof -> new root published |
