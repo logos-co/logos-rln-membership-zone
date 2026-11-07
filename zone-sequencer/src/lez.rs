@@ -59,10 +59,9 @@ pub struct Block {
     pub block_id: u64,
     pub timestamp_ms: u64,
     pub events: Vec<Event>,
-    /// Privacy-preserving transactions in the block (any program). They carry no instruction
-    /// and emit no event, so the reader learns nothing from them; one that calls the
-    /// registration program changes the registry without this reader seeing it, which is why
-    /// the count is reported.
+    /// Privacy-preserving transactions with a public effect under the registration program.
+    /// They carry no instruction and emit no event, so each changed the registry without this
+    /// reader seeing what; the ones under other programs are not counted.
     pub private_transaction_count: u32,
 }
 
@@ -70,8 +69,9 @@ pub struct Block {
 enum Transaction {
     /// A public transaction: the program's event, if the transaction called the program.
     Public(Option<Event>),
-    /// A privacy-preserving transaction, skipped.
-    Private,
+    /// A privacy-preserving transaction, skipped; whether one of its public effects is under
+    /// the registration program.
+    Private { touches_program: bool },
 }
 
 /// The LEZ Sequencer's JSON-RPC (`getLastBlockId`, `getBlockRange`, at most 1024 blocks per
@@ -193,7 +193,9 @@ impl SequencerLez {
             match self.decode_transaction(&mut c) {
                 Ok(Transaction::Public(Some(event))) => events.push(event),
                 Ok(Transaction::Public(None)) => {}
-                Ok(Transaction::Private) => private_transaction_count += 1,
+                Ok(Transaction::Private { touches_program }) => {
+                    private_transaction_count += u32::from(touches_program);
+                }
                 // The rest of the body cannot be located after a bad transaction.
                 Err(e) => bail!("LEZ block {block_id} tx {tx_index}: {e}"),
             }
@@ -216,8 +218,8 @@ impl SequencerLez {
         match tag {
             0 => {}
             1 => {
-                skip_privacy_transaction(c)?;
-                return Ok(Transaction::Private);
+                let touches_program = skip_privacy_transaction(c, &self.program_account_id)?;
+                return Ok(Transaction::Private { touches_program });
             }
             other => bail!("unknown LeeTransaction tag {other}"),
         }
@@ -348,13 +350,16 @@ impl SequencerLez {
 /// to: Option<u64>}, timestamp_validity_window{same}, program_image_claims:
 /// Vec<ProgramImageClaim: 0 Disclosed{account_id [32], image_id [32]} | 1 Undisclosed{root
 /// [32]}>}` then `WitnessSet{signatures_and_public_keys: Vec<([64], [32])>, proof: Vec<u8>}`.
-/// Nothing in it is read: the transaction carries no instruction and emits no event.
-fn skip_privacy_transaction(c: &mut Cursor<'_>) -> Result<()> {
+/// The transaction carries no instruction and emits no event; the one thing read is whether a
+/// public effect is under `program`, the sign that the transaction changed the registry.
+fn skip_privacy_transaction(c: &mut Cursor<'_>, program: &[u8; 32]) -> Result<bool> {
+    let mut touches_program = false;
     // Message.public_actions
     for _ in 0..c.u32()? {
         c.take(32)?;
         for _ in 0..c.u32()? {
-            c.take(64)?;
+            touches_program |= c.bytes32()? == *program;
+            c.take(32)?;
             c.skip_bytes()?;
         }
     }
@@ -384,7 +389,7 @@ fn skip_privacy_transaction(c: &mut Cursor<'_>) -> Result<()> {
     let witnesses = c.u32()?;
     c.take(witnesses as usize * 96)?;
     c.skip_bytes()?;
-    Ok(())
+    Ok(touches_program)
 }
 
 /// A borsh reader over fixed layouts: everything decoded here is fixed size or
@@ -582,7 +587,7 @@ mod test {
     /// A privacy-preserving transaction (every field populated) between two public ones: it
     /// is skipped field by field, counted, and the `Register` after it still decodes.
     #[test]
-    fn test_decode_block_skips_a_privacy_preserving_transaction() {
+    fn test_decode_block_skips_privacy_preserving_transactions_and_counts_the_programs() {
         use rln_layouts::Instruction;
         let program = [1u8; 32];
         let lez = SequencerLez::new("http://unused".into(), program, [7; 32]);
@@ -591,40 +596,44 @@ mod test {
             b.extend(vec![fill; n as usize]);
             b
         };
-        let mut private = vec![1u8];
-        // Message.public_actions: one action with one effect
-        private.extend(1u32.to_le_bytes());
-        private.extend([10u8; 32]);
-        private.extend(1u32.to_le_bytes());
-        private.extend([11u8; 32]);
-        private.extend([12u8; 32]);
-        private.extend(bytes(3, 13));
-        // Message.nonces: one
-        private.extend(1u32.to_le_bytes());
-        private.extend(9u128.to_le_bytes());
-        // Message.private_actions: one
-        private.extend(1u32.to_le_bytes());
-        private.extend([14u8; 96]);
-        private.extend(bytes(5, 15));
-        private.extend(bytes(33, 16));
-        private.push(17);
-        // Message.block_validity_window {Some(7), None}, timestamp_validity_window {None, Some(8)}
-        private.push(1);
-        private.extend(7u64.to_le_bytes());
-        private.push(0);
-        private.push(0);
-        private.push(1);
-        private.extend(8u64.to_le_bytes());
-        // Message.program_image_claims: Disclosed then Undisclosed
-        private.extend(2u32.to_le_bytes());
-        private.push(0);
-        private.extend([18u8; 64]);
-        private.push(1);
-        private.extend([19u8; 32]);
-        // WitnessSet: one signature + key, then the proof
-        private.extend(1u32.to_le_bytes());
-        private.extend([20u8; 96]);
-        private.extend(bytes(4, 21));
+        // A privacy-preserving transaction whose one public effect is under `effect_program`.
+        let private = |effect_program: [u8; 32]| {
+            let mut private = vec![1u8];
+            // Message.public_actions: one action with one effect
+            private.extend(1u32.to_le_bytes());
+            private.extend([10u8; 32]);
+            private.extend(1u32.to_le_bytes());
+            private.extend(effect_program);
+            private.extend([12u8; 32]);
+            private.extend(bytes(3, 13));
+            // Message.nonces: one
+            private.extend(1u32.to_le_bytes());
+            private.extend(9u128.to_le_bytes());
+            // Message.private_actions: one
+            private.extend(1u32.to_le_bytes());
+            private.extend([14u8; 96]);
+            private.extend(bytes(5, 15));
+            private.extend(bytes(33, 16));
+            private.push(17);
+            // Message.block_validity_window {Some(7), None}, timestamp_validity_window {None, Some(8)}
+            private.push(1);
+            private.extend(7u64.to_le_bytes());
+            private.push(0);
+            private.push(0);
+            private.push(1);
+            private.extend(8u64.to_le_bytes());
+            // Message.program_image_claims: Disclosed then Undisclosed
+            private.extend(2u32.to_le_bytes());
+            private.push(0);
+            private.extend([18u8; 64]);
+            private.push(1);
+            private.extend([19u8; 32]);
+            // WitnessSet: one signature + key, then the proof
+            private.extend(1u32.to_le_bytes());
+            private.extend([20u8; 96]);
+            private.extend(bytes(4, 21));
+            private
+        };
 
         let public = |to: [u8; 32], data: &[u8]| {
             let mut b = vec![0u8];
@@ -654,9 +663,10 @@ mod test {
         block.extend(43u64.to_le_bytes());
         block.extend([0u8; 64]);
         block.extend(2_345u64.to_le_bytes());
-        block.extend(3u32.to_le_bytes());
+        block.extend(4u32.to_le_bytes());
         block.extend(public([4u8; 32], b"other program"));
-        block.extend(private);
+        block.extend(private([11u8; 32]));
+        block.extend(private(program));
         block.extend(public(program, &register));
         block.push(0);
         let decoded = lez.decode_block(&block).unwrap();

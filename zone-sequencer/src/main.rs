@@ -280,8 +280,9 @@ async fn apply_range(
             }
             if block.private_transaction_count > 0 {
                 println!(
-                    "WARNING: LEZ block {}: {} privacy-preserving transaction(s) skipped; a \
-                     registry change made through one is not in this tree",
+                    "WARNING: LEZ block {}: {} privacy-preserving transaction(s) under the \
+                     registration program skipped; the registry changed in a way this tree does \
+                     not have",
                     block.block_id, block.private_transaction_count
                 );
             }

@@ -178,9 +178,10 @@ proves, through its grace period included) or `removed` for `expired`, `slashed`
 `/` adds `zone_channel_id`, `lez_source`, `first_lez_block_id` and `covered_to_lez_block_id`
 (the last block a published batch covers), `lez_events` (the program's events applied:
 `registered`, `extended`, `slashed`, `erased`, and `private_transactions`: privacy-preserving
-transactions seen in the LEZ blocks, any program; they carry no instruction and emit no
-event, so the reader skips them with a warning in the log, and a registry change made
-through one is not in this tree), `tree` (`active_leaves`, `removed_leaves`,
+transactions with a public effect under the registration program; they carry no instruction
+and emit no event, so each changed the registry in a way this tree does not have, and the
+reader logs a warning; the ones under other programs are skipped silently), `tree`
+(`active_leaves`, `removed_leaves`,
 and `changes` the rules made beyond the one insert per `Registered`: `removed_expired` by the
 LEZ clock, `removed_ended` by a slash or an erase while active, `reinserted` by an `Extended`
 that landed after the reader had expired the leaf), `pending_changes` (waiting for the next

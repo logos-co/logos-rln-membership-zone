@@ -100,9 +100,9 @@ pub struct Stats {
     pub removed_ended: u64,
     /// Leaves put back by an `Extended` that landed after the reader had expired them.
     pub reinserted: u64,
-    /// Privacy-preserving transactions seen in the LEZ blocks applied (any program): they
-    /// carry no instruction and emit no event, so a registry change made through one is not
-    /// in this tree.
+    /// Privacy-preserving transactions with a public effect under the registration program:
+    /// they carry no instruction and emit no event, so each changed the registry in a way
+    /// this tree does not have.
     pub private_transactions: u64,
 }
 
