@@ -681,6 +681,33 @@ async fn reconcile_finality(
     channel_id: ChannelId,
     registry: &Shared,
 ) -> Result<usize> {
+    // Batches published before the history kept their changes: read the block that finalized
+    // each, once, and take the changes from the inscription.
+    let without_changes = registry
+        .read()
+        .expect("registry lock")
+        .finalized_without_changes();
+    for (msg, l1_slot) in without_changes {
+        let blocks = node
+            .immutable_blocks(Slot::from(l1_slot), Slot::from(l1_slot))
+            .await
+            .map_err(|e| anyhow!("immutable block at {l1_slot}: {e}"))?;
+        let mut registry = registry.write().expect("registry lock");
+        for info in blocks
+            .iter()
+            .flat_map(|block| &block.transactions)
+            .flat_map(|tx| channel_inscriptions(tx, channel_id))
+        {
+            if msg_bytes(&info.this_msg) == msg && registry.fill_changes(&msg, &info.payload) {
+                println!(
+                    "batch msg {} took its changes from the chain",
+                    hex::encode(&msg[..4])
+                );
+                registry.save()?;
+            }
+        }
+    }
+
     let Some(from) = registry.read().expect("registry lock").finality_scan_from() else {
         return Ok(0);
     };

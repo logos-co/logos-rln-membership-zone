@@ -320,9 +320,52 @@ impl Registry {
         )
     }
 
+    /// A batch published before the history kept the changes learns them from its inscription
+    /// as the chain holds it: `payload` must decode to a batch with the span and root on
+    /// record. Returns whether the history changed.
+    pub fn fill_changes(&mut self, msg_id: &[u8; 32], payload: &[u8]) -> bool {
+        let Some(entry) = self.published_mut(msg_id) else {
+            return false;
+        };
+        if entry.changes.len() == entry.change_count {
+            return false;
+        }
+        let Ok(batch) = Batch::decode(payload) else {
+            return false;
+        };
+        if batch.from_lez_block_id != entry.from_lez_block_id
+            || batch.to_lez_block_id != entry.to_lez_block_id
+            || batch.root_after[..] != entry.root_after[..]
+            || batch.changes.len() != entry.change_count
+        {
+            return false;
+        }
+        entry.changes = batch
+            .changes
+            .iter()
+            .filter_map(ChangeRecord::from_change)
+            .collect();
+        true
+    }
+
+    /// The finalized batches whose changes the history does not have, with the L1 slot of
+    /// the block that holds their inscription: one block read each fills them.
+    pub fn finalized_without_changes(&self) -> Vec<([u8; 32], u64)> {
+        self.history
+            .published
+            .iter()
+            .filter(|p| p.changes.len() != p.change_count)
+            .filter_map(|p| match p.status {
+                Status::Finalized { l1_slot } => Some((p.msg_id, l1_slot)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Bedrock finality reached the batch `msg_id` at `l1_slot`, carrying `tx_hash` and
     /// `payload`: mark it, unless it is not ours, already final, or the payload on record (when
-    /// there is one) differs. Returns the entry marked.
+    /// there is one) differs. A batch whose changes the history lacks takes them from the
+    /// payload. Returns the entry marked.
     pub fn on_finalized(
         &mut self,
         msg_id: &[u8; 32],
@@ -335,6 +378,7 @@ impl Registry {
         if self.payload(msg_id).is_some_and(|p| p[..] != payload[..]) {
             return Err(FinalizeRefused::PayloadDiffers);
         }
+        self.fill_changes(msg_id, payload);
         let Some(entry) = self.published_mut(msg_id) else {
             return Err(FinalizeRefused::NotOurs);
         };
@@ -570,6 +614,22 @@ mod test {
         registry.history.published[0].status = Status::Finalized { l1_slot: 2000 };
         assert_eq!(registry.finality_scan_from(), Some(2000 - 100 - 600));
         registry.history.finality_scanned_to = Some(600);
+        // A batch recorded without its changes learns them from the inscription on chain,
+        // when span and root agree.
+        registry.history.published[2].changes.clear();
+        registry.history.published[2].change_count = 1;
+        let on_chain = Batch {
+            from_lez_block_id: 3,
+            to_lez_block_id: 3,
+            changes: vec![Change::insert(9, vec![0xC; 32])],
+            root_after: vec![0xB; 32],
+        }
+        .encode_to_vec();
+        assert_eq!(registry.payload(&[3; 32]), None);
+        assert!(!registry.fill_changes(&[3; 32], &payload_of(3, 0xB)));
+        assert!(registry.fill_changes(&[3; 32], &on_chain));
+        assert_eq!(registry.history.published[2].changes[0].leaf_index, 9);
+        assert_eq!(registry.payload(&[3; 32]), Some(on_chain));
         // The history survives a restart and still builds every batch's inscription.
         registry.save().unwrap();
         registry.close().unwrap();

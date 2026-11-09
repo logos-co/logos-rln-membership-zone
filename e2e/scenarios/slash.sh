@@ -50,8 +50,8 @@ say "leaf $leaf_index slashed, root $root"
 say "waiting for a root entry produced after the slash that removes leaf $leaf_index"
 for _ in $(seq 1 90); do
     status=$(zone /roots/5 | jq -r --arg r "$root" --argjson t "$slashed_at" --argjson leaf "$leaf_index" \
-        '.roots[] | select(.root == $r and .published_at_unix >= $t
-            and any(.changes[]; .kind == "remove" and .leaf_index == $leaf)) | .status' | head -1)
+        '.roots[] | select(.root == $r and .batches[0].published_at_unix >= $t
+            and any(.changes[]; .kind == "remove" and .leaf_index == $leaf)) | .batches[0].status' | head -1)
     [ -n "$status" ] && break
     sleep 10
 done

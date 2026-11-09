@@ -53,7 +53,7 @@ say "leaf $leaf_index active, root $root"
 
 say "waiting for a batch carrying that root"
 for _ in $(seq 1 90); do
-    status=$(zone /roots/5 | jq -r --arg r "$root" '.roots[] | select(.root == $r) | .status' | head -1)
+    status=$(zone /roots/5 | jq -r --arg r "$root" '.roots[] | select(.root == $r) | .batches[0].status' | head -1)
     [ -n "$status" ] && break
     sleep 10
 done

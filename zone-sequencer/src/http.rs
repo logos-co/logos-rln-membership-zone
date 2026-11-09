@@ -42,16 +42,18 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// A published batch as the API shows it: the LEZ blocks it covers, how many changes it
-/// listed and where its transaction stands on Bedrock.
+/// A published batch as the API shows it: the LEZ blocks it covers, when it went out and
+/// where its transaction stands on Bedrock.
 #[derive(Serialize)]
 struct BatchEntry {
     msg_id: String,
     tx_hash: String,
     from_lez_block_id: u64,
     to_lez_block_id: u64,
-    change_count: usize,
+    /// The sequencer's clock at publish.
     published_at_unix: u64,
+    /// The L1 slot at publish, the chain's clock; `null` when the node did not answer then.
+    published_at_slot: Option<u64>,
     status: &'static str,
     /// The L1 slot of the block that finalized it; `null` before.
     l1_slot: Option<u64>,
@@ -70,24 +72,24 @@ impl BatchEntry {
             tx_hash: hex::encode(p.tx_hash),
             from_lez_block_id: p.from_lez_block_id,
             to_lez_block_id: p.to_lez_block_id,
-            change_count: p.change_count,
             published_at_unix: p.published_at_unix,
+            published_at_slot: p.published_at_slot,
             status,
             l1_slot,
         }
     }
 }
 
-/// A root of the valid-root window as the API shows it: the batch that produced it (its
-/// fields at the top, its `changes` what made the root), `carried_to_lez_block_id`, the last
-/// LEZ block the root stood for, and `batches`, every batch of the run that carried it, the
-/// producing one first.
+/// A root of the valid-root window as the API shows it: the LEZ blocks it stood for
+/// (`from_lez_block_id` of the batch that produced it to `to_lez_block_id` of the newest batch
+/// carrying it), the `changes` that made it, and `batches`, every batch of the run, the
+/// producing one first with its status on Bedrock.
 #[derive(Serialize)]
 struct RootWindowEntry {
     root: String,
-    #[serde(flatten)]
-    produced_by: BatchEntry,
-    carried_to_lez_block_id: u64,
+    from_lez_block_id: u64,
+    to_lez_block_id: u64,
+    change_count: usize,
     changes: Vec<ChangeRecord>,
     batches: Vec<BatchEntry>,
 }
@@ -97,8 +99,9 @@ impl RootWindowEntry {
         let produced_by = entry.produced_by();
         Self {
             root: hex::encode(produced_by.root_after),
-            produced_by: BatchEntry::new(produced_by),
-            carried_to_lez_block_id: entry.carried_to_lez_block_id(),
+            from_lez_block_id: produced_by.from_lez_block_id,
+            to_lez_block_id: entry.carried_to_lez_block_id(),
+            change_count: produced_by.change_count,
             changes: produced_by.changes.clone(),
             batches: entry.batches.iter().map(|p| BatchEntry::new(p)).collect(),
         }

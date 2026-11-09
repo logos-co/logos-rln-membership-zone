@@ -192,13 +192,14 @@ batch), `published_batches`, `newest_adopted` and `newest_finalized` (root and
 `to_lez_block_id` of the newest batch in a Bedrock block, and in finalized history).
 
 `/roots` lists the roots by recency, one entry per run of batches carrying the same root. An
-entry carries the root and the batch that produced it (`msg_id`, `tx_hash`,
-`from_lez_block_id`, `to_lez_block_id`, `change_count`, `published_at_unix`, `status`,
-`l1_slot`), `changes`, the tree changes that made the root in order (`kind` `insert` with the
+entry carries the `root`, the LEZ blocks it stood for (`from_lez_block_id` of the batch that
+produced it to `to_lez_block_id` of the newest batch carrying it), `change_count` and
+`changes`, the tree changes that made the root in order (`kind` `insert` with the
 `rate_commitment` inserted or `remove` with `null`, and the `leaf_index`; empty when
-`change_count` is 0), `carried_to_lez_block_id`, the `to_lez_block_id` of the newest batch
-of the run, and `batches`, every batch of the run with the same fields, the producing one
-first (heartbeats carry the root further with `change_count` 0). A root the tree comes back
+`change_count` is 0), and `batches`, every batch of the run, the producing one first, each
+with `msg_id`, `tx_hash`, `from_lez_block_id`, `to_lez_block_id`, `published_at_unix` (the
+sequencer's clock), `published_at_slot` (the L1 slot then, the chain's clock), `status` and
+`l1_slot` (heartbeats carry the root further, their span is the proof). A root the tree comes back
 to (a leaf inserted then removed empties its slot again) is a new entry, so the window is the
 newest roots, not the newest values. A validator reads its policy off `changes`: the roots
 from the newest back to the newest whose `changes` remove a leaf are the ones no removed

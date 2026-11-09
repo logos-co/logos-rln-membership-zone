@@ -69,8 +69,14 @@ struct Roots {
 #[derive(Deserialize)]
 struct RootEntry {
     root: String,
-    status: String,
     to_lez_block_id: u64,
+    /// The batches that carried the root, the producing one first.
+    batches: Vec<BatchEntry>,
+}
+
+#[derive(Deserialize)]
+struct BatchEntry {
+    status: String,
 }
 
 fn fr_from_hex(hex: &str, what: &str) -> Result<Fr> {
@@ -153,8 +159,12 @@ async fn run(args: &Args) -> Result<bool> {
     };
     let mut valid_roots = vec![];
     for entry in &window.roots {
-        let rank =
-            status_rank(&entry.status).ok_or_else(|| anyhow!("unknown status {}", entry.status))?;
+        let status = &entry
+            .batches
+            .first()
+            .ok_or_else(|| anyhow!("a root entry without batches"))?
+            .status;
+        let rank = status_rank(status).ok_or_else(|| anyhow!("unknown status {status}"))?;
         if rank >= args.min_status {
             valid_roots.push(fr_from_hex(&entry.root, "root")?);
         }
@@ -184,7 +194,8 @@ async fn run(args: &Args) -> Result<bool> {
     match window.roots.iter().find(|e| e.root == root) {
         Some(entry) => println!(
             "proof root {root} = the Zone's root to LEZ block {} ({})",
-            entry.to_lez_block_id, entry.status
+            entry.to_lez_block_id,
+            entry.batches.first().map_or("?", |b| b.status.as_str())
         ),
         None => println!(
             "proof root {root} is not in the window (taken at the Zone's root {})",
