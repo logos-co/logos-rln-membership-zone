@@ -204,11 +204,11 @@ impl Registry {
                     .iter()
                     .map(|record| {
                         let bytes =
-                            hex::decode(&record.change).context("pending change is not hex")?;
+                            hex::decode(record.change()).context("pending change is not hex")?;
                         let change = Change::decode(bytes.as_slice()).context("pending change")?;
                         // A record written before the block was kept counts as just after
                         // `covered_to`, the only thing known about it.
-                        Ok((record.block.unwrap_or(history.covered_to + 1), change))
+                        Ok((record.block().unwrap_or(history.covered_to + 1), change))
                     })
                     .collect::<Result<_>>()?
             }
@@ -397,8 +397,8 @@ impl Registry {
         let pending_changes: Vec<PendingChangeRecord> = self
             .pending_changes
             .iter()
-            .map(|(block, change)| PendingChangeRecord {
-                block: Some(*block),
+            .map(|(block, change)| PendingChangeRecord::WithBlock {
+                block: *block,
                 change: hex::encode(change.encode_to_vec()),
             })
             .collect();
@@ -688,13 +688,28 @@ impl Registry {
 /// Slots the finality scan starts early when a batch's slot is estimated from another's.
 const SLOT_ESTIMATE_MARGIN: u64 = 600;
 
-/// A pending change as the tree store keeps it: the LEZ block that made it (`None` in a
-/// store written before the block was kept) and the change, prost in hex.
+/// A pending change as the tree store keeps it: the LEZ block that made it and the change,
+/// prost in hex. A store written before the block was kept holds the bare hex string.
 #[derive(Serialize, Deserialize)]
-struct PendingChangeRecord {
-    #[serde(default)]
-    block: Option<u64>,
-    change: String,
+#[serde(untagged)]
+enum PendingChangeRecord {
+    WithBlock { block: u64, change: String },
+    Bare(String),
+}
+
+impl PendingChangeRecord {
+    fn block(&self) -> Option<u64> {
+        match self {
+            Self::WithBlock { block, .. } => Some(*block),
+            Self::Bare(_) => None,
+        }
+    }
+
+    fn change(&self) -> &str {
+        match self {
+            Self::WithBlock { change, .. } | Self::Bare(change) => change,
+        }
+    }
 }
 
 /// Apply a batch's changes to a tree: an insert sets the leaf, a removal empties it.
@@ -979,6 +994,16 @@ mod test {
         registry.close().unwrap();
         drop(registry);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_pending_change_records_read_the_bare_format_too() {
+        let records: Vec<PendingChangeRecord> =
+            serde_json::from_str(r#"["0a00", {"block": 7, "change": "1200"}]"#).unwrap();
+        assert_eq!(records[0].block(), None);
+        assert_eq!(records[0].change(), "0a00");
+        assert_eq!(records[1].block(), Some(7));
+        assert_eq!(records[1].change(), "1200");
     }
 
     #[test]
