@@ -144,8 +144,10 @@ pub struct Registry {
     pub history: History,
     /// The tree at the latest LEZ block applied.
     pub head: Reader,
-    /// Changes of the LEZ blocks after `covered_to`, in derivation-rule order.
-    pub pending_changes: Vec<Change>,
+    /// Changes of the LEZ blocks after `covered_to`, in derivation-rule order, each with the
+    /// block that made it: the next batch's content for the sequencer, the head's lead over
+    /// the channel for the indexer; trimmed as `covered_to` advances.
+    pub pending_changes: Vec<(u64, Change)>,
     /// The Zone SDK checkpoint, as JSON.
     checkpoint: Option<Value>,
     /// Indexer: the tree the verified batches' changes replay to, in memory, rebuilt from the
@@ -196,13 +198,17 @@ impl Registry {
         // changed; a rebuild derives them again from LEZ.
         let pending_changes = match extra.get("pending_changes") {
             Some(encoded) if !rebuild => {
-                let encoded: Vec<String> = serde_json::from_value(encoded.clone())
+                let encoded: Vec<PendingChangeRecord> = serde_json::from_value(encoded.clone())
                     .context("pending changes in the tree store")?;
                 encoded
                     .iter()
-                    .map(|hex| {
-                        let bytes = hex::decode(hex).context("pending change is not hex")?;
-                        Change::decode(bytes.as_slice()).context("pending change")
+                    .map(|record| {
+                        let bytes =
+                            hex::decode(&record.change).context("pending change is not hex")?;
+                        let change = Change::decode(bytes.as_slice()).context("pending change")?;
+                        // A record written before the block was kept counts as just after
+                        // `covered_to`, the only thing known about it.
+                        Ok((record.block.unwrap_or(history.covered_to + 1), change))
                     })
                     .collect::<Result<_>>()?
             }
@@ -270,7 +276,7 @@ impl Registry {
         }
         let verification = self.verify(&batch, &changes, root_after)?;
         if verification == Verification::Verified {
-            self.history.covered_to = batch.to_lez_block_id;
+            self.cover_to(batch.to_lez_block_id);
         }
         let entry = Published {
             msg_id,
@@ -370,7 +376,7 @@ impl Registry {
                 break;
             }
             if verification == Verification::Verified {
-                self.history.covered_to = batch.to_lez_block_id;
+                self.cover_to(batch.to_lez_block_id);
             }
             self.history.published[at].verification = Some(verification);
             decided += 1;
@@ -388,10 +394,13 @@ impl Registry {
     /// Write the reader's state, the history, the pending changes and the checkpoint into the
     /// tree store.
     pub fn save(&mut self) -> Result<()> {
-        let pending_changes: Vec<String> = self
+        let pending_changes: Vec<PendingChangeRecord> = self
             .pending_changes
             .iter()
-            .map(|change| hex::encode(change.encode_to_vec()))
+            .map(|(block, change)| PendingChangeRecord {
+                block: Some(*block),
+                change: hex::encode(change.encode_to_vec()),
+            })
             .collect();
         let extra = json!({
             "history": self.history,
@@ -419,7 +428,8 @@ impl Registry {
         for block in blocks {
             let changes = self.head.apply_block(block)?;
             if block.block_id > self.history.covered_to {
-                self.pending_changes.extend(changes);
+                self.pending_changes
+                    .extend(changes.into_iter().map(|change| (block.block_id, change)));
             }
         }
         Ok(())
@@ -434,7 +444,11 @@ impl Registry {
         Some(Batch {
             from_lez_block_id: self.history.covered_to + 1,
             to_lez_block_id: self.head.applied_block_id,
-            changes: self.pending_changes.clone(),
+            changes: self
+                .pending_changes
+                .iter()
+                .map(|(_, change)| change.clone())
+                .collect(),
             root_after: self.head.root().to_vec(),
         })
     }
@@ -466,8 +480,14 @@ impl Registry {
             status: Status::Pending,
             verification: None,
         });
-        self.history.covered_to = batch.to_lez_block_id;
-        self.pending_changes.clear();
+        self.cover_to(batch.to_lez_block_id);
+    }
+
+    /// A batch covers the LEZ blocks up to `to`: the changes of those blocks are no longer
+    /// pending.
+    fn cover_to(&mut self, to: u64) {
+        self.history.covered_to = to;
+        self.pending_changes.retain(|(block, _)| *block > to);
     }
 
     /// A reorg dropped the message `old`: the same batch goes out again as `new_msg_id` (a
@@ -667,6 +687,15 @@ impl Registry {
 
 /// Slots the finality scan starts early when a batch's slot is estimated from another's.
 const SLOT_ESTIMATE_MARGIN: u64 = 600;
+
+/// A pending change as the tree store keeps it: the LEZ block that made it (`None` in a
+/// store written before the block was kept) and the change, prost in hex.
+#[derive(Serialize, Deserialize)]
+struct PendingChangeRecord {
+    #[serde(default)]
+    block: Option<u64>,
+    change: String,
+}
 
 /// Apply a batch's changes to a tree: an insert sets the leaf, a removal empties it.
 fn apply_changes(
@@ -886,7 +915,11 @@ mod test {
             }
             .encode_to_vec()
         };
-        let changes_1: Vec<Change> = registry.pending_changes.clone();
+        let changes_1: Vec<Change> = registry
+            .pending_changes
+            .iter()
+            .map(|(_, c)| c.clone())
+            .collect();
         assert_eq!(changes_1.len(), 2);
 
         // A batch claiming the right root with the right changes: verified.
@@ -901,6 +934,8 @@ mod test {
         assert_eq!(ok.verification, Some(Verification::Verified));
         assert_eq!(registry.history.covered_to, 1);
         assert_eq!(registry.replay_root(), Some(root_1));
+        // The changes the batch covered are no longer the head's lead over the channel.
+        assert!(registry.pending_changes.is_empty());
 
         // A batch for blocks the indexer has not read yet: pending, then checked.
         let pending = registry
@@ -925,7 +960,12 @@ mod test {
         assert_eq!(registry.history.covered_to, 1);
         assert_eq!(registry.replay_root(), Some(root_1));
         let root_3 = registry.head.root();
-        let changes_3: Vec<Change> = registry.pending_changes.clone();
+        assert_eq!(registry.pending_changes.len(), 1);
+        let changes_3: Vec<Change> = registry
+            .pending_changes
+            .iter()
+            .map(|(_, c)| c.clone())
+            .collect();
         let ok = registry
             .observe_batch([3; 32], [3; 32], &batch(2, 3, changes_3, root_3), 300)
             .unwrap();

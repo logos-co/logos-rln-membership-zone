@@ -126,7 +126,7 @@ impl RootWindowEntry {
             changes: registry
                 .pending_changes
                 .iter()
-                .filter_map(ChangeRecord::from_change)
+                .filter_map(|(_, change)| ChangeRecord::from_change(change))
                 .collect(),
             batches: vec![],
         })
