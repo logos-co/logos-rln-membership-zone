@@ -171,9 +171,15 @@ async fn run(args: &Args) -> Result<bool> {
         .graph(default_graph_single().clone())
         .zkey(default_zkey_single().clone())
         .build();
-    let verified = rln
-        .verify_with_roots(&proof, &values, &x, &valid_roots)
-        .context("verify")?;
+    // `Ok(false)` is the zkSNARK's verdict; `Err` is a public input that does not match the
+    // proof (the signal, the roots), a refusal for a validator all the same.
+    let verified = match rln.verify_with_roots(&proof, &values, &x, &valid_roots) {
+        Ok(verified) => verified,
+        Err(e) => {
+            println!("the proof does not match its public inputs: {e}");
+            false
+        }
+    };
     let root = fr_to_hex(&values.root());
     match window.roots.iter().find(|e| e.root == root) {
         Some(entry) => println!(
