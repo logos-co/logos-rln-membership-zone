@@ -6,7 +6,8 @@
 # Registers one membership from the payer wallet (lez-rln `register_member`), then watches
 # the Zone sequencer: the membership appears at `/merkle_proof/<id_commitment>` with the
 # leaf index the registration claimed and a proof path, and the root that includes it is
-# published in a batch (`/roots`), pending first, adopted once Bedrock holds it.
+# published in a batch (`/roots`), pending first, adopted once Bedrock holds it. The
+# membership (leaf, id_commitment, identity secret) goes on record for slash.sh and proof.sh.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${1:?usage: register.sh <network.env>}"
@@ -30,10 +31,8 @@ id_commitment=$(printf '%s\n' "$out" | sed -n 's/^ID_COMMITMENT=//p')
 leaf_index=$(printf '%s\n' "$out" | sed -n 's/^LEAF_INDEX=//p')
 identity_secret=$(printf '%s\n' "$out" | sed -n 's/^IDENTITY_SECRET_HASH=//p')
 [ -n "$id_commitment" ] && [ -n "$leaf_index" ] || die "register_member printed no ID_COMMITMENT / LEAF_INDEX"
-# The last registration, for slash.sh.
-state_set last_id_commitment "$id_commitment"
-state_set last_leaf_index "$leaf_index"
-state_set last_identity_secret "$identity_secret"
+# On record for slash.sh and proof.sh.
+membership_set "$leaf_index" "$id_commitment" "$identity_secret"
 
 say "waiting for the zone to apply leaf $leaf_index"
 for _ in $(seq 1 60); do

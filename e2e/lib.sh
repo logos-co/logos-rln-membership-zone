@@ -25,6 +25,29 @@ state_del() {
     jq --arg k "$1" 'del(.[$k])' "$STATE_JSON" > "$STATE_JSON.tmp" && mv "$STATE_JSON.tmp" "$STATE_JSON"
 }
 
+# ---- memberships -----------------------------------------------------------------------------
+# Every registration this harness made, by leaf index: `memberships.<leaf>` =
+# {id_commitment, identity_secret, slashed}. The secret is born in `register_member` and
+# cannot be read back from anywhere, so it lives here.
+
+membership_set() {
+    jq --arg leaf "$1" --arg id "$2" --arg secret "$3" \
+        '.memberships[$leaf] = {id_commitment: $id, identity_secret: $secret, slashed: false}' \
+        "$STATE_JSON" > "$STATE_JSON.tmp" && mv "$STATE_JSON.tmp" "$STATE_JSON"
+}
+membership_mark_slashed() {
+    jq --arg leaf "$1" '.memberships[$leaf].slashed = true' "$STATE_JSON" > "$STATE_JSON.tmp" \
+        && mv "$STATE_JSON.tmp" "$STATE_JSON"
+}
+# "<leaf> <id_commitment> <identity_secret>" of the leaf given, or of the newest one not slashed.
+membership_pick() {
+    if [ -n "${1:-}" ]; then
+        jq -r --arg leaf "$1" '.memberships[$leaf] | select(. != null) | "\($leaf) \(.id_commitment) \(.identity_secret)"' "$STATE_JSON"
+    else
+        jq -r '.memberships // {} | to_entries | map(select(.value.slashed == false)) | sort_by(.key | tonumber) | last | select(. != null) | "\(.key) \(.value.id_commitment) \(.value.identity_secret)"' "$STATE_JSON"
+    fi
+}
+
 # ---- chain reads ---------------------------------------------------------------------------
 
 lez_rpc() {
@@ -61,6 +84,16 @@ lez_rln_bin() {
         [ -x "$candidate" ] && { echo "$candidate"; return 0; }
     done
     die "no $name under $LEZ_RLN_CHECKOUT/lez-rln/target: cargo build --bin $name there (LEZ_RLN_CHECKOUT)"
+}
+
+# A zone-sequencer binary (`generate_proof`, `verify_proof`), debug build first, release second.
+zone_bin() {
+    local name="$1" repo candidate
+    repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    for candidate in "$repo/target/debug/$name" "$repo/target/release/$name"; do
+        [ -x "$candidate" ] && { echo "$candidate"; return 0; }
+    done
+    die "no $name under $repo/target: cargo build -p zone-sequencer --bins"
 }
 
 # The environment the lez-rln binaries read: wallet, payer, registry.

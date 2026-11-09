@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # e2e/scenarios/slash.sh: slash the membership register.sh made, seen end to end.
 #
-#   bash e2e/scenarios/slash.sh <network.env>
+#   bash e2e/scenarios/slash.sh <network.env> [leaf_index]
 #
-# Reveals the identity secret of the last registration (lez-rln `slash_member`, paid by the
-# payer), then watches the Zone sequencer: the membership turns `active: false`, `removed:
-# slashed`, its proof goes away, and a batch with the new root is published (`Remove leaf N`).
+# Reveals the identity secret of a registration register.sh made (the leaf given, else the
+# newest not slashed yet; lez-rln `slash_member`, paid by the payer), then watches the Zone
+# sequencer: the membership turns `active: false`, `removed: slashed`, its proof goes away,
+# and a batch with the new root is published (`Remove leaf N`).
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_FILE="${1:?usage: slash.sh <network.env>}"
+ENV_FILE="${1:?usage: slash.sh <network.env> [leaf_index]}"
 # shellcheck source=/dev/null
 . "$ENV_FILE"
 # shellcheck source=/dev/null
@@ -16,10 +17,8 @@ ENV_FILE="${1:?usage: slash.sh <network.env>}"
 
 slash_member=$(lez_rln_bin slash_member)
 lez_rln_env
-id_commitment=$(state_get last_id_commitment)
-leaf_index=$(state_get last_leaf_index)
-identity_secret=$(state_get last_identity_secret)
-[ -n "$id_commitment" ] && [ -n "$identity_secret" ] || die "no registration on record: run register.sh first"
+read -r leaf_index id_commitment identity_secret <<< "$(membership_pick "${2:-}")"
+[ -n "${identity_secret:-}" ] || die "no registration to slash on record${2:+ at leaf $2}: run register.sh first"
 membership=$(zone "/merkle_proof/$id_commitment") || die "the zone does not know $id_commitment"
 [ "$(printf '%s' "$membership" | jq -r '.active')" = "true" ] || die "leaf $leaf_index is not active, nothing to slash"
 
@@ -43,6 +42,7 @@ done
     || die "removed is $(printf '%s' "$membership" | jq -r '.removed'), not slashed"
 [ "$(printf '%s' "$membership" | jq -r '.proof')" = "null" ] || die "a removed membership still has a proof"
 root=$(printf '%s' "$membership" | jq -r '.root')
+membership_mark_slashed "$leaf_index"
 say "leaf $leaf_index slashed, root $root"
 
 # A removed leaf leaves its slot empty, so the root may be one the zone published before;

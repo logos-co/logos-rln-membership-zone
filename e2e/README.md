@@ -17,6 +17,8 @@ chain side. Everything that holds funds or state lives under `E2E_STATE` (defaul
   `mint_payer`, `register_member`, `slash_member` and `account_balance` built (`cargo build
   --bin ...` in its `lez-rln/`; debug is fine). `LEZ_RLN_CHECKOUT` points to it, default `~/logos-lez-rln`.
 - `curl`, `jq`, `python3`, `yq` (reads the node keystore).
+- The zone-sequencer bins `generate_proof` and `verify_proof` built (`cargo build -p
+  zone-sequencer --bins`), for `proof.sh`.
 
 ## Testnet
 
@@ -38,4 +40,5 @@ then watches `/merkle_proof/<id_commitment>` for the leaf with the claimed index
 | Script | Checks |
 | --- | --- |
 | `scenarios/register.sh <env>` | registration -> leaf and proof at the zone -> root published; records the membership for `slash.sh` |
+| `scenarios/proof.sh <env>` | RLN proof from `/merkle_proof` of the last registration (`generate_proof`) verifies against `/roots` (`verify_proof`); the same proof over another message is refused |
 | `scenarios/slash.sh <env>` | slash of the last registration -> `removed: slashed`, no proof -> new root published |
