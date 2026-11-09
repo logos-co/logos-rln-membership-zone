@@ -1,10 +1,11 @@
 //! The registry the sequencer holds and the HTTP API serves: the tree at the LEZ head, the
 //! changes not yet in a batch, and every batch published with the status of its Mantle
 //! Transaction on Bedrock. Everything is kept in the tree store (`data/tree/`): the tree and
-//! the reader's state by the reader, the batch history, the pending changes and the Zone SDK
-//! checkpoint as the reader's `extra`.
+//! the reader's state by the reader, the batch history (every batch with its changes, so the
+//! inscription it carried can be built again), the pending changes and the Zone SDK checkpoint
+//! as the reader's `extra`. What the channel holds, this store holds too.
 
-use std::{collections::HashMap, path::Path};
+use std::path::Path;
 
 use anyhow::{Context as _, Result};
 use prost::Message as _;
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    batch::{Batch, Change},
+    batch::{Batch, Change, Kind},
     lez::Block,
     reader::Reader,
 };
@@ -33,6 +34,50 @@ pub enum Status {
     Finalized { l1_slot: u64 },
 }
 
+/// One tree change a batch carried, as the history keeps it and the API shows it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeRecord {
+    pub kind: ChangeKind,
+    pub leaf_index: u64,
+    /// The leaf inserted, 32 bytes little-endian in hex; `None` for a removal.
+    pub rate_commitment: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    Insert,
+    Remove,
+}
+
+impl ChangeRecord {
+    /// A change without a kind (prost's `None`) cannot come from this sequencer.
+    pub fn from_change(change: &Change) -> Option<Self> {
+        Some(match change.kind.as_ref()? {
+            Kind::Insert(insert) => Self {
+                kind: ChangeKind::Insert,
+                leaf_index: insert.leaf_index,
+                rate_commitment: Some(hex::encode(&insert.rate_commitment)),
+            },
+            Kind::Remove(remove) => Self {
+                kind: ChangeKind::Remove,
+                leaf_index: remove.leaf_index,
+                rate_commitment: None,
+            },
+        })
+    }
+
+    pub fn to_change(&self) -> Option<Change> {
+        Some(match self.kind {
+            ChangeKind::Insert => Change::insert(
+                self.leaf_index,
+                hex::decode(self.rate_commitment.as_ref()?).ok()?,
+            ),
+            ChangeKind::Remove => Change::remove(self.leaf_index),
+        })
+    }
+}
+
 /// One batch this sequencer published, tracked by its inscription's message id: the Zone SDK
 /// re-funds a transaction that stays unmined (`stale_refund_slots`) under a new transaction
 /// hash but the same message id.
@@ -49,6 +94,10 @@ pub struct Published {
     #[serde(with = "hex::serde")]
     pub root_after: [u8; 32],
     pub change_count: usize,
+    /// The changes the batch carried, in order; empty with `change_count` > 0 only for a batch
+    /// published before the history kept them.
+    #[serde(default)]
+    pub changes: Vec<ChangeRecord>,
     pub published_at_unix: u64,
     /// The L1 slot at publish time: where the finality scan starts looking for it. `None` for
     /// a batch published before the slot was recorded.
@@ -78,8 +127,6 @@ pub struct Registry {
     pub pending_changes: Vec<Change>,
     /// The Zone SDK checkpoint, as JSON.
     checkpoint: Option<Value>,
-    /// The payload of each published batch, by message id, to publish it again after a reorg.
-    payloads: HashMap<[u8; 32], Vec<u8>>,
 }
 
 impl Registry {
@@ -137,51 +184,25 @@ impl Registry {
             }
             _ => vec![],
         };
-        // The payloads of the batches not finalized yet, to publish one again after a reorg
-        // and to recognise it when Bedrock finality reaches it, keyed by message id (hex).
-        let payloads = match extra.get("payloads") {
-            Some(encoded) => {
-                let encoded: HashMap<String, String> = serde_json::from_value(encoded.clone())
-                    .context("payloads in the tree store")?;
-                encoded
-                    .iter()
-                    .map(|(msg_id, payload)| {
-                        let msg_id = hex::decode(msg_id)
-                            .ok()
-                            .and_then(|v| <[u8; 32]>::try_from(v).ok())
-                            .context("payload message id is not 32 bytes of hex")?;
-                        Ok((msg_id, hex::decode(payload).context("payload is not hex")?))
-                    })
-                    .collect::<Result<_>>()?
-            }
-            None => HashMap::new(),
-        };
         Ok(Self {
             history,
             head,
             pending_changes,
             checkpoint,
-            payloads,
         })
     }
 
-    /// Write the reader's state, the history, the pending changes, the payloads of the
-    /// batches not finalized yet and the checkpoint into the tree store.
+    /// Write the reader's state, the history, the pending changes and the checkpoint into the
+    /// tree store.
     pub fn save(&mut self) -> Result<()> {
         let pending_changes: Vec<String> = self
             .pending_changes
             .iter()
             .map(|change| hex::encode(change.encode_to_vec()))
             .collect();
-        let payloads: HashMap<String, String> = self
-            .payloads
-            .iter()
-            .map(|(msg_id, payload)| (hex::encode(msg_id), hex::encode(payload)))
-            .collect();
         let extra = json!({
             "history": self.history,
             "pending_changes": pending_changes,
-            "payloads": payloads,
             "checkpoint": self.checkpoint,
         });
         self.head.persist(extra)
@@ -231,7 +252,6 @@ impl Registry {
         msg_id: [u8; 32],
         tx_hash: [u8; 32],
         batch: &Batch,
-        payload: Vec<u8>,
         published_at_slot: Option<u64>,
     ) {
         let mut root_after = [0u8; 32];
@@ -243,13 +263,17 @@ impl Registry {
             to_lez_block_id: batch.to_lez_block_id,
             root_after,
             change_count: batch.changes.len(),
+            changes: batch
+                .changes
+                .iter()
+                .filter_map(ChangeRecord::from_change)
+                .collect(),
             published_at_unix: now_unix(),
             published_at_slot,
             status: Status::Pending,
         });
         self.history.covered_to = batch.to_lez_block_id;
         self.pending_changes.clear();
-        self.payloads.insert(msg_id, payload);
     }
 
     /// A reorg dropped the message `old`: the same batch goes out again as `new_msg_id` (a
@@ -265,18 +289,35 @@ impl Registry {
         again.status = Status::Pending;
         again.published_at_unix = now_unix();
         self.history.published.push(again);
-        if let Some(payload) = self.payloads.remove(&old) {
-            self.payloads.insert(new_msg_id, payload);
+    }
+
+    /// The inscription the batch `msg_id` carried, built again from the history (the batch
+    /// wire format is deterministic): to publish it again after a reorg and to recognise it
+    /// when Bedrock finality reaches it. `None` for an unknown message id or a batch whose
+    /// changes the history does not have.
+    pub fn payload(&self, msg_id: &[u8; 32]) -> Option<Vec<u8>> {
+        let p = self
+            .history
+            .published
+            .iter()
+            .find(|p| p.msg_id == *msg_id)?;
+        if p.changes.len() != p.change_count {
+            return None;
         }
-    }
-
-    pub fn payload(&self, msg_id: &[u8; 32]) -> Option<&Vec<u8>> {
-        self.payloads.get(msg_id)
-    }
-
-    /// A finalized batch is never published again nor compared again: its payload goes.
-    pub fn drop_payload(&mut self, msg_id: &[u8; 32]) {
-        self.payloads.remove(msg_id);
+        let changes = p
+            .changes
+            .iter()
+            .map(ChangeRecord::to_change)
+            .collect::<Option<Vec<_>>>()?;
+        Some(
+            Batch {
+                from_lez_block_id: p.from_lez_block_id,
+                to_lez_block_id: p.to_lez_block_id,
+                changes,
+                root_after: p.root_after.to_vec(),
+            }
+            .encode_to_vec(),
+        )
     }
 
     /// Bedrock finality reached the batch `msg_id` at `l1_slot`, carrying `tx_hash` and
@@ -302,7 +343,6 @@ impl Registry {
         }
         entry.status = Status::Finalized { l1_slot };
         entry.tx_hash = tx_hash;
-        self.drop_payload(msg_id);
         Ok(self.history.published.iter().find(|p| p.msg_id == *msg_id))
     }
 
@@ -362,24 +402,12 @@ impl Registry {
             .find(|p| matches!(p.status, Status::Finalized { .. }))
     }
 
-    /// The published batches newest first, at most `window_size`, Orphaned ones left out.
-    pub fn batches(&self, window_size: usize) -> Vec<&Published> {
-        self.history
-            .published
-            .iter()
-            .rev()
-            .filter(|p| p.status != Status::Orphaned)
-            .take(window_size)
-            .collect()
-    }
-
     /// The roots newest first, at most `window_size`: one entry per run of batches carrying
-    /// the same root, the batch that produced it (its `change_count` is what made the root,
-    /// and it is the first of the run to be adopted or finalized) with
-    /// `carried_to_lez_block_id`, the last LEZ block the root stood for (the `to_lez_block_id`
-    /// of the newest batch of the run, a heartbeat as a rule). A root the tree comes back to
-    /// later (a leaf inserted then removed empties its slot again) is a new run, so the window
-    /// stays ordered by recency. Orphaned batches are left out.
+    /// the same root, the batch that produced it first (its changes are what made the root)
+    /// and every batch of the run after it (heartbeats as a rule, carrying the root further).
+    /// A root the tree comes back to later (a leaf inserted then removed empties its slot
+    /// again) is a new run, so the window stays ordered by recency. Orphaned batches are left
+    /// out.
     pub fn roots(&self, window_size: usize) -> Vec<RootEntry<'_>> {
         let mut entries: Vec<RootEntry<'_>> = vec![];
         for p in self
@@ -389,13 +417,8 @@ impl Registry {
             .filter(|p| p.status != Status::Orphaned)
         {
             match entries.last_mut() {
-                Some(entry) if entry.produced_by.root_after == p.root_after => {
-                    entry.carried_to_lez_block_id = p.to_lez_block_id;
-                }
-                _ => entries.push(RootEntry {
-                    produced_by: p,
-                    carried_to_lez_block_id: p.to_lez_block_id,
-                }),
+                Some(entry) if entry.batches[0].root_after == p.root_after => entry.batches.push(p),
+                _ => entries.push(RootEntry { batches: vec![p] }),
             }
         }
         entries.reverse();
@@ -416,11 +439,22 @@ pub enum FinalizeRefused {
     PayloadDiffers,
 }
 
-/// A root of the valid-root window: the batch that produced it and how far it was carried.
+/// A root of the valid-root window: the run of batches that carried it, the one that produced
+/// it first.
 pub struct RootEntry<'a> {
-    pub produced_by: &'a Published,
-    /// `to_lez_block_id` of the newest batch carrying this root.
-    pub carried_to_lez_block_id: u64,
+    pub batches: Vec<&'a Published>,
+}
+
+impl RootEntry<'_> {
+    /// The batch whose changes made the root.
+    pub fn produced_by(&self) -> &Published {
+        self.batches[0]
+    }
+
+    /// `to_lez_block_id` of the newest batch carrying the root.
+    pub fn carried_to_lez_block_id(&self) -> u64 {
+        self.batches[self.batches.len() - 1].to_lez_block_id
+    }
 }
 
 pub fn now_unix() -> u64 {
@@ -456,7 +490,7 @@ mod test {
     }
 
     #[test]
-    fn test_roots_window_finality_marks_and_payloads_survive_a_restart() {
+    fn test_roots_window_finality_marks_and_the_history_rebuilds_the_payloads() {
         let dir = std::env::temp_dir().join(format!("zone-roots-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
@@ -467,7 +501,17 @@ mod test {
                 changes: vec![],
                 root_after: vec![root; 32],
             };
-            registry.on_published([n; 32], [n; 32], &batch, vec![root], Some(u64::from(n)));
+            registry.on_published([n; 32], [n; 32], &batch, Some(u64::from(n)));
+        };
+        // The inscription a published batch carried, as the history builds it again.
+        let payload_of = |n: u8, root: u8| {
+            Batch {
+                from_lez_block_id: u64::from(n),
+                to_lez_block_id: u64::from(n),
+                changes: vec![],
+                root_after: vec![root; 32],
+            }
+            .encode_to_vec()
         };
         // Root A, a heartbeat carrying A, root B, back to A (a leaf inserted then removed).
         publish(&mut registry, 1, 0xA);
@@ -475,18 +519,19 @@ mod test {
         publish(&mut registry, 3, 0xB);
         publish(&mut registry, 4, 0xA);
         let roots = registry.roots(10);
-        let runs: Vec<(u8, u64, u64)> = roots
+        let runs: Vec<(u8, u64, u64, usize)> = roots
             .iter()
             .map(|e| {
                 (
-                    e.produced_by.root_after[0],
-                    e.produced_by.from_lez_block_id,
-                    e.carried_to_lez_block_id,
+                    e.produced_by().root_after[0],
+                    e.produced_by().from_lez_block_id,
+                    e.carried_to_lez_block_id(),
+                    e.batches.len(),
                 )
             })
             .collect();
-        assert_eq!(runs, vec![(0xA, 4, 4), (0xB, 3, 3), (0xA, 1, 2)]);
-        assert_eq!(registry.roots(1)[0].produced_by.root_after[0], 0xA);
+        assert_eq!(runs, vec![(0xA, 4, 4, 1), (0xB, 3, 3, 1), (0xA, 1, 2, 2)]);
+        assert_eq!(registry.roots(1)[0].produced_by().root_after[0], 0xA);
         // Finality: the oldest waiting batch is where the scan starts; a wrong payload is
         // refused; a batch marked final drops its payload and leaves the scan range.
         assert_eq!(registry.finality_scan_from(), Some(1));
@@ -499,13 +544,13 @@ mod test {
             Some(FinalizeRefused::NotOurs)
         );
         let marked = registry
-            .on_finalized(&[1; 32], [9; 32], &[0xA], 500)
+            .on_finalized(&[1; 32], [9; 32], &payload_of(1, 0xA), 500)
             .unwrap()
             .unwrap();
         assert_eq!(marked.status, Status::Finalized { l1_slot: 500 });
         assert!(
             registry
-                .on_finalized(&[1; 32], [9; 32], &[0xA], 500)
+                .on_finalized(&[1; 32], [9; 32], &payload_of(1, 0xA), 500)
                 .unwrap()
                 .is_none()
         );
@@ -525,13 +570,14 @@ mod test {
         registry.history.published[0].status = Status::Finalized { l1_slot: 2000 };
         assert_eq!(registry.finality_scan_from(), Some(2000 - 100 - 600));
         registry.history.finality_scanned_to = Some(600);
-        // The payloads of the batches not finalized yet survive a restart.
+        // The history survives a restart and still builds every batch's inscription.
         registry.save().unwrap();
         registry.close().unwrap();
         drop(registry);
         let registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
-        assert_eq!(registry.payload(&[1; 32]), None);
-        assert_eq!(registry.payload(&[4; 32]), Some(&vec![0xA]));
+        assert_eq!(registry.payload(&[1; 32]), Some(payload_of(1, 0xA)));
+        assert_eq!(registry.payload(&[4; 32]), Some(payload_of(4, 0xA)));
+        assert_eq!(registry.payload(&[7; 32]), None);
         assert_eq!(registry.history.finality_scanned_to, Some(600));
         drop(registry);
         let _ = std::fs::remove_dir_all(&dir);

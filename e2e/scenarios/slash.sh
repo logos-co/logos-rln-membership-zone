@@ -45,15 +45,16 @@ root=$(printf '%s' "$membership" | jq -r '.root')
 membership_mark_slashed "$leaf_index"
 say "leaf $leaf_index slashed, root $root"
 
-# A removed leaf leaves its slot empty, so the root may be one the zone published before;
-# the proof is a NEW batch, published after the slash, carrying the change and that root.
-say "waiting for a batch published after the slash with that root"
+# A removed leaf leaves its slot empty, so the root may be one the zone published before; the
+# proof is a NEW root entry, produced after the slash by a batch whose changes remove the leaf.
+say "waiting for a root entry produced after the slash that removes leaf $leaf_index"
 for _ in $(seq 1 90); do
-    status=$(zone /batches/5 | jq -r --arg r "$root" --argjson t "$slashed_at" \
-        '.batches[] | select(.root == $r and .published_at_unix >= $t and .change_count > 0) | .status' | head -1)
+    status=$(zone /roots/5 | jq -r --arg r "$root" --argjson t "$slashed_at" --argjson leaf "$leaf_index" \
+        '.roots[] | select(.root == $r and .published_at_unix >= $t
+            and any(.changes[]; .kind == "remove" and .leaf_index == $leaf)) | .status' | head -1)
     [ -n "$status" ] && break
     sleep 10
 done
-[ -n "$status" ] || die "no batch with root $root published after the slash within 15 minutes"
-say "batch with root $root is $status"
+[ -n "$status" ] || die "no root entry removing leaf $leaf_index published after the slash within 15 minutes"
+say "root $root, produced by the batch removing leaf $leaf_index, is $status"
 echo "ID_COMMITMENT=$id_commitment LEAF_INDEX=$leaf_index ROOT=$root STATUS=$status"

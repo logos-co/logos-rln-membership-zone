@@ -499,7 +499,7 @@ async fn main() -> Result<()> {
                     for tx in channel_update.orphaned() {
                         let Some(info) = tx.inscription() else { continue };
                         let old = msg_bytes(&info.this_msg);
-                        let payload = registry.read().expect("registry lock").payload(&old).cloned();
+                        let payload = registry.read().expect("registry lock").payload(&old);
                         let Some(payload) = payload else { continue };
                         let inscription = Inscription::try_from(payload).map_err(|e| anyhow!("payload too large: {e:?}"))?;
                         match sdk.handle().publish(inscription).await {
@@ -552,8 +552,7 @@ async fn main() -> Result<()> {
                     if due { registry.next_batch() } else { None }
                 };
                 let Some(batch) = batch else { continue };
-                let payload = batch.encode_to_vec();
-                let inscription = match Inscription::try_from(payload.clone()) {
+                let inscription = match Inscription::try_from(batch.encode_to_vec()) {
                     Ok(inscription) => inscription,
                     Err(e) => { println!("batch [{}..{}] does not fit one inscription: {e:?}", batch.from_lez_block_id, batch.to_lez_block_id); continue; }
                 };
@@ -569,7 +568,7 @@ async fn main() -> Result<()> {
                         let tx_hash = tx_bytes(&result.inscription_id());
                         {
                             let mut registry = registry.write().expect("registry lock");
-                            registry.on_published(msg, tx_hash, &batch, payload, published_at_slot);
+                            registry.on_published(msg, tx_hash, &batch, published_at_slot);
                             registry.save()?;
                         }
                         save_checkpoint(&registry, &checkpoint)?;

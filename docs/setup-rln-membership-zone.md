@@ -163,8 +163,7 @@ rm -rf zone-sequencer/data/tree
 
 ```bash
 curl -s localhost:3000/ | jq                  # channel, LEZ head, covered block, counters, newest roots
-curl -s localhost:3000/roots/5 | jq           # newest 5 roots, the batch that produced each
-curl -s localhost:3000/batches/5 | jq         # newest 5 batches as published, heartbeats included
+curl -s localhost:3000/roots/5 | jq           # newest 5 roots: the changes that made each, its batches on Bedrock
 curl -s localhost:3000/merkle_proof/0 | jq    # membership at leaf 0 and its proof path at the LEZ head
 curl -s localhost:3000/merkle_proof/<id_commitment hex> | jq   # the same, by identity commitment
 curl -s localhost:3000/leaves | jq            # active memberships with expiry, removed ones with why
@@ -174,9 +173,10 @@ curl -s localhost:3000/health
 Words used the same way in every answer: `lez_block_id` and `lez_timestamp_ms` are the LEZ
 block the tree is at (its timestamp is the clock expiry runs on) and `root` the tree's root
 there; `status` is always a batch's status on Bedrock (`pending`, `adopted`, `orphaned`,
-`finalized` with its `l1_slot`); a membership is `active` (its leaf is in the tree and it
-proves, through its grace period included) or `removed` for `expired`, `slashed` or `erased`.
-32-byte values are hex, little-endian.
+`finalized`; `l1_slot` is set at `finalized`, `null` before); a membership is `active` (its
+leaf is in the tree and it proves, through its grace period included) or `removed` for
+`expired`, `slashed` or `erased`. 32-byte values are hex, little-endian. Every key is always
+present: a value that does not apply is `null`, never absent.
 
 `/` adds `zone_channel_id`, `lez_source`, `first_lez_block_id` and `covered_to_lez_block_id`
 (the last block a published batch covers), `lez_events` (the program's events applied:
@@ -191,14 +191,18 @@ that landed after the reader had expired the leaf), `pending_changes` (waiting f
 batch), `published_batches`, `newest_adopted` and `newest_finalized` (root and
 `to_lez_block_id` of the newest batch in a Bedrock block, and in finalized history).
 
-A batch entry (`/batches`, `/roots`) carries `root`, `from_lez_block_id`, `to_lez_block_id`,
-`change_count`, `published_at_unix`, `status`, `tx_hash` and `msg_id`. `/batches` lists the
-batches as published, so a heartbeat shows the previous root with `change_count` 0. `/roots`
-lists the roots by recency, one entry per run of batches carrying the same root: the batch
-that produced it (its `change_count` is what made the root, and it is the first of the run to
-reach `adopted` and `finalized`) plus `carried_to_lez_block_id`, the `to_lez_block_id` of the
-newest batch of the run. A root the tree comes back to (a leaf inserted then removed empties
-its slot again) is a new entry, so the window is the newest roots, not the newest values.
+`/roots` lists the roots by recency, one entry per run of batches carrying the same root. An
+entry carries the root and the batch that produced it (`msg_id`, `tx_hash`,
+`from_lez_block_id`, `to_lez_block_id`, `change_count`, `published_at_unix`, `status`,
+`l1_slot`), `changes`, the tree changes that made the root in order (`kind` `insert` with the
+`rate_commitment` inserted or `remove` with `null`, and the `leaf_index`; empty when
+`change_count` is 0), `carried_to_lez_block_id`, the `to_lez_block_id` of the newest batch
+of the run, and `batches`, every batch of the run with the same fields, the producing one
+first (heartbeats carry the root further with `change_count` 0). A root the tree comes back
+to (a leaf inserted then removed empties its slot again) is a new entry, so the window is the
+newest roots, not the newest values. A validator reads its policy off `changes`: the roots
+from the newest back to the newest whose `changes` remove a leaf are the ones no removed
+member can still prove under; older roots in the window still hold that leaf.
 
 `/merkle_proof` answers 404 for an unknown leaf index or identity commitment. The answer
 carries the membership (`leaf_index`, `id_commitment`, `active`, `removed`,
@@ -386,7 +390,7 @@ fee per batch), `lib_slot` against `slot` (finality), the time from `pending` to
 - `LEZ read failed: getBlockRange: {"code":-32008,... "Response is too big"}` repeating:
   fixed (the span is halved down to one block); an older build needs the fix, not a restart.
 - The first batch of a channel carries a root but `no changes` in the log (`change_count`
-  0 in `/batches`): fixed (the pending changes are persisted with the tree; before, a
+  0 in `/roots`): fixed (the pending changes are persisted with the tree; before, a
   restart between reading LEZ and publishing lost them). A channel whose first batch is
   like that cannot be replayed by an indexer: start a new one (section 3).
 - `history N batches published ... (checkpoint resumed)` right after changing

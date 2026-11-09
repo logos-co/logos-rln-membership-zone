@@ -1,10 +1,11 @@
-//! The HTTP API a Module's node reads (its registry access): the roots with the status of
-//! their transaction on Bedrock, the Merkle proof path of a leaf at the tree of the LEZ head,
-//! a membership's state.
+//! The HTTP API a Module's node reads (its registry access): the roots with the changes that
+//! made them and the status of their batches on Bedrock, the Merkle proof path of a leaf at
+//! the tree of the LEZ head, a membership's state.
 //! 32-byte values are hex, little-endian (RLN-API Appendix B). Every answer carries
 //! `lez_block_id` and `lez_timestamp_ms`, the LEZ block the tree is at, and the tree's `root`
 //! there; `status` is always a batch's status on Bedrock (`pending`, `adopted`, `orphaned`,
-//! `finalized` with `l1_slot`), a membership is `active` or not.
+//! `finalized`, with `l1_slot` set at `finalized` and `null` before), a membership is `active`
+//! or not. Every key is always present: a value that does not apply is `null`, never absent.
 
 use std::sync::{Arc, RwLock};
 
@@ -19,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::{
     reader::Removed,
-    registry::{Published, Registry, RootEntry, Status},
+    registry::{ChangeRecord, Published, Registry, RootEntry, Status},
 };
 
 pub type Shared = Arc<RwLock<Registry>>;
@@ -36,49 +37,70 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(summary))
         .route("/health", get(|| async { "ok" }))
         .route("/roots/{window_size}", get(roots))
-        .route("/batches/{window_size}", get(batches))
         .route("/merkle_proof/{leaf}", get(merkle_proof))
         .route("/leaves", get(leaves))
         .with_state(state)
 }
 
-/// A published batch as the API shows it: the root it carried, the LEZ blocks it covers, how
-/// many changes it listed and where its transaction stands on Bedrock. In `/roots`,
-/// `carried_to_lez_block_id` is added: the last LEZ block the root stood for.
+/// A published batch as the API shows it: the LEZ blocks it covers, how many changes it
+/// listed and where its transaction stands on Bedrock.
 #[derive(Serialize)]
 struct BatchEntry {
-    root: String,
+    msg_id: String,
+    tx_hash: String,
     from_lez_block_id: u64,
     to_lez_block_id: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    carried_to_lez_block_id: Option<u64>,
     change_count: usize,
     published_at_unix: u64,
-    #[serde(flatten)]
-    status: Status,
-    tx_hash: String,
-    msg_id: String,
+    status: &'static str,
+    /// The L1 slot of the block that finalized it; `null` before.
+    l1_slot: Option<u64>,
 }
 
 impl BatchEntry {
     fn new(p: &Published) -> Self {
+        let (status, l1_slot) = match p.status {
+            Status::Pending => ("pending", None),
+            Status::Adopted => ("adopted", None),
+            Status::Orphaned => ("orphaned", None),
+            Status::Finalized { l1_slot } => ("finalized", Some(l1_slot)),
+        };
         Self {
-            root: hex::encode(p.root_after),
+            msg_id: hex::encode(p.msg_id),
+            tx_hash: hex::encode(p.tx_hash),
             from_lez_block_id: p.from_lez_block_id,
             to_lez_block_id: p.to_lez_block_id,
-            carried_to_lez_block_id: None,
             change_count: p.change_count,
             published_at_unix: p.published_at_unix,
-            status: p.status.clone(),
-            tx_hash: hex::encode(p.tx_hash),
-            msg_id: hex::encode(p.msg_id),
+            status,
+            l1_slot,
         }
     }
+}
 
-    fn root(entry: RootEntry<'_>) -> Self {
+/// A root of the valid-root window as the API shows it: the batch that produced it (its
+/// fields at the top, its `changes` what made the root), `carried_to_lez_block_id`, the last
+/// LEZ block the root stood for, and `batches`, every batch of the run that carried it, the
+/// producing one first.
+#[derive(Serialize)]
+struct RootWindowEntry {
+    root: String,
+    #[serde(flatten)]
+    produced_by: BatchEntry,
+    carried_to_lez_block_id: u64,
+    changes: Vec<ChangeRecord>,
+    batches: Vec<BatchEntry>,
+}
+
+impl RootWindowEntry {
+    fn new(entry: &RootEntry<'_>) -> Self {
+        let produced_by = entry.produced_by();
         Self {
-            carried_to_lez_block_id: Some(entry.carried_to_lez_block_id),
-            ..Self::new(entry.produced_by)
+            root: hex::encode(produced_by.root_after),
+            produced_by: BatchEntry::new(produced_by),
+            carried_to_lez_block_id: entry.carried_to_lez_block_id(),
+            changes: produced_by.changes.clone(),
+            batches: entry.batches.iter().map(|p| BatchEntry::new(p)).collect(),
         }
     }
 }
@@ -116,42 +138,27 @@ async fn summary(State(state): State<AppState>) -> Json<Value> {
             "published_batches": registry.history.published.len(),
             "newest_adopted": registry.newest_adopted().map(root_ref),
             "newest_finalized": registry.newest_finalized().map(root_ref),
-            "endpoints": ["/roots/{window_size}", "/batches/{window_size}", "/merkle_proof/{leaf_index or id_commitment}", "/leaves", "/health"],
+            "endpoints": ["/roots/{window_size}", "/merkle_proof/{leaf_index or id_commitment}", "/leaves", "/health"],
         }),
     )
 }
 
-/// The newest `window_size` distinct roots, newest first, each with the batch that produced
-/// it (its status on Bedrock, its `change_count`) and the last LEZ block it stood for.
+/// The newest `window_size` roots, newest first: each with the batch that produced it, the
+/// changes that made it, the last LEZ block it stood for and every batch that carried it. A
+/// validator reads its policy off this: the roots back to the newest one whose `changes`
+/// remove a leaf, say, are the ones no removed member can still prove under.
 async fn roots(State(state): State<AppState>, Path(window_size): Path<usize>) -> Json<Value> {
     let registry = state.registry.read().expect("registry lock");
     let roots: Vec<_> = registry
         .roots(window_size)
-        .into_iter()
-        .map(BatchEntry::root)
+        .iter()
+        .map(RootWindowEntry::new)
         .collect();
     with_head(
         &registry,
         json!({
             "covered_to_lez_block_id": registry.history.covered_to,
             "roots": roots,
-        }),
-    )
-}
-
-/// The newest `window_size` published batches, newest first, heartbeats included.
-async fn batches(State(state): State<AppState>, Path(window_size): Path<usize>) -> Json<Value> {
-    let registry = state.registry.read().expect("registry lock");
-    let batches: Vec<_> = registry
-        .batches(window_size)
-        .into_iter()
-        .map(BatchEntry::new)
-        .collect();
-    with_head(
-        &registry,
-        json!({
-            "covered_to_lez_block_id": registry.history.covered_to,
-            "batches": batches,
         }),
     )
 }
