@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::{
     reader::Removed,
-    registry::{ChangeRecord, Published, Registry, RootEntry, Status},
+    registry::{ChangeRecord, Published, Registry, RootEntry, Status, Verification},
 };
 
 pub type Shared = Arc<RwLock<Registry>>;
@@ -30,6 +30,8 @@ pub struct AppState {
     pub registry: Shared,
     pub channel_id: String,
     pub lez_source: String,
+    /// `sequencer` or `indexer`.
+    pub mode: String,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -57,6 +59,11 @@ struct BatchEntry {
     status: &'static str,
     /// The L1 slot of the block that finalized it; `null` before.
     l1_slot: Option<u64>,
+    /// An indexer's verdict: `verified`, `rejected` or `pending`; `null` from a sequencer,
+    /// which checks nothing of its own.
+    verification: Option<&'static str>,
+    /// Why the indexer rejected the batch; `null` otherwise.
+    rejection: Option<String>,
 }
 
 impl BatchEntry {
@@ -76,6 +83,15 @@ impl BatchEntry {
             published_at_slot: p.published_at_slot,
             status,
             l1_slot,
+            verification: p.verification.as_ref().map(|v| match v {
+                Verification::Verified => "verified",
+                Verification::Rejected(_) => "rejected",
+                Verification::Pending => "pending",
+            }),
+            rejection: match &p.verification {
+                Some(Verification::Rejected(reason)) => Some(reason.clone()),
+                _ => None,
+            },
         }
     }
 }
@@ -95,6 +111,27 @@ struct RootWindowEntry {
 }
 
 impl RootWindowEntry {
+    /// The root at the LEZ head, ahead of any batch: the changes not published yet (the
+    /// sequencer) or not read from the channel yet (the indexer). `None` when the head is
+    /// exactly the newest batch's root.
+    fn head(registry: &Registry) -> Option<Self> {
+        if registry.head.applied_block_id <= registry.history.covered_to {
+            return None;
+        }
+        Some(Self {
+            root: hex::encode(registry.head.root()),
+            from_lez_block_id: registry.history.covered_to + 1,
+            to_lez_block_id: registry.head.applied_block_id,
+            change_count: registry.pending_changes.len(),
+            changes: registry
+                .pending_changes
+                .iter()
+                .filter_map(ChangeRecord::from_change)
+                .collect(),
+            batches: vec![],
+        })
+    }
+
     fn new(entry: &RootEntry<'_>) -> Self {
         let produced_by = entry.produced_by();
         Self {
@@ -137,25 +174,30 @@ async fn summary(State(state): State<AppState>) -> Json<Value> {
                 "removed_leaves": registry.head.removed_leaves().len(),
                 "changes": registry.head.stats.tree_changes(),
             },
+            "mode": state.mode,
             "pending_changes": registry.pending_changes.len(),
             "published_batches": registry.history.published.len(),
+            "verified_batches": registry.history.published.iter().filter(|p| p.verification == Some(Verification::Verified)).count(),
+            "rejected_batches": registry.history.published.iter().filter(|p| matches!(p.verification, Some(Verification::Rejected(_)))).count(),
             "newest_adopted": registry.newest_adopted().map(root_ref),
             "newest_finalized": registry.newest_finalized().map(root_ref),
             "endpoints": ["/roots/{window_size}", "/merkle_proof/{leaf_index or id_commitment}", "/leaves", "/health"],
+            "replay_root": registry.replay_root().map(hex::encode),
         }),
     )
 }
 
-/// The newest `window_size` roots, newest first: each with the batch that produced it, the
-/// changes that made it, the last LEZ block it stood for and every batch that carried it. A
-/// validator reads its policy off this: the roots back to the newest one whose `changes`
-/// remove a leaf, say, are the ones no removed member can still prove under.
+/// The newest `window_size` roots, newest first: the head's when it is ahead of the batches
+/// (`batches` empty), then each root with the changes that made it, the LEZ blocks it stood
+/// for and every batch that carried it. A validator reads its policy off this: the roots back
+/// to the newest one whose `changes` remove a leaf, say, are the ones no removed member can
+/// still prove under.
 async fn roots(State(state): State<AppState>, Path(window_size): Path<usize>) -> Json<Value> {
     let registry = state.registry.read().expect("registry lock");
-    let roots: Vec<_> = registry
-        .roots(window_size)
-        .iter()
-        .map(RootWindowEntry::new)
+    let roots: Vec<_> = RootWindowEntry::head(&registry)
+        .into_iter()
+        .chain(registry.roots(window_size).iter().map(RootWindowEntry::new))
+        .take(window_size)
         .collect();
     with_head(
         &registry,

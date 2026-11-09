@@ -6,7 +6,9 @@ logs/
 
 
 # zone sequencer: accredited key and the tree store (tree, reader state, batches, SDK checkpoint)
-/zone-sequencer/data/
+/data/
+# zone indexer run beside it (MODE=indexer DATA_DIR=data-indexer)
+/data-indexer/
 # own LEZ sequencer: its home (RocksDB, keys)
 /lez-sequencer/home/
 # e2e: per-network state (the LEZ payer wallet, pending deposit)

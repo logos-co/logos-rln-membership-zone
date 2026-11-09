@@ -1,7 +1,7 @@
 # Setup: the RLN Membership Zone on the Logos testnet
 
 Everything needed to run the Zone end to end: a Logos Blockchain testnet node, the Zone
-sequencer (`zone-sequencer/`) with its HTTP registry API, and the LEZ source it reads, either
+sequencer (the `zone` binary of this repository) with its HTTP registry API, and the LEZ source it reads, either
 the public LEZ Sequencer or one run next to it (`lez-sequencer/`). Written for one Linux box (WSL2 works) that already
 runs the node; the Mac side is only where the code is edited.
 
@@ -10,7 +10,7 @@ runs the node; the Mac side is only where the code is edited.
 | Process | Port | Role |
 | --- | --- | --- |
 | Logos Blockchain node (Bedrock, L1) | 8080 | HTTP API: wallet, mempool, blocks. The Zone SDK publishes batches through it and pays fees from its wallet. Never expose it: the API has no auth and reaches the wallet. |
-| Zone sequencer, `zone-sequencer` | 3000 | Reads LEZ blocks, derives the tree, publishes one batch per change or heartbeat on its channel, serves `/roots`, `/merkle_proof`, `/leaf`, `/leaves`. |
+| Zone sequencer, `zone` | 3000 | Reads LEZ blocks, derives the tree, publishes one batch per change or heartbeat on its channel, serves `/roots`, `/merkle_proof`, `/leaf`, `/leaves`. |
 | LEZ Sequencer | 3040 or public | Source of closed LEZ blocks (`getBlockRange`). Default: `https://testnet.lez.logos.co`. Optional: your own, section 5. |
 
 Data flow: LEZ Sequencer (blocks, transactions) -> Zone sequencer (tree, batches) ->
@@ -71,7 +71,7 @@ cp .env.example .env
 sed -i "s/^FUNDING_PK=.*/FUNDING_PK=$(yq .public_keys.PoWClaim ~/keystore.yaml)/" .env
 ```
 
-`.env` keys (all also flags, see `cargo run -p zone-sequencer -- --help`):
+`.env` keys (all also flags, see `cargo run -- --help`):
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -88,7 +88,7 @@ sed -i "s/^FUNDING_PK=.*/FUNDING_PK=$(yq .public_keys.PoWClaim ~/keystore.yaml)/
 | `POLL_SEC` | 10 | Seconds between LEZ polls |
 | `HEARTBEAT_SEC` | 3600 | Publish an empty batch after this long without one |
 | `STALE_REFUND_SLOTS` | 0 | LIB slots an unmined batch waits before the Zone SDK re-funds it under a new transaction (0 disables). Off: the mempool is FIFO, a re-funded transaction goes to the back of the queue; the SDK default, 30, re-funded at every finalized block |
-| `DATA_DIR` | `zone-sequencer/data` | `key.hex` and the tree store `tree/`. Gitignored: copy `key.hex` outside the checkout after the first start, a deleted or re-cloned checkout takes the channel key with it |
+| `DATA_DIR` | `data` | `key.hex` and the tree store `tree/`. Gitignored: copy `key.hex` outside the checkout after the first start, a deleted or re-cloned checkout takes the channel key with it |
 | `HTTP_ADDR` | `127.0.0.1:3000` | HTTP API bind address |
 
 ### Run
@@ -98,16 +98,16 @@ cd ~/logos-rln-membership-zone
 set -a
 . ./.env
 set +a
-RUST_LOG=warn,logos_blockchain=info cargo run -p zone-sequencer
+RUST_LOG=warn,logos_blockchain=info cargo run
 ```
 
 What happens, in order:
 
-1. First start writes the accredited key to `zone-sequencer/data/key.hex`. Keep it: the channel can
+1. First start writes the accredited key to `data/key.hex`. Keep it: the channel can
    only be written by this key. The channel id is `sha256(CHANNEL_NAME)`; there is no
    create step, the first inscription to an unused id creates the channel with the signing
    key as its only accredited key (`posting_timeframe` and `posting_timeout` 0: one writer).
-2. The tree store `zone-sequencer/data/tree/` (sled) is opened: on a fresh start the tree is
+2. The tree store `data/tree/` (sled) is opened: on a fresh start the tree is
    built by reading every LEZ block from `FIRST_LEZ_BLOCK_ID` to the head, so every
    registration made before the sequencer existed is applied and the first batch covers all
    of them; later starts continue from the block the store is at.
@@ -136,8 +136,8 @@ next batch spans the whole gap.
 
 | File | Content | Lose it and |
 | --- | --- | --- |
-| `zone-sequencer/data/key.hex` | accredited key | the channel is lost; start a new one with a new `CHANNEL_NAME` |
-| `zone-sequencer/data/tree/` | sled store: the tree, the reader's state, the published batches, the Zone SDK checkpoint | the sequencer starts fresh: backfill from slot 0, tree rebuilt from LEZ, and on a channel that already has batches the next batch chains on the root and is refused (below) |
+| `data/key.hex` | accredited key | the channel is lost; start a new one with a new `CHANNEL_NAME` |
+| `data/tree/` | sled store: the tree, the reader's state, the published batches, the Zone SDK checkpoint | the sequencer starts fresh: backfill from slot 0, tree rebuilt from LEZ, and on a channel that already has batches the next batch chains on the root and is refused (below) |
 
 Rule: never delete the tree store on a channel that has batches. The Zone SDK learns the
 channel tip from finalized history only (8 to 10 hours behind on the testnet), so without
@@ -154,10 +154,37 @@ that never got mined), change the name and start clean:
 
 ```bash
 sed -i 's/^CHANNEL_NAME=.*/CHANNEL_NAME=rln-membership-zone:testnet:v0.3.0-1/' .env
-rm -rf zone-sequencer/data/tree
+rm -rf data/tree
 ```
 
 `key.hex` can stay. The old channel costs nothing abandoned.
+
+### Run an indexer
+
+The same binary in `--mode indexer` trusts nobody about the batches: it derives the tree
+from LEZ like the sequencer, reads the Zone channel's inscriptions from the finalized L1
+blocks of the node (`immutable_blocks`, every 5 minutes, from `INDEXER_FROM_L1_SLOT` on the
+first start, then from where it stopped) and checks each batch three ways: it continues the
+previous one (`from_lez_block_id`), its `changes` replay to its `root_after`, and that root is
+the indexer's own tree at `to_lez_block_id`. A batch that fails is kept with its reason and
+does not move the replay tree; a batch for LEZ blocks the indexer has not read yet waits
+(`pending`) and is checked once it has. No key, no funds, no publishing: only the node's HTTP
+API and the LEZ source. Run it beside the sequencer with its own data dir and port:
+
+```bash
+set -a; . ./.env; set +a
+MODE=indexer DATA_DIR=data-indexer HTTP_ADDR=127.0.0.1:3001 INDEXER_FROM_L1_SLOT=2478000 \
+    cargo run
+```
+
+`INDEXER_FROM_L1_SLOT` is any slot at or before the channel's first inscription; the
+sequencer's first batch shows it as `published_at_slot` in `/roots`, and 2478000 is channel
+`v0.3.0-4`'s. The indexer's `/` reports `mode`, `verified_batches`, `rejected_batches` and
+`replay_root` (the root its verified batches replay to); every batch in `/roots` carries
+`verification` (`verified`, `rejected`, `pending`) and `rejection`, the reason, `null` from a
+sequencer. Its `/roots` entry 0 is the LEZ head when it is ahead of the batches read (no
+`batches`), so a consumer that wants the live tree takes that one and a consumer that wants
+only what the channel finalized skips it (`verify_proof --min-status finalized`).
 
 ### HTTP API
 
@@ -191,15 +218,17 @@ that landed after the reader had expired the leaf), `pending_changes` (waiting f
 batch), `published_batches`, `newest_adopted` and `newest_finalized` (root and
 `to_lez_block_id` of the newest batch in a Bedrock block, and in finalized history).
 
-`/roots` lists the roots by recency, one entry per run of batches carrying the same root. An
-entry carries the `root`, the LEZ blocks it stood for (`from_lez_block_id` of the batch that
+`/roots` lists the roots by recency: first the LEZ head when it is ahead of the newest batch
+(`batches` empty, `changes` the ones not yet in a batch), then one entry per run of batches
+carrying the same root. An entry carries the `root`, the LEZ blocks it stood for (`from_lez_block_id` of the batch that
 produced it to `to_lez_block_id` of the newest batch carrying it), `change_count` and
 `changes`, the tree changes that made the root in order (`kind` `insert` with the
 `rate_commitment` inserted or `remove` with `null`, and the `leaf_index`; empty when
 `change_count` is 0), and `batches`, every batch of the run, the producing one first, each
 with `msg_id`, `tx_hash`, `from_lez_block_id`, `to_lez_block_id`, `published_at_unix` (the
-sequencer's clock), `published_at_slot` (the L1 slot then, the chain's clock), `status` and
-`l1_slot` (heartbeats carry the root further, their span is the proof). A root the tree comes back
+sequencer's clock), `published_at_slot` (the L1 slot then, the chain's clock), `status`,
+`l1_slot`, `verification` and `rejection` (heartbeats carry the root further, their span is
+the proof). A root the tree comes back
 to (a leaf inserted then removed empties its slot again) is a new entry, so the window is the
 newest roots, not the newest values. A validator reads its policy off `changes`: the roots
 from the newest back to the newest whose `changes` remove a leaf are the ones no removed
@@ -395,7 +424,7 @@ fee per batch), `lib_slot` against `slot` (finality), the time from `pending` to
   restart between reading LEZ and publishing lost them). A channel whose first batch is
   like that cannot be replayed by an indexer: start a new one (section 3).
 - `history N batches published ... (checkpoint resumed)` right after changing
-  `CHANNEL_NAME`: the old tree store is still there; stop, `rm -rf zone-sequencer/data/tree`
+  `CHANNEL_NAME`: the old tree store is still there; stop, `rm -rf data/tree`
   (keep `key.hex`), start again.
 - `LEZ unreachable: getLastBlockId` once in a while: network; the next poll retries, nothing
   to do unless it repeats for long.
@@ -408,13 +437,13 @@ Zone sequencer data (keeps the key):
 
 ```bash
 cd ~/logos-rln-membership-zone
-rm -rf zone-sequencer/data/tree
+rm -rf data/tree
 ```
 
 Everything of the Zone sequencer, including the key and the build:
 
 ```bash
-rm -rf ~/logos-rln-membership-zone/zone-sequencer/data ~/logos-rln-membership-zone/target
+rm -rf ~/logos-rln-membership-zone/data ~/logos-rln-membership-zone/target
 ```
 
 Own LEZ sequencer: `rm -rf ~/logos-rln-membership-zone/lez-sequencer/home` and, to free

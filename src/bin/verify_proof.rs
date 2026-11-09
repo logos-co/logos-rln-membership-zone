@@ -36,13 +36,16 @@ struct Args {
     /// How many of the newest roots count as valid, when they are fetched.
     #[arg(long, default_value_t = 5)]
     window_size: usize,
-    /// The least a root's batch must have reached on Bedrock to count.
+    /// The least a root must have reached to count: `head` (the LEZ head, in no batch yet),
+    /// or its batch's status on Bedrock.
     #[arg(long, value_enum, default_value_t = MinStatus::Pending)]
     min_status: MinStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, ValueEnum)]
 enum MinStatus {
+    /// The root at the LEZ head, in no batch yet.
+    Head,
     Pending,
     Adopted,
     Finalized,
@@ -97,6 +100,7 @@ fn fr_to_hex(fr: &Fr) -> String {
 
 fn status_rank(status: &str) -> Option<MinStatus> {
     match status {
+        "head" => Some(MinStatus::Head),
         "pending" => Some(MinStatus::Pending),
         "adopted" => Some(MinStatus::Adopted),
         "finalized" => Some(MinStatus::Finalized),
@@ -159,11 +163,8 @@ async fn run(args: &Args) -> Result<bool> {
     };
     let mut valid_roots = vec![];
     for entry in &window.roots {
-        let status = &entry
-            .batches
-            .first()
-            .ok_or_else(|| anyhow!("a root entry without batches"))?
-            .status;
+        // A root entry without batches is the LEZ head, ahead of any batch.
+        let status = entry.batches.first().map_or("head", |b| b.status.as_str());
         let rank = status_rank(status).ok_or_else(|| anyhow!("unknown status {status}"))?;
         if rank >= args.min_status {
             valid_roots.push(fr_from_hex(&entry.root, "root")?);
@@ -195,7 +196,7 @@ async fn run(args: &Args) -> Result<bool> {
         Some(entry) => println!(
             "proof root {root} = the Zone's root to LEZ block {} ({})",
             entry.to_lez_block_id,
-            entry.batches.first().map_or("?", |b| b.status.as_str())
+            entry.batches.first().map_or("head", |b| b.status.as_str())
         ),
         None => println!(
             "proof root {root} is not in the window (taken at the Zone's root {})",

@@ -5236,6 +5236,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "rln-membership-zone"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.8.9",
+ "base64 0.22.1",
+ "borsh",
+ "clap",
+ "hex",
+ "logos-blockchain-common-http-client",
+ "logos-blockchain-core",
+ "logos-blockchain-key-management-system-service",
+ "logos-blockchain-zone-sdk",
+ "prost 0.13.5",
+ "rand 0.8.8",
+ "reqwest 0.12.28",
+ "rln",
+ "rln-layouts",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+ "zerokit_utils",
+]
+
+[[package]]
 name = "rocksdb"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7309,34 +7337,6 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[package]]
-name = "zone-sequencer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum 0.8.9",
- "base64 0.22.1",
- "borsh",
- "clap",
- "hex",
- "logos-blockchain-common-http-client",
- "logos-blockchain-core",
- "logos-blockchain-key-management-system-service",
- "logos-blockchain-zone-sdk",
- "prost 0.13.5",
- "rand 0.8.8",
- "reqwest 0.12.28",
- "rln",
- "rln-layouts",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tracing",
- "tracing-subscriber 0.3.23",
- "zerokit_utils",
-]
 
 [[package]]
 name = "zstd"

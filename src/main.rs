@@ -25,7 +25,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use lb_core::mantle::{
     gas::GasCost,
     ops::channel::{ChannelId, MsgId, inscribe::Inscription},
@@ -48,7 +48,7 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     http::{AppState, Shared},
     lez::{MAX_BLOCK_RANGE_LEN, SequencerLez},
-    registry::{FinalizeRefused, Published, Registry, Status, now_unix},
+    registry::{FinalizeRefused, Published, Registry, Status, Verification, now_unix},
 };
 
 /// Seconds between two finality scans (`reconcile_finality`).
@@ -66,15 +66,32 @@ const TREE_ID_HEX: &str = "47b2de4f08080e74e2d4beffe8e5e87e709dd598619c9b322b64f
 /// LEZ block the program was deployed in: no event comes before it.
 const DEFAULT_FIRST_LEZ_BLOCK_ID: u64 = 49_431;
 
+/// What this binary is: the one sequencer of the Zone, or an indexer that trusts nobody.
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+enum Mode {
+    /// Derive the tree from LEZ, publish batches on the Zone channel, serve the API.
+    Sequencer,
+    /// Derive the tree from LEZ, read the batches from the channel's finalized history and
+    /// check each against the derivation, serve the API. No key, no funds, no publishing.
+    Indexer,
+}
+
 #[derive(Parser, Debug)]
-#[command(about = "RLN Membership Zone: Zone sequencer with an HTTP registry API")]
+#[command(about = "RLN Membership Zone: Zone sequencer or indexer with an HTTP registry API")]
 struct Args {
+    /// `sequencer` publishes the batches, `indexer` reads and checks them.
+    #[arg(long, value_enum, default_value_t = Mode::Sequencer, env = "MODE")]
+    mode: Mode,
     /// Logos Blockchain node HTTP API (no auth, local).
     #[arg(long, default_value = "http://127.0.0.1:8080", env = "NODE_URL")]
     node_url: String,
-    /// Node wallet key paying the Mantle Transaction fees (64 hex).
+    /// Node wallet key paying the Mantle Transaction fees (64 hex); the sequencer needs it.
     #[arg(long, env = "FUNDING_PK")]
-    funding_pk: String,
+    funding_pk: Option<String>,
+    /// Indexer: the L1 slot to read the channel from, at or before its first inscription
+    /// (the sequencer's first batch shows it as `published_at_slot`).
+    #[arg(long, env = "INDEXER_FROM_L1_SLOT")]
+    indexer_from_l1_slot: Option<u64>,
     /// Hard cap per publish, in atomic units.
     #[arg(long, default_value_t = 1_000_000, env = "MAX_TX_FEE")]
     max_tx_fee: u64,
@@ -83,7 +100,7 @@ struct Args {
     #[arg(long, default_value_t = 12, env = "PRIORITY_FEE_PERCENT")]
     priority_fee_percent: u64,
     /// Key, checkpoint and history live here.
-    #[arg(long, default_value = "zone-sequencer/data", env = "DATA_DIR")]
+    #[arg(long, default_value = "data", env = "DATA_DIR")]
     data_dir: PathBuf,
     /// HTTP API bind address.
     #[arg(long, default_value = "127.0.0.1:3000", env = "HTTP_ADDR")]
@@ -259,7 +276,7 @@ async fn check_channel_on_chain(
         ),
         None => anyhow::bail!(
             "channel is already on chain (tip {}..) but this data dir holds no batch: the next \
-             batch would chain on the root and be invalid; restore zone-sequencer/data from the \
+             batch would chain on the root and be invalid; restore data from the \
              run that wrote the channel, or pick another CHANNEL_NAME",
             &tip[..8]
         ),
@@ -325,22 +342,47 @@ async fn main() -> Result<()> {
         args.rebuild_tree,
     )?));
 
-    // Zone SDK sequencer on the node.
-    let signing_key = load_or_create_key(&key_path)?;
     // The channel id is any 32 bytes nobody has written to yet: the key signing the first
     // inscription becomes its accredited key. A name hashes to a stable, readable choice.
     let channel_id = ChannelId::from(match &args.channel_id {
         Some(id) => parse_32(id, "CHANNEL_ID")?,
         None => Sha256::digest(args.channel_name.as_bytes()).into(),
     });
+    let node_url: Url = args.node_url.parse().context("invalid NODE_URL")?;
+    let node = NodeHttpClient::new(CommonHttpClient::new(None), node_url.clone());
+
+    // HTTP API, the same in both modes.
+    let state = AppState {
+        registry: registry.clone(),
+        channel_id: hex::encode(channel_id.as_ref()),
+        lez_source: source.describe(),
+        mode: format!("{:?}", args.mode).to_lowercase(),
+    };
+    let listener = tokio::net::TcpListener::bind(&args.http_addr)
+        .await
+        .with_context(|| format!("bind {}", args.http_addr))?;
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, http::router(state)).await {
+            eprintln!("http server stopped: {e}");
+        }
+    });
+
+    if args.mode == Mode::Indexer {
+        return run_indexer(&args, node, channel_id, source, registry).await;
+    }
+
+    // Zone SDK sequencer on the node.
+    let signing_key = load_or_create_key(&key_path)?;
+    let funding_pk = args
+        .funding_pk
+        .as_deref()
+        .context("FUNDING_PK is required to run the sequencer")?;
     let funding = FundingConfig {
-        funding_pk: parse_funding_pk(&args.funding_pk)?,
+        funding_pk: parse_funding_pk(funding_pk)?,
         change_pk: None,
         max_tx_fee: GasCost::new(args.max_tx_fee),
         priority_fee_percent: args.priority_fee_percent,
     };
-    let node_url: Url = args.node_url.parse().context("invalid NODE_URL")?;
-    let node = NodeHttpClient::new(CommonHttpClient::new(None), node_url.clone());
     let checkpoint: Option<SequencerCheckpoint> = registry
         .read()
         .expect("registry lock")
@@ -368,21 +410,6 @@ async fn main() -> Result<()> {
         sdk_config,
         checkpoint,
     );
-
-    // HTTP API.
-    let state = AppState {
-        registry: registry.clone(),
-        channel_id: hex::encode(channel_id.as_ref()),
-        lez_source: source.describe(),
-    };
-    let listener = tokio::net::TcpListener::bind(&args.http_addr)
-        .await
-        .with_context(|| format!("bind {}", args.http_addr))?;
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, http::router(state)).await {
-            eprintln!("http server stopped: {e}");
-        }
-    });
 
     {
         let registry = registry.read().expect("registry lock");
@@ -602,6 +629,173 @@ async fn main() -> Result<()> {
     registry.write().expect("registry lock").close()?;
     println!("stopped; state in {}", args.data_dir.display());
     Ok(())
+}
+
+/// The indexer: the tree from LEZ as the sequencer derives it, the batches from the channel's
+/// finalized L1 blocks (`immutable_blocks` from `--indexer-from-l1-slot`, then from the slot
+/// scanned last), each checked against the derivation (`Registry::observe_batch`). It trusts
+/// the LEZ sequencer for the blocks and nobody for the batches.
+async fn run_indexer(
+    args: &Args,
+    node: NodeHttpClient,
+    channel_id: ChannelId,
+    source: SequencerLez,
+    registry: Shared,
+) -> Result<()> {
+    let from_slot = {
+        let registry = registry.read().expect("registry lock");
+        match (
+            registry.history.finality_scanned_to,
+            args.indexer_from_l1_slot,
+        ) {
+            (Some(scanned), _) => scanned + 1,
+            (None, Some(from)) => from,
+            (None, None) => anyhow::bail!(
+                "INDEXER_FROM_L1_SLOT is required on the first start: the L1 slot to read the \
+                 channel from, at or before its first inscription"
+            ),
+        }
+    };
+    registry.write().expect("registry lock").start_replay()?;
+    {
+        let registry = registry.read().expect("registry lock");
+        println!("RLN Membership Zone indexer");
+        println!("  node      {}", args.node_url);
+        println!("  channel   {}", hex::encode(channel_id.as_ref()));
+        println!("  lez       {}", source.describe());
+        println!("  http      http://{}", args.http_addr);
+        println!("  data      {}", args.data_dir.display());
+        println!(
+            "  history   {} batches read, {} verified, covered to LEZ block {}; channel read from L1 slot {}",
+            registry.history.published.len(),
+            registry
+                .history
+                .published
+                .iter()
+                .filter(|p| p.verification == Some(Verification::Verified))
+                .count(),
+            registry.history.covered_to,
+            from_slot
+        );
+    }
+    source.set_registered_count(
+        registry
+            .read()
+            .expect("registry lock")
+            .head
+            .stats
+            .registered,
+    );
+
+    let mut lez_tick = tokio::time::interval(Duration::from_secs(args.poll_sec.max(1)));
+    lez_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut channel_tick = tokio::time::interval(Duration::from_secs(FINALITY_SCAN_SEC));
+    channel_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut next_slot = from_slot;
+    loop {
+        tokio::select! {
+            _ = lez_tick.tick() => {
+                let head = match source.last_block_id().await {
+                    Ok(head) => head,
+                    Err(e) => { println!("LEZ unreachable: {e}"); continue; }
+                };
+                let applied_to = registry.read().expect("registry lock").head.applied_block_id;
+                if head > applied_to
+                    && let Err(e) = apply_range(&source, &registry, applied_to + 1, head).await
+                {
+                    println!("LEZ read failed: {e}");
+                    continue;
+                }
+                let mut registry = registry.write().expect("registry lock");
+                match registry.recheck_pending() {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        println!("{n} batch(es) checked now that LEZ is read far enough");
+                        registry.save()?;
+                    }
+                    Err(e) => println!("recheck failed: {e}"),
+                }
+            }
+            _ = channel_tick.tick() => {
+                match read_channel(&node, channel_id, &registry, next_slot).await {
+                    Ok(scanned_to) => next_slot = scanned_to + 1,
+                    Err(e) => println!("channel read failed: {e}"),
+                }
+            }
+            _ = tokio::signal::ctrl_c() => break,
+        }
+    }
+    registry.write().expect("registry lock").close()?;
+    println!("stopped; state in {}", args.data_dir.display());
+    Ok(())
+}
+
+/// Indexer: read the channel's inscriptions in the finalized L1 blocks from `from_slot` up to
+/// the LIB, page by page, and check each as a batch. Returns the slot read up to.
+async fn read_channel(
+    node: &NodeHttpClient,
+    channel_id: ChannelId,
+    registry: &Shared,
+    from_slot: u64,
+) -> Result<u64> {
+    let lib = u64::from(
+        node.consensus_info()
+            .await
+            .map_err(|e| anyhow!("consensus info: {e}"))?
+            .cryptarchia_info
+            .lib_slot,
+    );
+    if from_slot > lib {
+        return Ok(from_slot - 1);
+    }
+    let mut page_from = from_slot;
+    while page_from <= lib {
+        let page_to = lib.min(page_from + FINALITY_SCAN_PAGE - 1);
+        let blocks = node
+            .immutable_blocks(Slot::from(page_from), Slot::from(page_to))
+            .await
+            .map_err(|e| anyhow!("immutable blocks {page_from}..{page_to}: {e}"))?;
+        let mut registry = registry.write().expect("registry lock");
+        for block in &blocks {
+            let l1_slot = u64::from(block.header.slot);
+            for tx in &block.transactions {
+                for info in channel_inscriptions(tx, channel_id) {
+                    let msg = msg_bytes(&info.this_msg);
+                    let entry = registry.observe_batch(
+                        msg,
+                        tx_bytes(&info.tx_hash),
+                        &info.payload,
+                        l1_slot,
+                    )?;
+                    match &entry.verification {
+                        Some(Verification::Verified) => println!(
+                            "batch [{}..{}] msg {} at L1 slot {l1_slot}: VERIFIED, root {}..",
+                            entry.from_lez_block_id,
+                            entry.to_lez_block_id,
+                            hex::encode(&msg[..4]),
+                            hex::encode(&entry.root_after[..4])
+                        ),
+                        Some(Verification::Rejected(reason)) => println!(
+                            "batch [{}..{}] msg {} at L1 slot {l1_slot}: REJECTED, {reason}",
+                            entry.from_lez_block_id,
+                            entry.to_lez_block_id,
+                            hex::encode(&msg[..4])
+                        ),
+                        _ => println!(
+                            "batch [{}..{}] msg {} at L1 slot {l1_slot}: pending, LEZ not read that far yet",
+                            entry.from_lez_block_id,
+                            entry.to_lez_block_id,
+                            hex::encode(&msg[..4])
+                        ),
+                    }
+                }
+            }
+        }
+        registry.history.finality_scanned_to = Some(page_to);
+        registry.save()?;
+        page_from = page_to + 1;
+    }
+    Ok(lib)
 }
 
 /// Mark our batches Finalized as Bedrock finality reaches them (the Zone SDK stream), with

@@ -86,14 +86,14 @@ lez_rln_bin() {
     die "no $name under $LEZ_RLN_CHECKOUT/lez-rln/target: cargo build --bin $name there (LEZ_RLN_CHECKOUT)"
 }
 
-# A zone-sequencer binary (`generate_proof`, `verify_proof`), debug build first, release second.
+# A zone binary (`generate_proof`, `verify_proof`), debug build first, release second.
 zone_bin() {
     local name="$1" repo candidate
     repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     for candidate in "$repo/target/debug/$name" "$repo/target/release/$name"; do
         [ -x "$candidate" ] && { echo "$candidate"; return 0; }
     done
-    die "no $name under $repo/target: cargo build -p zone-sequencer --bins"
+    die "no $name under $repo/target: cargo build --bins"
 }
 
 # The environment the lez-rln binaries read: wallet, payer, registry.

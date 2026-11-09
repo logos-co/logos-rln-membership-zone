@@ -12,10 +12,13 @@ use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use rln::prelude::{Fr, PoseidonHash};
+use zerokit_utils::merkle_tree::{OptimalMerkleConfig, OptimalMerkleTree, ZerokitMerkleTree};
+
 use crate::{
     batch::{Batch, Change, Kind},
     lez::Block,
-    reader::Reader,
+    reader::{Reader, TREE_DEPTH, fr_from_bytes_le, fr_to_bytes_le},
 };
 
 /// Where the Mantle Transaction carrying a batch stands, in the Zone SDK's words: it is
@@ -105,6 +108,24 @@ pub struct Published {
     pub published_at_slot: Option<u64>,
     #[serde(flatten)]
     pub status: Status,
+    /// What an indexer found checking the batch against its own derivation; `None` for the
+    /// sequencer's own batches.
+    #[serde(default)]
+    pub verification: Option<Verification>,
+}
+
+/// An indexer's verdict on a batch read from the channel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verification {
+    /// Contiguous with the previous batch, its changes replay to its root, and that root is
+    /// the indexer's own at `to_lez_block_id`.
+    Verified,
+    /// A check failed; the reason says which. The batch is kept, so the history stays a
+    /// faithful copy of the channel, but it did not move the replay tree.
+    Rejected(String),
+    /// The indexer has not read LEZ up to `to_lez_block_id` yet; checked again then.
+    Pending,
 }
 
 /// The published batches.
@@ -127,6 +148,9 @@ pub struct Registry {
     pub pending_changes: Vec<Change>,
     /// The Zone SDK checkpoint, as JSON.
     checkpoint: Option<Value>,
+    /// Indexer: the tree the verified batches' changes replay to, in memory, rebuilt from the
+    /// history at start. Its root after a batch must be the batch's `root_after`.
+    replay: Option<OptimalMerkleTree<PoseidonHash>>,
 }
 
 impl Registry {
@@ -189,7 +213,176 @@ impl Registry {
             head,
             pending_changes,
             checkpoint,
+            replay: None,
         })
+    }
+
+    /// Turn this registry into an indexer's: a replay tree rebuilt from the verified batches
+    /// of the history, so `observe_batch` can check the next ones.
+    pub fn start_replay(&mut self) -> Result<()> {
+        let mut tree = OptimalMerkleTree::<PoseidonHash>::new(
+            TREE_DEPTH,
+            Fr::default(),
+            OptimalMerkleConfig::default(),
+        )
+        .context("replay tree")?;
+        for p in self
+            .history
+            .published
+            .iter()
+            .filter(|p| p.verification == Some(Verification::Verified))
+        {
+            apply_changes(&mut tree, &p.changes)?;
+        }
+        self.replay = Some(tree);
+        Ok(())
+    }
+
+    /// Indexer: a batch read from the channel (`payload` its inscription, finalized at
+    /// `l1_slot`), checked and kept. A message id already on record is checked again only
+    /// while `Pending`. Returns the entry as kept.
+    pub fn observe_batch(
+        &mut self,
+        msg_id: [u8; 32],
+        tx_hash: [u8; 32],
+        payload: &[u8],
+        l1_slot: u64,
+    ) -> Result<&Published> {
+        let batch = Batch::decode(payload).context("the inscription is not a batch")?;
+        let changes: Vec<ChangeRecord> = batch
+            .changes
+            .iter()
+            .filter_map(ChangeRecord::from_change)
+            .collect();
+        let mut root_after = [0u8; 32];
+        if batch.root_after.len() == 32 {
+            root_after.copy_from_slice(&batch.root_after);
+        }
+        let position = self
+            .history
+            .published
+            .iter()
+            .position(|p| p.msg_id == msg_id);
+        if let Some(at) = position
+            && self.history.published[at].verification != Some(Verification::Pending)
+        {
+            return Ok(&self.history.published[at]);
+        }
+        let verification = self.verify(&batch, &changes, root_after)?;
+        if verification == Verification::Verified {
+            self.history.covered_to = batch.to_lez_block_id;
+        }
+        let entry = Published {
+            msg_id,
+            tx_hash,
+            from_lez_block_id: batch.from_lez_block_id,
+            to_lez_block_id: batch.to_lez_block_id,
+            root_after,
+            change_count: batch.changes.len(),
+            changes,
+            published_at_unix: now_unix(),
+            published_at_slot: Some(l1_slot),
+            status: Status::Finalized { l1_slot },
+            verification: Some(verification),
+        };
+        match position {
+            Some(at) => {
+                self.history.published[at] = entry;
+                Ok(&self.history.published[at])
+            }
+            None => {
+                self.history.published.push(entry);
+                Ok(self.history.published.last().expect("just pushed"))
+            }
+        }
+    }
+
+    /// The three checks of a batch: contiguous with what was verified so far, its changes
+    /// replay to its root, and that root is this indexer's own tree at `to_lez_block_id`.
+    /// Only a verified batch moves the replay tree.
+    fn verify(
+        &mut self,
+        batch: &Batch,
+        changes: &[ChangeRecord],
+        root_after: [u8; 32],
+    ) -> Result<Verification> {
+        let Some(own_root) = self.head.root_at(batch.to_lez_block_id) else {
+            return Ok(Verification::Pending);
+        };
+        if batch.from_lez_block_id != self.history.covered_to + 1 {
+            return Ok(Verification::Rejected(format!(
+                "covers LEZ blocks from {}, the previous batch covered to {}",
+                batch.from_lez_block_id, self.history.covered_to
+            )));
+        }
+        if changes.len() != batch.changes.len() {
+            return Ok(Verification::Rejected("a change has no kind".into()));
+        }
+        let replay = self
+            .replay
+            .as_mut()
+            .context("indexer replay tree not started")?;
+        let mut trial = replay.clone();
+        apply_changes(&mut trial, changes)?;
+        let replayed = fr_to_bytes_le(&trial.root());
+        if replayed != root_after {
+            return Ok(Verification::Rejected(format!(
+                "the changes replay to root {}, the batch claims {}",
+                hex::encode(replayed),
+                hex::encode(root_after)
+            )));
+        }
+        if own_root != root_after {
+            return Ok(Verification::Rejected(format!(
+                "the tree derived from LEZ is {} at block {}, the batch claims {}",
+                hex::encode(own_root),
+                batch.to_lez_block_id,
+                hex::encode(root_after)
+            )));
+        }
+        *replay = trial;
+        Ok(Verification::Verified)
+    }
+
+    /// Indexer: check again, in channel order, the batches left `Pending` because LEZ had not
+    /// been read far enough; stops at the first still pending (the later ones chain on it).
+    /// Returns how many got a verdict.
+    pub fn recheck_pending(&mut self) -> Result<usize> {
+        let mut decided = 0;
+        let pending: Vec<usize> = self
+            .history
+            .published
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.verification == Some(Verification::Pending))
+            .map(|(at, _)| at)
+            .collect();
+        for at in pending {
+            let p = &self.history.published[at];
+            let Some(payload) = self.payload(&p.msg_id) else {
+                continue;
+            };
+            let batch = Batch::decode(payload.as_slice()).context("a batch on record")?;
+            let changes = p.changes.clone();
+            let root_after = p.root_after;
+            let verification = self.verify(&batch, &changes, root_after)?;
+            if verification == Verification::Pending {
+                break;
+            }
+            if verification == Verification::Verified {
+                self.history.covered_to = batch.to_lez_block_id;
+            }
+            self.history.published[at].verification = Some(verification);
+            decided += 1;
+        }
+        Ok(decided)
+    }
+
+    /// Indexer: the root the replay tree is at, the last verified batch's.
+    pub fn replay_root(&self) -> Option<[u8; 32]> {
+        self.replay
+            .as_ref()
+            .map(|tree| fr_to_bytes_le(&tree.root()))
     }
 
     /// Write the reader's state, the history, the pending changes and the checkpoint into the
@@ -271,6 +464,7 @@ impl Registry {
             published_at_unix: now_unix(),
             published_at_slot,
             status: Status::Pending,
+            verification: None,
         });
         self.history.covered_to = batch.to_lez_block_id;
         self.pending_changes.clear();
@@ -474,6 +668,35 @@ impl Registry {
 /// Slots the finality scan starts early when a batch's slot is estimated from another's.
 const SLOT_ESTIMATE_MARGIN: u64 = 600;
 
+/// Apply a batch's changes to a tree: an insert sets the leaf, a removal empties it.
+fn apply_changes(
+    tree: &mut OptimalMerkleTree<PoseidonHash>,
+    changes: &[ChangeRecord],
+) -> Result<()> {
+    for change in changes {
+        let leaf_index = change.leaf_index as usize;
+        match change.kind {
+            ChangeKind::Insert => {
+                let hex = change
+                    .rate_commitment
+                    .as_deref()
+                    .context("an insert without a leaf")?;
+                let bytes: [u8; 32] = hex::decode(hex)
+                    .ok()
+                    .and_then(|v| v.try_into().ok())
+                    .context("a leaf that is not 32 bytes of hex")?;
+                let leaf = fr_from_bytes_le(&bytes).map_err(|e| anyhow::anyhow!(e))?;
+                tree.set(leaf_index, leaf)
+                    .with_context(|| format!("insert leaf {leaf_index}"))?;
+            }
+            ChangeKind::Remove => tree
+                .delete(leaf_index)
+                .with_context(|| format!("remove leaf {leaf_index}"))?,
+        }
+    }
+    Ok(())
+}
+
 /// Why `Registry::on_finalized` left a batch as it was.
 #[derive(Debug, PartialEq)]
 pub enum FinalizeRefused {
@@ -639,6 +862,81 @@ mod test {
         assert_eq!(registry.payload(&[4; 32]), Some(payload_of(4, 0xA)));
         assert_eq!(registry.payload(&[7; 32]), None);
         assert_eq!(registry.history.finality_scanned_to, Some(600));
+        drop(registry);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_indexer_checks_the_batches_against_its_own_derivation() {
+        let dir = std::env::temp_dir().join(format!("zone-indexer-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
+        registry.start_replay().unwrap();
+        // The indexer has read LEZ block 1 (two registrations).
+        registry
+            .apply_blocks(&[block(1, vec![registered(1, 0), registered(2, 1)])])
+            .unwrap();
+        let root_1 = registry.head.root();
+        let batch = |from: u64, to: u64, changes: Vec<Change>, root: [u8; 32]| {
+            Batch {
+                from_lez_block_id: from,
+                to_lez_block_id: to,
+                changes,
+                root_after: root.to_vec(),
+            }
+            .encode_to_vec()
+        };
+        let changes_1: Vec<Change> = registry.pending_changes.clone();
+        assert_eq!(changes_1.len(), 2);
+
+        // A batch claiming the right root with the right changes: verified.
+        let ok = registry
+            .observe_batch(
+                [1; 32],
+                [1; 32],
+                &batch(1, 1, changes_1.clone(), root_1),
+                100,
+            )
+            .unwrap();
+        assert_eq!(ok.verification, Some(Verification::Verified));
+        assert_eq!(registry.history.covered_to, 1);
+        assert_eq!(registry.replay_root(), Some(root_1));
+
+        // A batch for blocks the indexer has not read yet: pending, then checked.
+        let pending = registry
+            .observe_batch(
+                [2; 32],
+                [2; 32],
+                &batch(2, 3, vec![Change::remove(0)], [7; 32]),
+                200,
+            )
+            .unwrap();
+        assert_eq!(pending.verification, Some(Verification::Pending));
+        registry
+            .apply_blocks(&[block(2, vec![]), block(3, vec![registered(3, 2)])])
+            .unwrap();
+        assert_eq!(registry.recheck_pending().unwrap(), 1);
+        let rejected = &registry.history.published[1];
+        assert!(matches!(
+            rejected.verification,
+            Some(Verification::Rejected(ref reason)) if reason.contains("replay to root")
+        ));
+        // A rejected batch moves nothing: the next honest batch still chains on block 1.
+        assert_eq!(registry.history.covered_to, 1);
+        assert_eq!(registry.replay_root(), Some(root_1));
+        let root_3 = registry.head.root();
+        let changes_3: Vec<Change> = registry.pending_changes.clone();
+        let ok = registry
+            .observe_batch([3; 32], [3; 32], &batch(2, 3, changes_3, root_3), 300)
+            .unwrap();
+        assert_eq!(ok.verification, Some(Verification::Verified));
+        assert_eq!(registry.replay_root(), Some(root_3));
+        // Seen again, a decided batch is left as it is.
+        let again = registry
+            .observe_batch([3; 32], [3; 32], &batch(2, 3, vec![], [9; 32]), 300)
+            .unwrap();
+        assert_eq!(again.verification, Some(Verification::Verified));
+        registry.close().unwrap();
         drop(registry);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -27,7 +27,7 @@ Early design. Nothing is deployed.
 
 - **Specification**: [`docs/rfc-rln-membership-zone.md`](docs/rfc-rln-membership-zone.md),
   a raw LIP draft that ends with the open design questions.
-- **Zone sequencer**: [`zone-sequencer/`](zone-sequencer) runs on the Logos testnet with an
+- **Zone node** (`src/`, bin `zone`): the sequencer runs on the Logos testnet with an
   HTTP registry API. It reads the registration program's transactions from a LEZ Sequencer,
   derives the tree, publishes batches on its channel through the Zone SDK and follows them to
   finality. Setup, operation and troubleshooting: [`docs/setup-rln-membership-zone.md`](docs/setup-rln-membership-zone.md).
@@ -69,7 +69,7 @@ but that only pauses the registry at the Zone indexers until a correct batch arr
 
 ```text
 docs/rfc-rln-membership-zone.md   the specification (raw LIP draft)
-zone-sequencer/                   the Zone sequencer, with its HTTP registry API
+src/                              the Zone node: sequencer and indexer (MODE), HTTP registry API; src/bin/ the proof tools
   src/lez.rs                      LEZ blocks and the program's events, derived from its transactions (rln-layouts)
   src/reader.rs                   a reader: derivation rules over the events and the tree (sled-backed PmTree)
   src/batch.rs                    batch wire format (protobuf)
@@ -106,15 +106,17 @@ cd logos-rln-membership-zone
 
 cp .env.example .env             # set FUNDING_PK to the node's PoWClaim public key
 set -a; source .env; set +a      # clap reads process env vars, not the .env file
-cargo run -p zone-sequencer
+cargo run
 
 curl -s localhost:3000/ | jq                 # channel, LEZ head, event and tree counters
 curl -s localhost:3000/roots/5 | jq          # newest roots: the changes that made each, its batches on Bedrock
+MODE=indexer DATA_DIR=data-indexer HTTP_ADDR=127.0.0.1:3001 INDEXER_FROM_L1_SLOT=2478000 \
+    cargo run                # an indexer beside it: reads the channel, checks every batch
 curl -s localhost:3000/merkle_proof/0 | jq   # membership at leaf 0 (or by id_commitment) and its proof path
 curl -s localhost:3000/leaves | jq           # active and removed memberships at the LEZ head
 ```
 
-The first start creates the channel (the key in `zone-sequencer/data/key.hex`, the id
+The first start creates the channel (the key in `data/key.hex`, the id
 `sha256(CHANNEL_NAME)`), reads every LEZ block since the program was deployed, backfills the
 channel from the node and publishes the first batch; later starts resume from the data dir.
 Everything else, including running your own LEZ sequencer as the block source, is in
@@ -123,8 +125,8 @@ Everything else, including running your own LEZ sequencer as the block source, i
 ### Tests
 
 ```bash
-cargo test -p zone-sequencer
-cargo clippy -p zone-sequencer --all-targets -- -D warnings
+cargo test
+cargo clippy --all-targets -- -D warnings
 ```
 
 The unit tests cover the derivation rules (a `Registered` event sets the leaf and the proof

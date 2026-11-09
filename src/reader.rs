@@ -17,7 +17,11 @@
 //! - After a block's events, every active leaf whose expiry is at or before the block's
 //!   timestamp is removed, in leaf order.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::LazyLock,
+};
 
 use anyhow::{Context as _, Result, anyhow};
 use rln::prelude::{
@@ -26,7 +30,9 @@ use rln::prelude::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use zerokit_utils::merkle_tree::{ZerokitMerkleProof, ZerokitMerkleTree};
+use zerokit_utils::merkle_tree::{
+    OptimalMerkleConfig, OptimalMerkleTree, ZerokitMerkleProof, ZerokitMerkleTree,
+};
 
 use crate::{
     batch::Change,
@@ -34,6 +40,17 @@ use crate::{
 };
 
 pub const TREE_DEPTH: usize = 20;
+
+/// The root of the empty tree, what every registry starts from.
+pub static EMPTY_ROOT: LazyLock<[u8; 32]> = LazyLock::new(|| {
+    let tree = OptimalMerkleTree::<PoseidonHash>::new(
+        TREE_DEPTH,
+        Fr::default(),
+        OptimalMerkleConfig::default(),
+    )
+    .expect("an in-memory tree of depth 20");
+    fr_to_bytes_le(&tree.root())
+});
 
 /// 32-byte little-endian representation of a field element (RLN-API Appendix B form).
 pub fn fr_to_bytes_le(fr: &Fr) -> [u8; 32] {
@@ -145,6 +162,10 @@ struct Meta {
     stats: Stats,
     /// By `id_commitment`, hex.
     members: HashMap<String, Member>,
+    /// The root after every LEZ block that changed the tree, by block id (as a string, JSON
+    /// keys), root hex.
+    #[serde(default)]
+    roots_by_block: BTreeMap<String, String>,
     #[serde(default)]
     extra: Value,
 }
@@ -161,6 +182,9 @@ pub struct Reader {
     pub applied_block_id: u64,
     /// `timestamp_ms` of the last LEZ block applied: the clock this reader's tree is at.
     pub applied_timestamp_ms: u64,
+    /// The root after every LEZ block that changed the tree: what the tree was at any block
+    /// (`root_at`), to check a batch's root against.
+    roots_by_block: BTreeMap<u64, [u8; 32]>,
 }
 
 impl Reader {
@@ -224,6 +248,7 @@ impl Reader {
             stats: Stats::default(),
             applied_block_id,
             applied_timestamp_ms: 0,
+            roots_by_block: BTreeMap::new(),
         };
         let bytes = reader.tree.metadata().unwrap_or_default();
         if bytes.is_empty() {
@@ -243,6 +268,10 @@ impl Reader {
         reader.stats = meta.stats;
         reader.applied_block_id = meta.applied_block_id;
         reader.applied_timestamp_ms = meta.applied_timestamp_ms;
+        for (block_id, root) in &meta.roots_by_block {
+            let block_id: u64 = block_id.parse().context("root history block id")?;
+            reader.roots_by_block.insert(block_id, parse_32(root)?);
+        }
         Ok((reader, meta.extra))
     }
 
@@ -257,6 +286,11 @@ impl Reader {
                 .members
                 .iter()
                 .map(|(id, m)| (hex::encode(id), *m))
+                .collect(),
+            roots_by_block: self
+                .roots_by_block
+                .iter()
+                .map(|(block_id, root)| (block_id.to_string(), hex::encode(root)))
                 .collect(),
             extra,
         };
@@ -404,7 +438,24 @@ impl Reader {
         }
         self.applied_block_id = block.block_id;
         self.applied_timestamp_ms = block.timestamp_ms;
+        if !changes.is_empty() {
+            self.roots_by_block.insert(block.block_id, self.root());
+        }
         Ok(changes)
+    }
+
+    /// The tree's root right after LEZ block `block_id`: the root after the last block up to it
+    /// that changed the tree, the empty tree's before any. `None` past the block applied last.
+    pub fn root_at(&self, block_id: u64) -> Option<[u8; 32]> {
+        if block_id > self.applied_block_id {
+            return None;
+        }
+        Some(
+            self.roots_by_block
+                .range(..=block_id)
+                .next_back()
+                .map_or(*EMPTY_ROOT, |(_, root)| *root),
+        )
     }
 
     /// Slashed or erased: the membership is over; its leaf leaves the tree if still there.

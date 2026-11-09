@@ -1,14 +1,18 @@
-[workspace]
-members  = ["zone-sequencer"]
-resolver = "2"
+[package]
+name        = "rln-membership-zone"
+description = "The RLN Membership Zone node: derives the membership tree from the registration program on LEZ; as the sequencer publishes batches on the Zone channel, as an indexer reads and checks them; serves roots and Merkle proof paths over HTTP"
+edition     = "2024"
+license     = "MIT OR Apache-2.0"
+repository  = "https://github.com/logos-co/logos-rln-membership-zone"
+version     = "0.1.0"
+publish     = false
+default-run = "zone"
 
-[workspace.package]
-edition    = "2024"
-license    = "MIT OR Apache-2.0"
-repository = "https://github.com/logos-co/logos-rln-membership-zone"
-version    = "0.1.0"
+[[bin]]
+name = "zone"
+path = "src/main.rs"
 
-[workspace.dependencies]
+[dependencies]
 # logos-blockchain crates (unpublished), pinned to the node release in use by git tag; the
 # tag and rust-toolchain.toml move together with the node
 lb-common-http-client            = { default-features = false, package = "logos-blockchain-common-http-client", git = "https://github.com/logos-blockchain/logos-blockchain", tag = "0.3.2" }
@@ -31,7 +35,7 @@ base64             = "0.22"
 borsh              = "1"
 axum               = { default-features = false, features = ["http1", "json", "query", "tokio"], version = "0.8" }
 clap               = { features = ["derive", "env", "std"], version = "4" }
-hex                = "0.4"
+hex                = { features = ["serde"], version = "0.4" }
 prost              = "0.13"
 rand               = "0.8"
 reqwest            = { default-features = false, features = ["json", "rustls-tls"], version = "0.12" }
