@@ -444,7 +444,7 @@ async fn main() -> Result<()> {
             .stats
             .registered,
     );
-    println!("waiting for the Zone sequencer to be ready...");
+    println!("waiting for the Zone SDK to be ready...");
 
     let mut ready = false;
     // The batch waiting to land in a block (its message id), if any; after a restart, the

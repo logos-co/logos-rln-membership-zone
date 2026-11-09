@@ -10,11 +10,13 @@ runs the node; the Mac side is only where the code is edited.
 | Process | Port | Role |
 | --- | --- | --- |
 | Logos Blockchain node (Bedrock, L1) | 8080 | HTTP API: wallet, mempool, blocks. The Zone SDK publishes batches through it and pays fees from its wallet. Never expose it: the API has no auth and reaches the wallet. |
-| Zone sequencer, `zone` | 3000 | Reads LEZ blocks, derives the tree, publishes one batch per change or heartbeat on its channel, serves `/roots`, `/merkle_proof`, `/leaf`, `/leaves`. |
+| Zone sequencer, `zone` | 3000 | Reads LEZ blocks, derives the tree, publishes one batch per change or heartbeat on its channel, serves `/roots`, `/merkle_proof`, `/leaves`. |
+| Zone indexer, `zone --mode indexer` | 3001 | Optional, beside the sequencer: derives the same tree, reads the channel's finalized batches and checks each against it, serves the same API with the verdicts. |
 | LEZ Sequencer | 3040 or public | Source of closed LEZ blocks (`getBlockRange`). Default: `https://testnet.lez.logos.co`. Optional: your own, section 5. |
 
 Data flow: LEZ Sequencer (blocks, transactions) -> Zone sequencer (tree, batches) ->
-Bedrock node (channel) and HTTP API (Modules).
+Bedrock node (channel) and HTTP API (Modules); Bedrock node (channel) -> Zone indexer
+(checks) -> HTTP API.
 
 ## 2. Prerequisites on the Linux box
 
@@ -59,7 +61,7 @@ newer node answers the backfill with blocks the older SDK cannot parse (`Failed 
 immutable blocks ... Failed to parse response`, repeating forever); bump the tag and
 `rust-toolchain.toml` then.
 
-## 3. Zone sequencer
+## 3. Zone node: sequencer and indexer
 
 ### Install and configure
 
@@ -433,17 +435,19 @@ fee per batch), `lib_slot` against `slot` (finality), the time from `pending` to
 
 ## 8. Cleanup
 
-Zone sequencer data (keeps the key):
+Zone sequencer data (keeps the key), and the indexer's (nothing to keep, it reads the chain
+again):
 
 ```bash
 cd ~/logos-rln-membership-zone
 rm -rf data/tree
+rm -rf data-indexer
 ```
 
-Everything of the Zone sequencer, including the key and the build:
+Everything of the Zone node, including the key and the build:
 
 ```bash
-rm -rf ~/logos-rln-membership-zone/data ~/logos-rln-membership-zone/target
+rm -rf ~/logos-rln-membership-zone/data ~/logos-rln-membership-zone/data-indexer ~/logos-rln-membership-zone/target
 ```
 
 Own LEZ sequencer: `rm -rf ~/logos-rln-membership-zone/lez-sequencer/home` and, to free

@@ -1,4 +1,4 @@
-//! Generate an RLN proof for a membership the Zone sequencer serves: the Merkle proof path is
+//! Generate an RLN proof for a membership a Zone node serves: the Merkle proof path is
 //! the Zone's `GET /merkle_proof/{id_commitment}` answer, handed in as JSON (`--merkle-proof`,
 //! `ZONE_MERKLE_PROOF`) or fetched from `--zone-url`; the identity secret comes from the caller
 //! (`register_member` prints it as `IDENTITY_SECRET_HASH`); the proof goes to a JSON file for
@@ -21,13 +21,13 @@ use rln::prelude::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
-#[command(about = "RLN proof for a membership the Zone sequencer serves")]
+#[command(about = "RLN proof for a membership a Zone node serves")]
 struct Args {
     /// The Zone's `/merkle_proof/{id_commitment}` answer, as JSON; fetched from `zone_url`
     /// when absent.
     #[arg(long, env = "ZONE_MERKLE_PROOF", hide_env_values = true)]
     merkle_proof: Option<String>,
-    /// The Zone sequencer's HTTP API, asked when no `merkle_proof` is given.
+    /// A Zone node's HTTP API (sequencer or indexer), asked when no `merkle_proof` is given.
     #[arg(long, default_value = "http://127.0.0.1:3000", env = "ZONE_URL")]
     zone_url: String,
     /// The identity secret, 32 bytes little-endian in hex (`IDENTITY_SECRET_HASH` of

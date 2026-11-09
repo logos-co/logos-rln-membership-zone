@@ -27,12 +27,14 @@ Early design. Nothing is deployed.
 
 - **Specification**: [`docs/rfc-rln-membership-zone.md`](docs/rfc-rln-membership-zone.md),
   a raw LIP draft that ends with the open design questions.
-- **Zone node** (`src/`, bin `zone`): the sequencer runs on the Logos testnet with an
-  HTTP registry API. It reads the registration program's transactions from a LEZ Sequencer,
-  derives the tree, publishes batches on its channel through the Zone SDK and follows them to
-  finality. Setup, operation and troubleshooting: [`docs/setup-rln-membership-zone.md`](docs/setup-rln-membership-zone.md).
-- **Not yet written**: the Zone indexer (a Zone sequencer without an accredited key that
-  checks the batches), the event source once LEZ serves events live, and the Module side.
+- **Zone node** (`src/`, bin `zone`), two modes on one binary, both with the HTTP registry
+  API. The **sequencer** runs on the Logos testnet: it reads the registration program's
+  transactions from a LEZ Sequencer, derives the tree, publishes batches on its channel
+  through the Zone SDK and follows them to finality. The **indexer** derives the same tree,
+  reads the batches from the channel's finalized history and checks each against its own
+  derivation: the watchdog of the sequencer, no key, no funds. Setup, operation and
+  troubleshooting: [`docs/setup-rln-membership-zone.md`](docs/setup-rln-membership-zone.md).
+- **Not yet written**: the event source once LEZ serves events live, and the Module side.
 
 ## How it works
 

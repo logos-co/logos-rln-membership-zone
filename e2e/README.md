@@ -11,8 +11,8 @@ chain side. Everything that holds funds or state lives under `E2E_STATE` (defaul
 
 ## Prerequisites
 
-- The Zone sequencer running (`docs/setup-rln-membership-zone.md`), its `.env` naming the
-  same program and tree as the network env file.
+- The Zone node running as the sequencer (`docs/setup-rln-membership-zone.md`), its `.env`
+  naming the same program and tree as the network env file; the scenarios read its API.
 - A `logos-lez-rln` checkout on branch `feat/rln-zone-events` (the deployed program) with
   `mint_payer`, `register_member`, `slash_member` and `account_balance` built (`cargo build
   --bin ...` in its `lez-rln/`; debug is fine). `LEZ_RLN_CHECKOUT` points to it, default `~/logos-lez-rln`.

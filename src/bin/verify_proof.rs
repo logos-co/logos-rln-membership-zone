@@ -22,12 +22,12 @@ use rln::prelude::{
 use serde::Deserialize;
 
 #[derive(Parser)]
-#[command(about = "Verify an RLN proof against the roots the Zone sequencer serves")]
+#[command(about = "Verify an RLN proof against the roots a Zone node serves")]
 struct Args {
     /// The Zone's `/roots/{window_size}` answer, as JSON; fetched from `zone_url` when absent.
     #[arg(long, env = "ZONE_ROOTS", hide_env_values = true)]
     roots: Option<String>,
-    /// The Zone sequencer's HTTP API, asked when no `roots` are given.
+    /// A Zone node's HTTP API (sequencer or indexer), asked when no `roots` are given.
     #[arg(long, default_value = "http://127.0.0.1:3000", env = "ZONE_URL")]
     zone_url: String,
     /// The proof file `generate_proof` wrote.
