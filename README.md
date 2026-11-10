@@ -112,7 +112,7 @@ cargo run
 
 curl -s localhost:3000/ | jq                 # channel, LEZ head, event and tree counters
 curl -s localhost:3000/roots/5 | jq          # newest roots: the changes that made each, its batches on Bedrock
-MODE=indexer DATA_DIR=data-indexer HTTP_ADDR=127.0.0.1:3001 INDEXER_FROM_L1_SLOT=2478000 \
+MODE=indexer DATA_DIR=data-indexer HTTP_ADDR=127.0.0.1:3001 INDEXER_FROM_L1_SLOT=2734232 \
     cargo run                # an indexer beside it: reads the channel, checks every batch
 curl -s localhost:3000/merkle_proof/0 | jq   # membership at leaf 0 (or by id_commitment) and its proof path
 curl -s localhost:3000/leaves | jq           # active and removed memberships at the LEZ head

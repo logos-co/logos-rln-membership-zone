@@ -175,13 +175,13 @@ API and the LEZ source. Run it beside the sequencer with its own data dir and po
 
 ```bash
 set -a; . ./.env; set +a
-MODE=indexer DATA_DIR=data-indexer HTTP_ADDR=127.0.0.1:3001 INDEXER_FROM_L1_SLOT=2478000 \
+MODE=indexer DATA_DIR=data-indexer HTTP_ADDR=127.0.0.1:3001 INDEXER_FROM_L1_SLOT=2734232 \
     cargo run
 ```
 
 `INDEXER_FROM_L1_SLOT` is any slot at or before the channel's first inscription; the
-sequencer logs it at publish (`L1 slot`), and 2478000 is channel
-`v0.3.0-4`'s. The indexer's `/` reports `mode`, `verified_batch_count`, `rejected_batch_count` and
+sequencer logs it at publish (`L1 slot`), and 2734232 is channel
+`v0.3.0-5`'s (batch 1 at that slot). The indexer's `/` reports `mode`, `verified_batch_count`, `rejected_batch_count` and
 `replay_root` (the root its verified batches replay to); every batch in `/roots` carries
 `verification` (`verified`, `rejected`, `pending`) and `rejection`, the reason or `null`. A
 sequencer checks nothing of its own and has none of these keys. Its `/roots` entry 0 is the
