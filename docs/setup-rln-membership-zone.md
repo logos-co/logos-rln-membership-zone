@@ -424,14 +424,18 @@ fee per batch), `lib_slot` against `slot` (finality), the time from `pending` to
   history); if seen, start a new channel (section 3).
 - `LEZ read failed: getBlockRange: {"code":-32008,... "Response is too big"}` repeating:
   fixed (the span is halved down to one block); an older build needs the fix, not a restart.
-- `LEZ read failed: LEZ block N where M was expected` or `... does not chain on block ...`
-  every poll: the Sequencer answered `getBlockRange` out of order or with a history that
-  differs from the blocks already applied (seen once on 2026-11-10: the slash of leaf 15
-  read at block 79375 live sits at 79376 in the chain since; the sequencer batched the
-  change one block early and an indexer rejects that batch and every later one). The
-  reader applies nothing until the chain continues; if LEZ really rewrote closed blocks,
-  `REBUILD_TREE=true` once re-reads it, and the batches already on Bedrock stay wrong:
-  start a new channel for a clean indexer replay.
+- `LEZ rewrote its blocks after N: rewound to it, reading again`: the LEZ Sequencer
+  re-produced closed blocks it had not anchored on Bedrock yet (it does after a restart;
+  seen twice on 2026-11-10). The reader keeps the hashes of the last 4096 blocks, finds the
+  newest one LEZ still agrees on and reads from there; harmless while none of the rewritten
+  blocks carried an event. `WARNING: K published batch(es) cover blocks LEZ rewrote` means
+  a batch already on Bedrock claims a root for a block that changed: an indexer rejects it
+  and every later one, only a new channel mends that.
+- `LEZ read failed: ... carried an event; the tree must be read again (REBUILD_TREE=true)`
+  every poll: the rewrite crossed an event and the tree may hold what LEZ no longer says;
+  stop, start once with `REBUILD_TREE=true` (history and checkpoint kept), then as usual.
+  `LEZ block N where M was expected` is a `getBlockRange` answer out of order; nothing is
+  applied until it comes back right.
 - The first batch of a channel carries a root but `no changes` in the log (empty
   `changes` in `/roots`): fixed (the pending changes are persisted with the tree; before, a
   restart between reading LEZ and publishing lost them). A channel whose first batch is

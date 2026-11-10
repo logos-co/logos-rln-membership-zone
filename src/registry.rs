@@ -479,6 +479,21 @@ impl Registry {
         Ok(())
     }
 
+    /// LEZ rewrote its blocks after `block_id` (`ChainBreak::Fork`): forget them and the
+    /// pending changes they made so they are read again. Returns how many published batches
+    /// cover a rewritten block: their roots may no longer be what LEZ says, an indexer will
+    /// reject them, and only a new channel mends that.
+    pub fn rewind_to(&mut self, block_id: u64) -> Result<usize> {
+        self.head.rewind_to(block_id)?;
+        self.pending_changes.retain(|(block, _)| *block <= block_id);
+        Ok(self
+            .history
+            .published
+            .iter()
+            .filter(|p| p.status != Status::Orphaned && p.to_lez_block_id > block_id)
+            .count())
+    }
+
     /// The next batch: every LEZ block after `covered_to` up to the head, with the pending
     /// changes and the root after them; `None` when the head is already covered.
     pub fn next_batch(&self) -> Option<Batch> {

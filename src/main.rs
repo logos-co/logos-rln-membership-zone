@@ -24,7 +24,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use lb_core::mantle::{
     gas::GasCost,
@@ -48,6 +48,7 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     http::{AppState, Shared},
     lez::{MAX_BLOCK_RANGE_LEN, SequencerLez},
+    reader::{ChainBreak, HASH_HISTORY},
     registry::{FinalizeRefused, Published, Registry, Status, Verification, now_unix},
 };
 
@@ -295,6 +296,33 @@ async fn apply_range(
     while start <= to {
         let end = to.min(start + MAX_BLOCK_RANGE_LEN - 1);
         let blocks = source.blocks(start, end).await?;
+        // The chain check comes first: nothing of a span that does not continue the
+        // reader's chain is applied or logged.
+        let fork = {
+            let registry = registry.read().expect("registry lock");
+            match registry.head.check_chain(&blocks) {
+                Ok(()) => None,
+                Err(ChainBreak::Fork { .. }) => Some(()),
+                Err(e) => return Err(e.into()),
+            }
+        };
+        if fork.is_some() {
+            // LEZ rewrote blocks the reader applied: back to the newest one both agree on,
+            // and this span is read again from there.
+            let fork = find_fork(source, registry).await?;
+            let mut registry = registry.write().expect("registry lock");
+            let stale = registry.rewind_to(fork)?;
+            registry.save()?;
+            println!("LEZ rewrote its blocks after {fork}: rewound to it, reading again");
+            if stale > 0 {
+                println!(
+                    "WARNING: {stale} published batch(es) cover blocks LEZ rewrote; an indexer \
+                     rejects them, only a new channel mends that"
+                );
+            }
+            start = fork + 1;
+            continue;
+        }
         let mut registry = registry.write().expect("registry lock");
         for block in &blocks {
             if !block.events.is_empty() {
@@ -316,6 +344,39 @@ async fn apply_range(
         start = end + 1;
     }
     Ok(applied)
+}
+
+/// The newest LEZ block the reader applied whose hash LEZ still serves: where a rewritten
+/// history forks off. Walks back from the reader's head through the hashes it kept.
+async fn find_fork(source: &SequencerLez, registry: &Shared) -> Result<u64> {
+    let (mut high, oldest) = {
+        let registry = registry.read().expect("registry lock");
+        let oldest = registry
+            .head
+            .oldest_hashed_block_id()
+            .context("no block hash kept, cannot find where LEZ forked")?;
+        (registry.head.lez_block_id, oldest)
+    };
+    loop {
+        let low = high.saturating_sub(63).max(oldest);
+        let blocks = source.blocks(low, high).await?;
+        {
+            let registry = registry.read().expect("registry lock");
+            for block in blocks.iter().rev() {
+                if registry.head.block_hash(block.block_id) == Some(block.hash) {
+                    return Ok(block.block_id);
+                }
+            }
+        }
+        if low == oldest {
+            bail!(
+                "none of the last {} blocks applied agrees with LEZ any more; the tree must be \
+                 read again (REBUILD_TREE=true)",
+                HASH_HISTORY
+            );
+        }
+        high = low - 1;
+    }
 }
 
 #[tokio::main]
