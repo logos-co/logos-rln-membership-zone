@@ -452,8 +452,8 @@ impl Reader {
         }
         if self.last_event_block_id > block_id {
             bail!(
-                "LEZ rewrote blocks after {block_id} and block {} carried an event; the tree \
-                 must be read again (REBUILD_TREE=true)",
+                "LEZ FORK at block {block_id} but block {} after it carried an event: the tree may \
+                 hold what LEZ no longer says; stop and start once with REBUILD_TREE=true",
                 self.last_event_block_id
             );
         }

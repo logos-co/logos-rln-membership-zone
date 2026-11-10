@@ -298,28 +298,34 @@ async fn apply_range(
         let blocks = source.blocks(start, end).await?;
         // The chain check comes first: nothing of a span that does not continue the
         // reader's chain is applied or logged.
-        let fork = {
+        let broken = {
             let registry = registry.read().expect("registry lock");
             match registry.head.check_chain(&blocks) {
-                Ok(()) => None,
-                Err(ChainBreak::Fork { .. }) => Some(()),
+                Ok(()) => false,
+                Err(e @ ChainBreak::Fork { .. }) => {
+                    println!("LEZ FORK: {e}; looking for the last block LEZ still agrees on");
+                    true
+                }
                 Err(e) => return Err(e.into()),
             }
         };
-        if fork.is_some() {
+        if broken {
             // LEZ rewrote blocks the reader applied: back to the newest one both agree on,
             // and this span is read again from there.
             let fork = find_fork(source, registry).await?;
             let mut registry = registry.write().expect("registry lock");
-            let stale = registry.rewind_to(fork)?;
+            let was_at = registry.head.lez_block_id;
+            let pending_before = registry.pending_changes.len();
+            registry.rewind_to(fork)?;
             registry.save()?;
-            println!("LEZ rewrote its blocks after {fork}: rewound to it, reading again");
-            if stale > 0 {
-                println!(
-                    "WARNING: {stale} published batch(es) cover blocks LEZ rewrote; an indexer \
-                     rejects them, only a new channel mends that"
-                );
-            }
+            println!(
+                "LEZ FORK: at block {fork}; blocks {}..{was_at} ({} block(s), no events) \
+                 forgotten, {} pending change(s) dropped; reading again from {}",
+                fork + 1,
+                was_at - fork,
+                pending_before - registry.pending_changes.len(),
+                fork + 1
+            );
             start = fork + 1;
             continue;
         }
@@ -359,6 +365,7 @@ async fn find_fork(source: &SequencerLez, registry: &Shared) -> Result<u64> {
     };
     loop {
         let low = high.saturating_sub(63).max(oldest);
+        println!("LEZ FORK: comparing blocks {low}..{high} with the hashes kept");
         let blocks = source.blocks(low, high).await?;
         {
             let registry = registry.read().expect("registry lock");
@@ -370,8 +377,8 @@ async fn find_fork(source: &SequencerLez, registry: &Shared) -> Result<u64> {
         }
         if low == oldest {
             bail!(
-                "none of the last {} blocks applied agrees with LEZ any more; the tree must be \
-                 read again (REBUILD_TREE=true)",
+                "LEZ FORK older than the last {} blocks kept: the tree must be read again \
+                 (REBUILD_TREE=true)",
                 HASH_HISTORY
             );
         }
@@ -508,6 +515,8 @@ async fn main() -> Result<()> {
     println!("waiting for the Zone SDK to be ready...");
 
     let mut ready = false;
+    // Published batches LEZ has contradicted, as last reported (warned once per change).
+    let mut contradicted_count = 0;
     // The batch waiting to land in a block (its message id), if any; after a restart, the
     // newest Pending batch of the history, which the SDK checkpoint keeps resubmitting.
     // The SDK's view of the channel: its `tip_message` is how our own batches are seen landing,
@@ -628,6 +637,21 @@ async fn main() -> Result<()> {
                 {
                     println!("LEZ read failed: {e}");
                     continue;
+                }
+                // The sequencer checks its own statements against the tree LEZ gives now.
+                {
+                    let registry = registry.read().expect("registry lock");
+                    let contradicted = registry.contradicted();
+                    if contradicted.len() != contradicted_count {
+                        contradicted_count = contradicted.len();
+                        for p in contradicted {
+                            println!(
+                                "WARNING: batch [{}..{}] msg {} claims root {}.. but LEZ now gives {}.. at block {}: an indexer rejects it and every later batch, only a new channel mends that",
+                                p.from_lez_block_id, p.to_lez_block_id, hex::encode(&p.msg_id[..4]), hex::encode(&p.root_after[..4]),
+                                registry.head.root_at(p.to_lez_block_id).map(|r| hex::encode(&r[..4])).unwrap_or_default(), p.to_lez_block_id
+                            );
+                        }
+                    }
                 }
                 // 2. One batch covering the LEZ blocks not covered yet, when there are changes
                 //    or the heartbeat is due, with at most one batch in flight.

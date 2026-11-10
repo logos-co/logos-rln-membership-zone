@@ -424,14 +424,17 @@ fee per batch), `lib_slot` against `slot` (finality), the time from `pending` to
   history); if seen, start a new channel (section 3).
 - `LEZ read failed: getBlockRange: {"code":-32008,... "Response is too big"}` repeating:
   fixed (the span is halved down to one block); an older build needs the fix, not a restart.
-- `LEZ rewrote its blocks after N: rewound to it, reading again`: the LEZ Sequencer
+- `LEZ FORK: LEZ block N does not chain on block N-1 ...` then `LEZ FORK: at block F; blocks
+  F+1..N-1 forgotten ... reading again`: the LEZ Sequencer
   re-produced closed blocks it had not anchored on Bedrock yet (it does after a restart;
   seen twice on 2026-11-10). The reader keeps the hashes of the last 4096 blocks, finds the
   newest one LEZ still agrees on and reads from there; harmless while none of the rewritten
-  blocks carried an event. `WARNING: K published batch(es) cover blocks LEZ rewrote` means
-  a batch already on Bedrock claims a root for a block that changed: an indexer rejects it
-  and every later one, only a new channel mends that.
-- `LEZ read failed: ... carried an event; the tree must be read again (REBUILD_TREE=true)`
+  blocks carried an event. `WARNING: batch [..] claims root R.. but LEZ now gives S.. at
+  block N` (checked after every LEZ read) means a batch already on Bedrock states a root
+  the rewritten history contradicts: an indexer rejects it and every later one, only a new
+  channel mends that.
+- `LEZ read failed: LEZ FORK at block F but block E after it carried an event ...` (or
+  `LEZ FORK older than the last 4096 blocks kept`)
   every poll: the rewrite crossed an event and the tree may hold what LEZ no longer says;
   stop, start once with `REBUILD_TREE=true` (history and checkpoint kept), then as usual.
   `LEZ block N where M was expected` is a `getBlockRange` answer out of order; nothing is
