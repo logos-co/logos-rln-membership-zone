@@ -92,6 +92,12 @@ pub struct Member {
     pub active: bool,
     /// Why the leaf is not in the tree, when it is not.
     pub removed: Option<Removed>,
+    /// The LEZ block of the `Registered` that made it.
+    #[serde(default)]
+    pub registered_at_lez_block_id: u64,
+    /// The LEZ block whose event or expiry step took the leaf out, while it is out.
+    #[serde(default)]
+    pub removed_at_lez_block_id: Option<u64>,
 }
 
 impl Member {
@@ -120,19 +126,18 @@ pub struct Stats {
     /// Privacy-preserving transactions with a public effect under the registration program:
     /// they carry no instruction and emit no event, so each changed the registry in a way
     /// this tree does not have.
-    pub private_transactions: u64,
+    #[serde(alias = "private_transactions")]
+    pub private_transaction_count: u64,
 }
 
 impl Stats {
-    /// The program's events applied, by name, and the privacy-preserving transactions the
-    /// reader could not read.
+    /// The program's events applied, by name.
     pub fn lez_events(&self) -> Value {
         serde_json::json!({
             "registered": self.registered,
             "extended": self.extended,
             "slashed": self.slashed,
             "erased": self.erased,
-            "private_transactions": self.private_transactions,
         })
     }
 
@@ -157,8 +162,10 @@ pub struct ProofPath {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Meta {
     tree_id: String,
-    applied_block_id: u64,
-    applied_timestamp_ms: u64,
+    #[serde(alias = "applied_block_id")]
+    lez_block_id: u64,
+    #[serde(alias = "applied_timestamp_ms")]
+    lez_timestamp_ms: u64,
     stats: Stats,
     /// By `id_commitment`, hex.
     members: HashMap<String, Member>,
@@ -179,25 +186,25 @@ pub struct Reader {
     members: HashMap<[u8; 32], Member>,
     pub stats: Stats,
     /// Last LEZ `block_id` applied.
-    pub applied_block_id: u64,
+    pub lez_block_id: u64,
     /// `timestamp_ms` of the last LEZ block applied: the clock this reader's tree is at.
-    pub applied_timestamp_ms: u64,
+    pub lez_timestamp_ms: u64,
     /// The root after every LEZ block that changed the tree: what the tree was at any block
     /// (`root_at`), to check a batch's root against.
     roots_by_block: BTreeMap<u64, [u8; 32]>,
 }
 
 impl Reader {
-    /// Open the tree store at `dir` (created when missing). `applied_block_id` is where a
+    /// Open the tree store at `dir` (created when missing). `lez_block_id` is where a
     /// fresh reader starts; a store that already holds a reader keeps its own. Returns the
     /// `extra` its owner persisted last.
-    pub fn open(dir: &Path, tree_id: [u8; 32], applied_block_id: u64) -> Result<(Self, Value)> {
+    pub fn open(dir: &Path, tree_id: [u8; 32], lez_block_id: u64) -> Result<(Self, Value)> {
         let config = PmTreeSledConfig::new()
             .path(dir.to_path_buf())
             .temporary(false)
             .build()
             .with_context(|| format!("tree store at {}", dir.display()))?;
-        Self::open_with(config, tree_id, applied_block_id)
+        Self::open_with(config, tree_id, lez_block_id)
     }
 
     /// Only the owner's `extra` of the store at `dir`, read off the raw metadata so a store
@@ -225,15 +232,15 @@ impl Reader {
 
     /// A throwaway store, for tests.
     #[cfg(test)]
-    pub fn open_temporary(tree_id: [u8; 32], applied_block_id: u64) -> Result<(Self, Value)> {
+    pub fn open_temporary(tree_id: [u8; 32], lez_block_id: u64) -> Result<(Self, Value)> {
         let config = PmTreeSledConfig::new().temporary(true).build()?;
-        Self::open_with(config, tree_id, applied_block_id)
+        Self::open_with(config, tree_id, lez_block_id)
     }
 
     fn open_with(
         config: PmTreeSledConfig,
         tree_id: [u8; 32],
-        applied_block_id: u64,
+        lez_block_id: u64,
     ) -> Result<(Self, Value)> {
         let tree = <PmTree<SledDB, PoseidonHash> as ZerokitMerkleTree>::new(
             TREE_DEPTH,
@@ -246,8 +253,8 @@ impl Reader {
             tree,
             members: HashMap::new(),
             stats: Stats::default(),
-            applied_block_id,
-            applied_timestamp_ms: 0,
+            lez_block_id,
+            lez_timestamp_ms: 0,
             roots_by_block: BTreeMap::new(),
         };
         let bytes = reader.tree.metadata().unwrap_or_default();
@@ -266,8 +273,8 @@ impl Reader {
             reader.members.insert(parse_32(id)?, *member);
         }
         reader.stats = meta.stats;
-        reader.applied_block_id = meta.applied_block_id;
-        reader.applied_timestamp_ms = meta.applied_timestamp_ms;
+        reader.lez_block_id = meta.lez_block_id;
+        reader.lez_timestamp_ms = meta.lez_timestamp_ms;
         for (block_id, root) in &meta.roots_by_block {
             let block_id: u64 = block_id.parse().context("root history block id")?;
             reader.roots_by_block.insert(block_id, parse_32(root)?);
@@ -279,8 +286,8 @@ impl Reader {
     pub fn persist(&mut self, extra: Value) -> Result<()> {
         let meta = Meta {
             tree_id: hex::encode(self.tree_id),
-            applied_block_id: self.applied_block_id,
-            applied_timestamp_ms: self.applied_timestamp_ms,
+            lez_block_id: self.lez_block_id,
+            lez_timestamp_ms: self.lez_timestamp_ms,
             stats: self.stats,
             members: self
                 .members
@@ -312,35 +319,32 @@ impl Reader {
         self.members.values().filter(|m| m.active).count()
     }
 
-    /// Active leaves by `leaf_index`: `(leaf_index, id_commitment, expiry_timestamp_ms)`.
-    pub fn active_leaves(&self) -> Vec<(u64, [u8; 32], u64)> {
+    /// Active leaves by `leaf_index`: `(id_commitment, member)`.
+    pub fn active_leaves(&self) -> Vec<([u8; 32], Member)> {
+        self.leaves(|m| m.active)
+    }
+
+    /// Memberships whose leaf is not in the tree, by `leaf_index`: `(id_commitment, member)`.
+    pub fn removed_leaves(&self) -> Vec<([u8; 32], Member)> {
+        self.leaves(|m| m.removed.is_some())
+    }
+
+    fn leaves(&self, keep: impl Fn(&Member) -> bool) -> Vec<([u8; 32], Member)> {
         let mut leaves: Vec<_> = self
             .members
             .iter()
-            .filter(|(_, m)| m.active)
-            .map(|(id, m)| (m.leaf_index, *id, m.expiry_timestamp_ms))
+            .filter(|(_, m)| keep(m))
+            .map(|(id, m)| (*id, *m))
             .collect();
-        leaves.sort();
+        leaves.sort_by_key(|(_, m)| m.leaf_index);
         leaves
-    }
-
-    /// Memberships whose leaf is not in the tree, by `leaf_index`:
-    /// `(leaf_index, id_commitment, cause)`.
-    pub fn removed_leaves(&self) -> Vec<(u64, [u8; 32], Removed)> {
-        let mut removed: Vec<_> = self
-            .members
-            .iter()
-            .filter_map(|(id, m)| m.removed.map(|c| (m.leaf_index, *id, c)))
-            .collect();
-        removed.sort_by_key(|(leaf_index, _, _)| *leaf_index);
-        removed
     }
 
     /// Apply the derivation rules to the events of one LEZ block and return the changes, in
     /// order.
     pub fn apply_block(&mut self, block: &Block) -> Result<Vec<Change>> {
         let mut changes = vec![];
-        self.stats.private_transactions += u64::from(block.private_transaction_count);
+        self.stats.private_transaction_count += u64::from(block.private_transaction_count);
         for event in &block.events {
             match event {
                 Event::Registered {
@@ -369,6 +373,8 @@ impl Reader {
                             rate_commitment: fr_to_bytes_le(&leaf),
                             active: true,
                             removed: None,
+                            registered_at_lez_block_id: block.block_id,
+                            removed_at_lez_block_id: None,
                         },
                     );
                     changes.push(Change::insert(*leaf_index, fr_to_bytes_le(&leaf).to_vec()));
@@ -400,6 +406,7 @@ impl Reader {
                         let leaf_index = member.leaf_index;
                         member.active = true;
                         member.removed = None;
+                        member.removed_at_lez_block_id = None;
                         self.stats.reinserted += 1;
                         self.tree
                             .set(leaf_index as usize, leaf)
@@ -409,11 +416,11 @@ impl Reader {
                 }
                 Event::Erased { id_commitment } => {
                     self.stats.erased += 1;
-                    changes.extend(self.end(id_commitment, Removed::Erased)?);
+                    changes.extend(self.end(id_commitment, Removed::Erased, block.block_id)?);
                 }
                 Event::Slashed { id_commitment } => {
                     self.stats.slashed += 1;
-                    changes.extend(self.end(id_commitment, Removed::Slashed)?);
+                    changes.extend(self.end(id_commitment, Removed::Slashed, block.block_id)?);
                 }
             }
         }
@@ -429,6 +436,7 @@ impl Reader {
             let member = self.members.get_mut(&id).expect("listed above");
             member.active = false;
             member.removed = Some(Removed::Expired);
+            member.removed_at_lez_block_id = Some(block.block_id);
             self.stats.removed_expired += 1;
             let leaf_index = member.leaf_index;
             self.tree
@@ -436,8 +444,8 @@ impl Reader {
                 .with_context(|| format!("delete leaf {leaf_index}"))?;
             changes.push(Change::remove(leaf_index));
         }
-        self.applied_block_id = block.block_id;
-        self.applied_timestamp_ms = block.timestamp_ms;
+        self.lez_block_id = block.block_id;
+        self.lez_timestamp_ms = block.timestamp_ms;
         if !changes.is_empty() {
             self.roots_by_block.insert(block.block_id, self.root());
         }
@@ -447,7 +455,7 @@ impl Reader {
     /// The tree's root right after LEZ block `block_id`: the root after the last block up to it
     /// that changed the tree, the empty tree's before any. `None` past the block applied last.
     pub fn root_at(&self, block_id: u64) -> Option<[u8; 32]> {
-        if block_id > self.applied_block_id {
+        if block_id > self.lez_block_id {
             return None;
         }
         Some(
@@ -459,7 +467,12 @@ impl Reader {
     }
 
     /// Slashed or erased: the membership is over; its leaf leaves the tree if still there.
-    fn end(&mut self, id_commitment: &[u8; 32], cause: Removed) -> Result<Option<Change>> {
+    fn end(
+        &mut self,
+        id_commitment: &[u8; 32],
+        cause: Removed,
+        block_id: u64,
+    ) -> Result<Option<Change>> {
         let Some(member) = self.members.get_mut(id_commitment) else {
             println!(
                 "{cause:?} {}.. without a registration; ignored",
@@ -473,6 +486,7 @@ impl Reader {
         let was_active = member.active;
         member.active = false;
         member.removed = Some(cause);
+        member.removed_at_lez_block_id = Some(block_id);
         if !was_active {
             return Ok(None);
         }
@@ -668,7 +682,7 @@ mod test {
         {
             let (reader, extra) = Reader::open(&dir, [0; 32], 0).unwrap();
             assert_eq!(reader.root(), root);
-            assert_eq!(reader.applied_block_id, 2);
+            assert_eq!(reader.lez_block_id, 2);
             assert_eq!(reader.active_count(), 1);
             assert_eq!(reader.removed_leaves().len(), 1);
             assert!(reader.proof_path(1).is_some());

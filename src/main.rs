@@ -430,7 +430,7 @@ async fn main() -> Result<()> {
         println!(
             "  history   {} batches published, covered to LEZ block {}, first block {}{}",
             registry.history.published.len(),
-            registry.history.covered_to,
+            registry.history.covered_to(),
             registry.history.first_lez_block_id,
             if resumed { " (checkpoint resumed)" } else { "" }
         );
@@ -561,7 +561,7 @@ async fn main() -> Result<()> {
                     Ok(head) => head,
                     Err(e) => { println!("LEZ unreachable: {e}"); continue; }
                 };
-                let applied_to = registry.read().expect("registry lock").head.applied_block_id;
+                let applied_to = registry.read().expect("registry lock").head.lez_block_id;
                 if head > applied_to
                     && let Err(e) = apply_range(&source, &registry, applied_to + 1, head).await
                 {
@@ -603,11 +603,12 @@ async fn main() -> Result<()> {
                         last_publish_unix = now_unix();
                         let described: Vec<_> = batch.changes.iter().map(|c| c.describe()).collect();
                         println!(
-                            "batch [{}..{}] published as msg {} (tx {}): root {}.., {}",
+                            "batch [{}..{}] published as msg {} (tx {}, L1 slot {}): root {}.., {}",
                             batch.from_lez_block_id,
                             batch.to_lez_block_id,
                             hex::encode(&msg[..4]),
                             hex::encode(&tx_hash[..4]),
+                            published_at_slot.map_or("unknown".into(), |s| s.to_string()),
                             hex::encode(&batch.root_after[..4]),
                             if described.is_empty() { "no changes".into() } else { described.join("; ") }
                         );
@@ -674,7 +675,7 @@ async fn run_indexer(
                 .iter()
                 .filter(|p| p.verification == Some(Verification::Verified))
                 .count(),
-            registry.history.covered_to,
+            registry.history.covered_to(),
             from_slot
         );
     }
@@ -699,7 +700,7 @@ async fn run_indexer(
                     Ok(head) => head,
                     Err(e) => { println!("LEZ unreachable: {e}"); continue; }
                 };
-                let applied_to = registry.read().expect("registry lock").head.applied_block_id;
+                let applied_to = registry.read().expect("registry lock").head.lez_block_id;
                 if head > applied_to
                     && let Err(e) = apply_range(&source, &registry, applied_to + 1, head).await
                 {

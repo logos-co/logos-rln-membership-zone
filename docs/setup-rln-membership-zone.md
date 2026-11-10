@@ -180,13 +180,14 @@ MODE=indexer DATA_DIR=data-indexer HTTP_ADDR=127.0.0.1:3001 INDEXER_FROM_L1_SLOT
 ```
 
 `INDEXER_FROM_L1_SLOT` is any slot at or before the channel's first inscription; the
-sequencer's first batch shows it as `published_at_slot` in `/roots`, and 2478000 is channel
-`v0.3.0-4`'s. The indexer's `/` reports `mode`, `verified_batches`, `rejected_batches` and
+sequencer logs it at publish (`L1 slot`), and 2478000 is channel
+`v0.3.0-4`'s. The indexer's `/` reports `mode`, `verified_batch_count`, `rejected_batch_count` and
 `replay_root` (the root its verified batches replay to); every batch in `/roots` carries
-`verification` (`verified`, `rejected`, `pending`) and `rejection`, the reason, `null` from a
-sequencer. Its `/roots` entry 0 is the LEZ head when it is ahead of the batches read (no
-`batches`), so a consumer that wants the live tree takes that one and a consumer that wants
-only what the channel finalized skips it (`verify_proof --min-status finalized`).
+`verification` (`verified`, `rejected`, `pending`) and `rejection`, the reason or `null`. A
+sequencer checks nothing of its own and has none of these keys. Its `/roots` entry 0 is the
+LEZ head when changes wait that no batch read yet carries (no `batches`), so a consumer that
+wants the live tree takes that one and a consumer that wants only what the channel finalized
+skips it (`verify_proof --min-status finalized`).
 
 ### HTTP API
 
@@ -199,48 +200,50 @@ curl -s localhost:3000/leaves | jq            # active memberships with expiry, 
 curl -s localhost:3000/health
 ```
 
-Words used the same way in every answer: `lez_block_id` and `lez_timestamp_ms` are the LEZ
-block the tree is at (its timestamp is the clock expiry runs on) and `root` the tree's root
-there; `status` is always a batch's status on Bedrock (`pending`, `adopted`, `orphaned`,
-`finalized`; `l1_slot` is set at `finalized`, `null` before); a membership is `active` (its
-leaf is in the tree and it proves, through its grace period included) or `removed` for
-`expired`, `slashed` or `erased`. 32-byte values are hex, little-endian. Every key is always
-present: a value that does not apply is `null`, never absent.
+Words used the same way in every answer: `head` is where the tree is, `lez_block_id` and
+`lez_timestamp_ms` the LEZ block applied last (its timestamp is the clock expiry runs on) and
+`root` the tree's root there; `status` is always a batch's status on Bedrock (`pending`,
+`adopted`, `orphaned`, `finalized`; `l1_slot`, the L1 block carrying it, is set at `finalized`,
+`null` before); a membership is `active` (its leaf is in the tree and it proves, through its
+grace period included) or `removed` for `expired`, `slashed` or `erased`. 32-byte values are
+hex, little-endian. Counts end in `_count`. Every key is always present: a value that does not
+apply is `null`, never absent; the one exception is `mode`, the indexer's verdict keys exist
+only in its answers.
 
-`/` adds `zone_channel_id`, `lez_source`, `first_lez_block_id` and `covered_to_lez_block_id`
-(the last block a published batch covers), `lez_events` (the program's events applied:
-`registered`, `extended`, `slashed`, `erased`, and `private_transactions`: privacy-preserving
-transactions with a public effect under the registration program; they carry no instruction
-and emit no event, so each changed the registry in a way this tree does not have, and the
-reader logs a warning; the ones under other programs are skipped silently), `tree`
-(`active_leaves`, `removed_leaves`,
-and `changes` the rules made beyond the one insert per `Registered`: `removed_expired` by the
-LEZ clock, `removed_ended` by a slash or an erase while active, `reinserted` by an `Extended`
-that landed after the reader had expired the leaf), `pending_changes` (waiting for the next
-batch), `published_batches`, `newest_adopted` and `newest_finalized` (root and
-`to_lez_block_id` of the newest batch in a Bedrock block, and in finalized history).
+`/` adds `zone_channel_id`, `lez_source`, `first_lez_block_id`, `lez_events` (the program's
+events applied: `registered`, `extended`, `slashed`, `erased`), `private_transaction_count`
+(privacy-preserving transactions with a public effect under the registration program; they
+carry no instruction and emit no event, so each changed the registry in a way this tree does
+not have, and the reader logs a warning; the ones under other programs are skipped silently),
+`tree` (`active_leaf_count`, `removed_leaf_count`, and `changes` the rules made beyond the one
+insert per `Registered`: `removed_expired` by the LEZ clock, `removed_ended` by a slash or an
+erase while active, `reinserted` by an `Extended` that landed after the reader had expired the
+leaf), `pending_change_count` (waiting for the next batch), `published_batch_count`,
+`newest_published`, `newest_adopted` and `newest_finalized` (root and `to_lez_block_id` of the
+newest batch published, in a Bedrock block, and in finalized history).
 
-`/roots` lists the roots by recency: first the LEZ head when it is ahead of the newest batch
-(`batches` empty, `changes` the ones not yet in a batch), then one entry per run of batches
-carrying the same root. An entry carries the `root`, the LEZ blocks it stood for (`from_lez_block_id` of the batch that
-produced it to `to_lez_block_id` of the newest batch carrying it), `change_count` and
+`/roots` lists the roots by recency: first the LEZ head when changes wait that no batch
+carries yet (`batches` empty, `changes` those), then one entry per run of batches carrying
+the same root. An entry carries the `root`, the LEZ blocks it stood for (`from_lez_block_id`
+of the batch that produced it to `to_lez_block_id` of the newest batch carrying it),
 `changes`, the tree changes that made the root in order (`kind` `insert` with the
-`rate_commitment` inserted or `remove` with `null`, and the `leaf_index`; empty when
-`change_count` is 0), and `batches`, every batch of the run, the producing one first, each
-with `msg_id`, `tx_hash`, `from_lez_block_id`, `to_lez_block_id`, `published_at_unix` (the
-sequencer's clock), `published_at_slot` (the L1 slot then, the chain's clock), `status`,
-`l1_slot`, `verification` and `rejection` (heartbeats carry the root further, their span is
-the proof). A root the tree comes back
-to (a leaf inserted then removed empties its slot again) is a new entry, so the window is the
+`rate_commitment` inserted or `remove` with `null`, and the `leaf_index`), and `batches`,
+every batch of the run, the producing one first, each with `msg_id`, `tx_hash`,
+`from_lez_block_id`, `to_lez_block_id`, `published_at_unix` (the sequencer's clock when it
+sent it), `status`, `l1_slot`, and from an indexer `verification` and `rejection`
+(heartbeats carry the root further, their span is the proof). A root the tree comes back to
+(a leaf inserted then removed empties its slot again) is a new entry, so the window is the
 newest roots, not the newest values. A validator reads its policy off `changes`: the roots
 from the newest back to the newest whose `changes` remove a leaf are the ones no removed
 member can still prove under; older roots in the window still hold that leaf.
 
 `/merkle_proof` answers 404 for an unknown leaf index or identity commitment. The answer
-carries the membership (`leaf_index`, `id_commitment`, `active`, `removed`,
-`expiry_timestamp_ms`), `newest_adopted` and `newest_finalized` (for a validator to compare
-with `root`), and `proof` (`rate_commitment`, `path_elements`, `identity_path_index`, the
-`RLNMerkleProof` of Zerokit) while the membership is active, `null` otherwise.
+carries the membership (`leaf_index`, `id_commitment`, `active`, `registered_at_lez_block_id`,
+`removed`, `removed_at_lez_block_id`, the LEZ blocks of its registration and of the event or
+expiry that removed it, `expiry_timestamp_ms`; `/leaves` carries the same per membership),
+`newest_adopted` and `newest_finalized` (for a validator to compare with `head.root`), and
+`proof` (`rate_commitment`, `path_elements`, `identity_path_index`, the `RLNMerkleProof` of
+Zerokit) while the membership is active, `null` otherwise.
 
 ## 4. LEZ source: the public LEZ Sequencer (default)
 
@@ -288,7 +291,7 @@ missing a change until the decoder is fixed and the sequencer restarted once wit
 `--rebuild-tree` (the batch history and the checkpoint stay, the tree is read again from
 LEZ). A change found again in a block after the last one covered goes into the next batch; a
 change in a block already covered is in no batch's change list, so the next batch carries the
-corrected root with a `change_count` that does not account for it (a Zone indexer replaying
+corrected root whose `changes` do not account for it (a Zone indexer replaying
 the batches would reject it; the rebuild is an operator's repair, not a protocol path).
 
 Check the source by hand:
@@ -370,7 +373,7 @@ The home (`lez-sequencer/home/`) is gitignored.
 ```bash
 # Zone sequencer
 curl -s localhost:3000/ | jq
-watch -n 10 'curl -s localhost:3000/roots/3 | jq -c ".roots[] | {to_lez_block_id, status, l1_slot}"'
+watch -n 10 'curl -s localhost:3000/roots/3 | jq -c ".roots[] | {root, to_lez_block_id, batches: [.batches[] | {status, l1_slot}]}"'
 
 # Node
 curl -s localhost:8080/cryptarchia/info | jq '.cryptarchia_info | {slot, height, lib_slot, state}'
@@ -421,8 +424,8 @@ fee per batch), `lib_slot` against `slot` (finality), the time from `pending` to
   history); if seen, start a new channel (section 3).
 - `LEZ read failed: getBlockRange: {"code":-32008,... "Response is too big"}` repeating:
   fixed (the span is halved down to one block); an older build needs the fix, not a restart.
-- The first batch of a channel carries a root but `no changes` in the log (`change_count`
-  0 in `/roots`): fixed (the pending changes are persisted with the tree; before, a
+- The first batch of a channel carries a root but `no changes` in the log (empty
+  `changes` in `/roots`): fixed (the pending changes are persisted with the tree; before, a
   restart between reading LEZ and publishing lost them). A channel whose first batch is
   like that cannot be replayed by an indexer: start a new one (section 3).
 - `history N batches published ... (checkpoint resumed)` right after changing

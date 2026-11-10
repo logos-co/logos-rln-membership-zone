@@ -54,7 +54,7 @@ enum MinStatus {
 /// The fields of `generate_proof`'s file the verifier reads.
 #[derive(Deserialize)]
 struct ProofFile {
-    message: String,
+    signal: String,
     epoch: String,
     rln_identifier: String,
     zone_root: String,
@@ -65,8 +65,13 @@ struct ProofFile {
 /// The Zone's `/roots/{window_size}` answer, the fields read.
 #[derive(Deserialize)]
 struct Roots {
-    lez_block_id: u64,
+    head: Head,
     roots: Vec<RootEntry>,
+}
+
+#[derive(Deserialize)]
+struct Head {
+    lez_block_id: u64,
 }
 
 #[derive(Deserialize)]
@@ -127,7 +132,7 @@ async fn run(args: &Args) -> Result<bool> {
     .context("proof values")?;
 
     // What the verifier recomputes itself from the public inputs it was given.
-    let x = hash_to_field_le(file.message.as_bytes());
+    let x = hash_to_field_le(file.signal.as_bytes());
     let external_nullifier = Hasher::<PoseidonHash>::hash_pair(
         hash_to_field_le(file.epoch.as_bytes()),
         hash_to_field_le(file.rln_identifier.as_bytes()),
@@ -172,7 +177,7 @@ async fn run(args: &Args) -> Result<bool> {
     }
     println!(
         "zone at LEZ block {}: {} root(s) in the window, {} at least {:?}",
-        window.lez_block_id,
+        window.head.lez_block_id,
         window.roots.len(),
         valid_roots.len(),
         args.min_status

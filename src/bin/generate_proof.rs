@@ -37,13 +37,13 @@ struct Args {
     /// The identity commitment, 32 bytes little-endian in hex; must be `poseidon(secret)`.
     #[arg(long, env = "RLN_ID_COMMITMENT")]
     id_commitment: String,
-    /// The membership's rate limit, the `user_message_limit` of the proof; the Zone's
-    /// `rate_commitment` must be `poseidon(id_commitment, rate_limit)`.
+    /// The membership's rate limit; the Zone's `rate_commitment` must be
+    /// `poseidon(id_commitment, user_message_limit)`.
     #[arg(long, default_value_t = 100)]
-    rate_limit: u64,
+    user_message_limit: u64,
     /// The signal the proof binds, hashed to the field (`x`).
     #[arg(long, default_value = "Hello, RLN Membership Zone!")]
-    message: String,
+    signal: String,
     /// The epoch, hashed to the field and combined with the identifier into the external
     /// nullifier.
     #[arg(long, default_value = "1231028105")]
@@ -63,9 +63,15 @@ struct Args {
 struct Membership {
     leaf_index: u64,
     active: bool,
+    head: Head,
+    proof: Option<ProofPath>,
+}
+
+/// Where the Zone's tree is: the LEZ block and the root there.
+#[derive(Deserialize)]
+struct Head {
     lez_block_id: u64,
     root: String,
-    proof: Option<ProofPath>,
 }
 
 #[derive(Deserialize)]
@@ -79,11 +85,11 @@ struct ProofPath {
 /// inputs that produced them, every field element 32 bytes little-endian in hex.
 #[derive(Serialize)]
 struct ProofFile {
-    message: String,
+    signal: String,
     epoch: String,
     rln_identifier: String,
     message_id: u64,
-    rate_limit: u64,
+    user_message_limit: u64,
     id_commitment: String,
     leaf_index: u64,
     /// The Zone's root the path was taken at, and the LEZ block.
@@ -153,12 +159,12 @@ async fn main() -> Result<()> {
         .proof
         .ok_or_else(|| anyhow!("the membership is active but carries no proof path"))?;
 
-    let user_message_limit = Fr::from(args.rate_limit);
+    let user_message_limit = Fr::from(args.user_message_limit);
     let rate_commitment = Hasher::<PoseidonHash>::hash_pair(id_commitment, user_message_limit);
     if fr_to_hex(&rate_commitment) != path.rate_commitment {
         bail!(
             "the Zone's rate_commitment is not poseidon(id_commitment, {}): another rate limit",
-            args.rate_limit
+            args.user_message_limit
         );
     }
     let path_elements = path
@@ -168,7 +174,7 @@ async fn main() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let merkle_proof = RLNMerkleProof::new(path_elements, path.identity_path_index);
 
-    let x = hash_to_field_le(args.message.as_bytes());
+    let x = hash_to_field_le(args.signal.as_bytes());
     let external_nullifier = Hasher::<PoseidonHash>::hash_pair(
         hash_to_field_le(args.epoch.as_bytes()),
         hash_to_field_le(args.rln_identifier.as_bytes()),
@@ -188,11 +194,11 @@ async fn main() -> Result<()> {
         .zkey(default_zkey_single().clone())
         .build();
     let (proof, values) = rln.generate_proof(&witness).context("generate the proof")?;
-    if fr_to_hex(&values.root()) != membership.root {
+    if fr_to_hex(&values.root()) != membership.head.root {
         bail!(
             "the proof's root {} is not the Zone's root {}: the path does not match the tree",
             fr_to_hex(&values.root()),
-            membership.root
+            membership.head.root
         );
     }
 
@@ -205,15 +211,15 @@ async fn main() -> Result<()> {
         .serialize_compressed(&mut values_bytes)
         .context("serialize the proof values")?;
     let file = ProofFile {
-        message: args.message,
+        signal: args.signal,
         epoch: args.epoch,
         rln_identifier: args.rln_identifier,
         message_id: args.message_id,
-        rate_limit: args.rate_limit,
+        user_message_limit: args.user_message_limit,
         id_commitment: args.id_commitment,
         leaf_index: membership.leaf_index,
-        zone_root: membership.root,
-        zone_lez_block_id: membership.lez_block_id,
+        zone_root: membership.head.root,
+        zone_lez_block_id: membership.head.lez_block_id,
         proof: hex::encode(proof_bytes),
         proof_values: hex::encode(values_bytes),
     };

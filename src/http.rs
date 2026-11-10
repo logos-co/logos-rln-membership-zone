@@ -1,11 +1,13 @@
 //! The HTTP API a Module's node reads (its registry access): the roots with the changes that
 //! made them and the status of their batches on Bedrock, the Merkle proof path of a leaf at
 //! the tree of the LEZ head, a membership's state.
-//! 32-byte values are hex, little-endian (RLN-API Appendix B). Every answer carries
+//! 32-byte values are hex, little-endian (RLN-API Appendix B). Every answer carries `head`:
 //! `lez_block_id` and `lez_timestamp_ms`, the LEZ block the tree is at, and the tree's `root`
 //! there; `status` is always a batch's status on Bedrock (`pending`, `adopted`, `orphaned`,
 //! `finalized`, with `l1_slot` set at `finalized` and `null` before), a membership is `active`
 //! or not. Every key is always present: a value that does not apply is `null`, never absent.
+//! The one exception is `mode`: the indexer's verdicts (`verification`, `rejection`,
+//! `verified_batches`, `rejected_batches`, `replay_root`) exist only in its answers.
 
 use std::sync::{Arc, RwLock};
 
@@ -18,10 +20,7 @@ use axum::{
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{
-    reader::Removed,
-    registry::{ChangeRecord, Published, Registry, RootEntry, Status, Verification},
-};
+use crate::registry::{ChangeRecord, Published, Registry, RootEntry, Status, Verification};
 
 pub type Shared = Arc<RwLock<Registry>>;
 
@@ -54,15 +53,22 @@ struct BatchEntry {
     to_lez_block_id: u64,
     /// The sequencer's clock at publish.
     published_at_unix: u64,
-    /// The L1 slot at publish, the chain's clock; `null` when the node did not answer then.
+    /// The L1 slot at publish, the chain's clock; `null` when the node did not answer then or
+    /// the batch predates the record.
     published_at_slot: Option<u64>,
     status: &'static str,
     /// The L1 slot of the block that finalized it; `null` before.
     l1_slot: Option<u64>,
-    /// An indexer's verdict: `verified`, `rejected` or `pending`; `null` from a sequencer,
-    /// which checks nothing of its own.
-    verification: Option<&'static str>,
-    /// Why the indexer rejected the batch; `null` otherwise.
+    /// An indexer's verdict; a sequencer checks nothing of its own and has no such keys.
+    #[serde(flatten)]
+    verdict: Option<Verdict>,
+}
+
+#[derive(Serialize)]
+struct Verdict {
+    /// `verified`, `rejected` or `pending`.
+    verification: &'static str,
+    /// Why the batch was rejected; `null` otherwise.
     rejection: Option<String>,
 }
 
@@ -83,15 +89,20 @@ impl BatchEntry {
             published_at_slot: p.published_at_slot,
             status,
             l1_slot,
-            verification: p.verification.as_ref().map(|v| match v {
-                Verification::Verified => "verified",
-                Verification::Rejected(_) => "rejected",
-                Verification::Pending => "pending",
+            verdict: p.verification.as_ref().map(|v| match v {
+                Verification::Verified => Verdict {
+                    verification: "verified",
+                    rejection: None,
+                },
+                Verification::Pending => Verdict {
+                    verification: "pending",
+                    rejection: None,
+                },
+                Verification::Rejected(reason) => Verdict {
+                    verification: "rejected",
+                    rejection: Some(reason.clone()),
+                },
             }),
-            rejection: match &p.verification {
-                Some(Verification::Rejected(reason)) => Some(reason.clone()),
-                _ => None,
-            },
         }
     }
 }
@@ -105,24 +116,22 @@ struct RootWindowEntry {
     root: String,
     from_lez_block_id: u64,
     to_lez_block_id: u64,
-    change_count: usize,
     changes: Vec<ChangeRecord>,
     batches: Vec<BatchEntry>,
 }
 
 impl RootWindowEntry {
     /// The root at the LEZ head, ahead of any batch: the changes not published yet (the
-    /// sequencer) or not read from the channel yet (the indexer). `None` when the head is
-    /// exactly the newest batch's root.
+    /// sequencer) or not read from the channel yet (the indexer). `None` while no change
+    /// waits, the head's root being the newest batch's then.
     fn head(registry: &Registry) -> Option<Self> {
-        if registry.head.applied_block_id <= registry.history.covered_to {
+        if registry.pending_changes.is_empty() {
             return None;
         }
         Some(Self {
             root: hex::encode(registry.head.root()),
-            from_lez_block_id: registry.history.covered_to + 1,
-            to_lez_block_id: registry.head.applied_block_id,
-            change_count: registry.pending_changes.len(),
+            from_lez_block_id: registry.history.covered_to() + 1,
+            to_lez_block_id: registry.head.lez_block_id,
             changes: registry
                 .pending_changes
                 .iter()
@@ -138,53 +147,59 @@ impl RootWindowEntry {
             root: hex::encode(produced_by.root_after),
             from_lez_block_id: produced_by.from_lez_block_id,
             to_lez_block_id: entry.carried_to_lez_block_id(),
-            change_count: produced_by.change_count,
             changes: produced_by.changes.clone(),
             batches: entry.batches.iter().map(|p| BatchEntry::new(p)).collect(),
         }
     }
 }
 
-/// `body` plus where the tree is: `lez_block_id` (the LEZ block applied last),
+/// `body` plus `head`, where the tree is: `lez_block_id` (the LEZ block applied last),
 /// `lez_timestamp_ms` and the `root` there.
 fn with_head(registry: &Registry, mut body: Value) -> Json<Value> {
-    if let Value::Object(map) = &mut body {
-        map.insert("lez_block_id".into(), registry.head.applied_block_id.into());
-        map.insert(
-            "lez_timestamp_ms".into(),
-            registry.head.applied_timestamp_ms.into(),
-        );
-        map.insert("root".into(), hex::encode(registry.head.root()).into());
-    }
+    body["head"] = json!({
+        "lez_block_id": registry.head.lez_block_id,
+        "lez_timestamp_ms": registry.head.lez_timestamp_ms,
+        "root": hex::encode(registry.head.root()),
+    });
     Json(body)
 }
 
 async fn summary(State(state): State<AppState>) -> Json<Value> {
     let registry = state.registry.read().expect("registry lock");
-    with_head(
-        &registry,
-        json!({
-            "zone_channel_id": state.channel_id,
-            "lez_source": state.lez_source,
-            "first_lez_block_id": registry.history.first_lez_block_id,
-            "covered_to_lez_block_id": registry.history.covered_to,
-            "lez_events": registry.head.stats.lez_events(),
-            "tree": {
-                "active_leaves": registry.head.active_count(),
-                "removed_leaves": registry.head.removed_leaves().len(),
-                "changes": registry.head.stats.tree_changes(),
-            },
-            "mode": state.mode,
-            "pending_changes": registry.pending_changes.len(),
-            "published_batches": registry.history.published.len(),
-            "verified_batches": registry.history.published.iter().filter(|p| p.verification == Some(Verification::Verified)).count(),
-            "rejected_batches": registry.history.published.iter().filter(|p| matches!(p.verification, Some(Verification::Rejected(_)))).count(),
-            "newest_adopted": registry.newest_adopted().map(root_ref),
-            "newest_finalized": registry.newest_finalized().map(root_ref),
-            "endpoints": ["/roots/{window_size}", "/merkle_proof/{leaf_index or id_commitment}", "/leaves", "/health"],
-            "replay_root": registry.replay_root().map(hex::encode),
-        }),
-    )
+    let mut body = json!({
+        "zone_channel_id": state.channel_id,
+        "lez_source": state.lez_source,
+        "first_lez_block_id": registry.history.first_lez_block_id,
+        "lez_events": registry.head.stats.lez_events(),
+        "private_transaction_count": registry.head.stats.private_transaction_count,
+        "tree": {
+            "active_leaf_count": registry.head.active_count(),
+            "removed_leaf_count": registry.head.removed_leaves().len(),
+            "changes": registry.head.stats.tree_changes(),
+        },
+        "mode": state.mode,
+        "pending_change_count": registry.pending_changes.len(),
+        "published_batch_count": registry.history.published.len(),
+        "newest_published": registry.newest_published().map(root_ref),
+        "newest_adopted": registry.newest_adopted().map(root_ref),
+        "newest_finalized": registry.newest_finalized().map(root_ref),
+        "endpoints": ["/roots/{window_size}", "/merkle_proof/{leaf_index or id_commitment}", "/leaves", "/health"],
+    });
+    if state.mode == "indexer" {
+        let published = &registry.history.published;
+        body["verified_batch_count"] = published
+            .iter()
+            .filter(|p| p.verification == Some(Verification::Verified))
+            .count()
+            .into();
+        body["rejected_batch_count"] = published
+            .iter()
+            .filter(|p| matches!(p.verification, Some(Verification::Rejected(_))))
+            .count()
+            .into();
+        body["replay_root"] = registry.replay_root().map(hex::encode).into();
+    }
+    with_head(&registry, body)
 }
 
 /// The newest `window_size` roots, newest first: the head's when it is ahead of the batches
@@ -199,13 +214,7 @@ async fn roots(State(state): State<AppState>, Path(window_size): Path<usize>) ->
         .chain(registry.roots(window_size).iter().map(RootWindowEntry::new))
         .take(window_size)
         .collect();
-    with_head(
-        &registry,
-        json!({
-            "covered_to_lez_block_id": registry.history.covered_to,
-            "roots": roots,
-        }),
-    )
+    with_head(&registry, json!({ "roots": roots }))
 }
 
 /// A membership by its leaf index (decimal) or its identity commitment (64 hex): whether it
@@ -250,7 +259,9 @@ async fn merkle_proof(
             "id_commitment": hex::encode(id_commitment),
             "leaf_index": member.leaf_index,
             "active": member.active,
+            "registered_at_lez_block_id": member.registered_at_lez_block_id,
             "removed": member.removed,
+            "removed_at_lez_block_id": member.removed_at_lez_block_id,
             "expiry_timestamp_ms": member.expiry_timestamp_ms,
             "newest_adopted": registry.newest_adopted().map(root_ref),
             "newest_finalized": registry.newest_finalized().map(root_ref),
@@ -271,12 +282,13 @@ async fn leaves(State(state): State<AppState>) -> Json<Value> {
         .head
         .active_leaves()
         .into_iter()
-        .map(|(leaf_index, id, expiry)| {
+        .map(|(id, m)| {
             json!({
-                "leaf_index": leaf_index,
+                "leaf_index": m.leaf_index,
                 "id_commitment": hex::encode(id),
-                "expiry_timestamp_ms": expiry,
-                "expires_in_ms": expiry.saturating_sub(registry.head.applied_timestamp_ms),
+                "registered_at_lez_block_id": m.registered_at_lez_block_id,
+                "expiry_timestamp_ms": m.expiry_timestamp_ms,
+                "expires_in_ms": m.expiry_timestamp_ms.saturating_sub(registry.head.lez_timestamp_ms),
             })
         })
         .collect();
@@ -284,11 +296,13 @@ async fn leaves(State(state): State<AppState>) -> Json<Value> {
         .head
         .removed_leaves()
         .into_iter()
-        .map(|(leaf_index, id, cause): (u64, [u8; 32], Removed)| {
+        .map(|(id, m)| {
             json!({
-                "leaf_index": leaf_index,
+                "leaf_index": m.leaf_index,
                 "id_commitment": hex::encode(id),
-                "removed": cause,
+                "registered_at_lez_block_id": m.registered_at_lez_block_id,
+                "removed": m.removed,
+                "removed_at_lez_block_id": m.removed_at_lez_block_id,
             })
         })
         .collect();

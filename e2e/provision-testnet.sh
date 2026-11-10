@@ -146,7 +146,7 @@ step_status() {
     say "L1 $key: $(bedrock_wallet "$key" | jq -c '{balance, notes: (.notes | length)}')"
     [ -n "$payer" ] && say "payer $payer: L2 balance $(lez_balance "$payer")"
     [ -n "$(state_get pending_deposit)" ] && say "pending deposit $(state_get pending_deposit)"
-    say "zone:    $(zone / | jq -c '{lez_block_id, covered_to_lez_block_id, published_batches, newest_adopted}' 2>/dev/null || echo 'not running')"
+    say "zone:    $(zone / | jq -c '{head, newest_published, newest_adopted}' 2>/dev/null || echo 'not running')"
 }
 
 case "$STEP" in

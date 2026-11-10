@@ -41,7 +41,7 @@ done
 [ "$(printf '%s' "$membership" | jq -r '.removed')" = "slashed" ] \
     || die "removed is $(printf '%s' "$membership" | jq -r '.removed'), not slashed"
 [ "$(printf '%s' "$membership" | jq -r '.proof')" = "null" ] || die "a removed membership still has a proof"
-root=$(printf '%s' "$membership" | jq -r '.root')
+root=$(printf '%s' "$membership" | jq -r '.head.root')
 membership_mark_slashed "$leaf_index"
 say "leaf $leaf_index slashed, root $root"
 

@@ -23,7 +23,7 @@ read -r leaf_index id_commitment identity_secret <<< "$(membership_pick "${2:-}"
 generate_proof=$(zone_bin generate_proof)
 verify_proof=$(zone_bin verify_proof)
 proof_file="$E2E_STATE/proof-$leaf_index.json"
-message="e2e $(date -u +%FT%TZ)"
+signal="e2e $(date -u +%FT%TZ)"
 
 say "fetching the Zone's path for leaf $leaf_index"
 ZONE_MERKLE_PROOF=$(zone "/merkle_proof/$id_commitment") || die "the zone does not know $id_commitment"
@@ -32,7 +32,7 @@ export ZONE_MERKLE_PROOF
 
 say "proving membership of leaf $leaf_index"
 RLN_IDENTITY_SECRET="$identity_secret" RLN_ID_COMMITMENT="$id_commitment" \
-    "$generate_proof" --message "$message" --out "$proof_file" >&2 || die "generate_proof failed"
+    "$generate_proof" --signal "$signal" --out "$proof_file" >&2 || die "generate_proof failed"
 
 say "fetching the Zone's roots and verifying (adopted at least)"
 ZONE_ROOTS=$(zone /roots/5) || die "cannot read the zone's roots"
@@ -42,7 +42,7 @@ export ZONE_ROOTS
 
 say "verifying a tampered proof (another message, same proof) must fail"
 tampered="$E2E_STATE/proof-$leaf_index-tampered.json"
-jq '.message = "not the signal the proof binds"' "$proof_file" > "$tampered"
+jq '.signal = "not the signal the proof binds"' "$proof_file" > "$tampered"
 if "$verify_proof" --proof "$tampered" --min-status adopted >&2; then
     die "verify_proof accepted a proof over another message"
 fi

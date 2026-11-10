@@ -48,7 +48,7 @@ done
     || die "leaf index mismatch: claimed $leaf_index, zone $(printf '%s' "$membership" | jq -r '.leaf_index')"
 [ "$(printf '%s' "$membership" | jq -r '.proof.path_elements | length')" = "20" ] \
     || die "the proof path does not have 20 elements"
-root=$(printf '%s' "$membership" | jq -r '.root')
+root=$(printf '%s' "$membership" | jq -r '.head.root')
 say "leaf $leaf_index active, root $root"
 
 say "waiting for a batch carrying that root"

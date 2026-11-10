@@ -18,7 +18,7 @@ use zerokit_utils::merkle_tree::{OptimalMerkleConfig, OptimalMerkleTree, Zerokit
 use crate::{
     batch::{Batch, Change, Kind},
     lez::Block,
-    reader::{Reader, TREE_DEPTH, fr_from_bytes_le, fr_to_bytes_le},
+    reader::{EMPTY_ROOT, Reader, TREE_DEPTH, fr_from_bytes_le, fr_to_bytes_le},
 };
 
 /// Where the Mantle Transaction carrying a batch stands, in the Zone SDK's words: it is
@@ -96,14 +96,13 @@ pub struct Published {
     pub to_lez_block_id: u64,
     #[serde(with = "hex::serde")]
     pub root_after: [u8; 32],
-    pub change_count: usize,
-    /// The changes the batch carried, in order; empty with `change_count` > 0 only for a batch
-    /// published before the history kept them.
+    /// The changes the batch carried, in order. Empty while the root moved only for a batch
+    /// published before the history kept them (`History::lacks_changes`).
     #[serde(default)]
     pub changes: Vec<ChangeRecord>,
     pub published_at_unix: u64,
-    /// The L1 slot at publish time: where the finality scan starts looking for it. `None` for
-    /// a batch published before the slot was recorded.
+    /// The sequencer's L1 slot at publish time: where the finality scan starts looking for
+    /// it. `None` for a batch published before the slot was recorded, and for an indexer's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_at_slot: Option<u64>,
     #[serde(flatten)]
@@ -132,12 +131,58 @@ pub enum Verification {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct History {
     pub first_lez_block_id: u64,
-    /// Last LEZ block a published batch covers.
-    pub covered_to: u64,
     pub published: Vec<Published>,
     /// The L1 slot the finality scan has read the finalized blocks up to.
     #[serde(default)]
     pub finality_scanned_to: Option<u64>,
+}
+
+impl History {
+    /// Last LEZ block a batch covers: the newest published (the sequencer; an orphaned one
+    /// still covers, it goes out again) or verified (the indexer); the block before the first
+    /// one while there is none.
+    pub fn covered_to(&self) -> u64 {
+        self.published
+            .iter()
+            .rev()
+            .find(|p| {
+                p.verification
+                    .as_ref()
+                    .is_none_or(|v| *v == Verification::Verified)
+            })
+            .map_or(self.first_lez_block_id.saturating_sub(1), |p| {
+                p.to_lez_block_id
+            })
+    }
+
+    /// Whether the batch at `at` moved the root without the history having its changes: one
+    /// published before the history kept them (a batch without changes keeps the root).
+    pub fn lacks_changes(&self, at: usize) -> bool {
+        let p = &self.published[at];
+        p.changes.is_empty() && p.root_after != self.root_before(at)
+    }
+
+    /// The root the batch at `at` started from: the newest batch's before it that counts, the
+    /// empty tree's for the first.
+    fn root_before(&self, at: usize) -> [u8; 32] {
+        self.published[..at]
+            .iter()
+            .rev()
+            .find(|p| p.counts())
+            .map_or(*EMPTY_ROOT, |p| p.root_after)
+    }
+}
+
+impl Published {
+    /// Whether the batch is part of the tree's history: not orphaned, and verified when an
+    /// indexer judged it.
+    fn counts(&self) -> bool {
+        self.status != Status::Orphaned
+            && self
+                .verification
+                .as_ref()
+                .is_none_or(|v| *v == Verification::Verified)
+    }
 }
 
 pub struct Registry {
@@ -188,7 +233,6 @@ impl Registry {
             }
             None => History {
                 first_lez_block_id,
-                covered_to: first_lez_block_id.saturating_sub(1),
                 published: vec![],
                 finality_scanned_to: None,
             },
@@ -208,7 +252,7 @@ impl Registry {
                         let change = Change::decode(bytes.as_slice()).context("pending change")?;
                         // A record written before the block was kept counts as just after
                         // `covered_to`, the only thing known about it.
-                        Ok((record.block().unwrap_or(history.covered_to + 1), change))
+                        Ok((record.block().unwrap_or(history.covered_to() + 1), change))
                     })
                     .collect::<Result<_>>()?
             }
@@ -276,7 +320,7 @@ impl Registry {
         }
         let verification = self.verify(&batch, &changes, root_after)?;
         if verification == Verification::Verified {
-            self.cover_to(batch.to_lez_block_id);
+            self.trim_pending(batch.to_lez_block_id);
         }
         let entry = Published {
             msg_id,
@@ -284,10 +328,9 @@ impl Registry {
             from_lez_block_id: batch.from_lez_block_id,
             to_lez_block_id: batch.to_lez_block_id,
             root_after,
-            change_count: batch.changes.len(),
             changes,
             published_at_unix: now_unix(),
-            published_at_slot: Some(l1_slot),
+            published_at_slot: None,
             status: Status::Finalized { l1_slot },
             verification: Some(verification),
         };
@@ -315,10 +358,11 @@ impl Registry {
         let Some(own_root) = self.head.root_at(batch.to_lez_block_id) else {
             return Ok(Verification::Pending);
         };
-        if batch.from_lez_block_id != self.history.covered_to + 1 {
+        let covered_to = self.history.covered_to();
+        if batch.from_lez_block_id != covered_to + 1 {
             return Ok(Verification::Rejected(format!(
-                "covers LEZ blocks from {}, the previous batch covered to {}",
-                batch.from_lez_block_id, self.history.covered_to
+                "covers LEZ blocks from {}, the previous batch covered to {covered_to}",
+                batch.from_lez_block_id
             )));
         }
         if changes.len() != batch.changes.len() {
@@ -375,10 +419,8 @@ impl Registry {
             if verification == Verification::Pending {
                 break;
             }
-            if verification == Verification::Verified {
-                self.cover_to(batch.to_lez_block_id);
-            }
             self.history.published[at].verification = Some(verification);
+            self.trim_pending(self.history.covered_to());
             decided += 1;
         }
         Ok(decided)
@@ -425,9 +467,10 @@ impl Registry {
     /// Apply closed LEZ blocks to the head tree; the changes of blocks after `covered_to` wait
     /// for the next batch.
     pub fn apply_blocks(&mut self, blocks: &[Block]) -> Result<()> {
+        let covered_to = self.history.covered_to();
         for block in blocks {
             let changes = self.head.apply_block(block)?;
-            if block.block_id > self.history.covered_to {
+            if block.block_id > covered_to {
                 self.pending_changes
                     .extend(changes.into_iter().map(|change| (block.block_id, change)));
             }
@@ -438,12 +481,13 @@ impl Registry {
     /// The next batch: every LEZ block after `covered_to` up to the head, with the pending
     /// changes and the root after them; `None` when the head is already covered.
     pub fn next_batch(&self) -> Option<Batch> {
-        if self.head.applied_block_id <= self.history.covered_to {
+        let covered_to = self.history.covered_to();
+        if self.head.lez_block_id <= covered_to {
             return None;
         }
         Some(Batch {
-            from_lez_block_id: self.history.covered_to + 1,
-            to_lez_block_id: self.head.applied_block_id,
+            from_lez_block_id: covered_to + 1,
+            to_lez_block_id: self.head.lez_block_id,
             changes: self
                 .pending_changes
                 .iter()
@@ -469,7 +513,6 @@ impl Registry {
             from_lez_block_id: batch.from_lez_block_id,
             to_lez_block_id: batch.to_lez_block_id,
             root_after,
-            change_count: batch.changes.len(),
             changes: batch
                 .changes
                 .iter()
@@ -480,13 +523,12 @@ impl Registry {
             status: Status::Pending,
             verification: None,
         });
-        self.cover_to(batch.to_lez_block_id);
+        self.trim_pending(batch.to_lez_block_id);
     }
 
     /// A batch covers the LEZ blocks up to `to`: the changes of those blocks are no longer
     /// pending.
-    fn cover_to(&mut self, to: u64) {
-        self.history.covered_to = to;
+    fn trim_pending(&mut self, to: u64) {
         self.pending_changes.retain(|(block, _)| *block > to);
     }
 
@@ -510,14 +552,15 @@ impl Registry {
     /// when Bedrock finality reaches it. `None` for an unknown message id or a batch whose
     /// changes the history does not have.
     pub fn payload(&self, msg_id: &[u8; 32]) -> Option<Vec<u8>> {
-        let p = self
+        let at = self
             .history
             .published
             .iter()
-            .find(|p| p.msg_id == *msg_id)?;
-        if p.changes.len() != p.change_count {
+            .position(|p| p.msg_id == *msg_id)?;
+        if self.history.lacks_changes(at) {
             return None;
         }
+        let p = &self.history.published[at];
         let changes = p
             .changes
             .iter()
@@ -538,19 +581,24 @@ impl Registry {
     /// as the chain holds it: `payload` must decode to a batch with the span and root on
     /// record. Returns whether the history changed.
     pub fn fill_changes(&mut self, msg_id: &[u8; 32], payload: &[u8]) -> bool {
-        let Some(entry) = self.published_mut(msg_id) else {
+        let Some(at) = self
+            .history
+            .published
+            .iter()
+            .position(|p| p.msg_id == *msg_id)
+        else {
             return false;
         };
-        if entry.changes.len() == entry.change_count {
+        if !self.history.lacks_changes(at) {
             return false;
         }
         let Ok(batch) = Batch::decode(payload) else {
             return false;
         };
+        let entry = &mut self.history.published[at];
         if batch.from_lez_block_id != entry.from_lez_block_id
             || batch.to_lez_block_id != entry.to_lez_block_id
             || batch.root_after[..] != entry.root_after[..]
-            || batch.changes.len() != entry.change_count
         {
             return false;
         }
@@ -568,8 +616,9 @@ impl Registry {
         self.history
             .published
             .iter()
-            .filter(|p| p.changes.len() != p.change_count)
-            .filter_map(|p| match p.status {
+            .enumerate()
+            .filter(|(at, _)| self.history.lacks_changes(*at))
+            .filter_map(|(_, p)| match p.status {
                 Status::Finalized { l1_slot } => Some((p.msg_id, l1_slot)),
                 _ => None,
             })
@@ -640,6 +689,15 @@ impl Registry {
             .published
             .iter_mut()
             .find(|p| p.msg_id == *msg_id)
+    }
+
+    /// The newest batch published, whatever its status but orphaned.
+    pub fn newest_published(&self) -> Option<&Published> {
+        self.history
+            .published
+            .iter()
+            .rev()
+            .find(|p| p.status != Status::Orphaned)
     }
 
     /// The newest batch in a Bedrock block (Adopted or Finalized).
@@ -805,25 +863,18 @@ mod test {
         let dir = std::env::temp_dir().join(format!("zone-roots-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
+        // Batch `n` covers block `n` with one change (the roots here are stand-ins).
+        let batch_of = |n: u8, root: u8| Batch {
+            from_lez_block_id: u64::from(n),
+            to_lez_block_id: u64::from(n),
+            changes: vec![Change::insert(u64::from(n), vec![root; 32])],
+            root_after: vec![root; 32],
+        };
         let publish = |registry: &mut Registry, n: u8, root: u8| {
-            let batch = Batch {
-                from_lez_block_id: u64::from(n),
-                to_lez_block_id: u64::from(n),
-                changes: vec![],
-                root_after: vec![root; 32],
-            };
-            registry.on_published([n; 32], [n; 32], &batch, Some(u64::from(n)));
+            registry.on_published([n; 32], [n; 32], &batch_of(n, root), Some(u64::from(n)));
         };
         // The inscription a published batch carried, as the history builds it again.
-        let payload_of = |n: u8, root: u8| {
-            Batch {
-                from_lez_block_id: u64::from(n),
-                to_lez_block_id: u64::from(n),
-                changes: vec![],
-                root_after: vec![root; 32],
-            }
-            .encode_to_vec()
-        };
+        let payload_of = |n: u8, root: u8| batch_of(n, root).encode_to_vec();
         // Root A, a heartbeat carrying A, root B, back to A (a leaf inserted then removed).
         publish(&mut registry, 1, 0xA);
         publish(&mut registry, 2, 0xA);
@@ -884,7 +935,6 @@ mod test {
         // A batch recorded without its changes learns them from the inscription on chain,
         // when span and root agree.
         registry.history.published[2].changes.clear();
-        registry.history.published[2].change_count = 1;
         let on_chain = Batch {
             from_lez_block_id: 3,
             to_lez_block_id: 3,
@@ -893,7 +943,7 @@ mod test {
         }
         .encode_to_vec();
         assert_eq!(registry.payload(&[3; 32]), None);
-        assert!(!registry.fill_changes(&[3; 32], &payload_of(3, 0xB)));
+        assert!(!registry.fill_changes(&[3; 32], &payload_of(3, 0xC)));
         assert!(registry.fill_changes(&[3; 32], &on_chain));
         assert_eq!(registry.history.published[2].changes[0].leaf_index, 9);
         assert_eq!(registry.payload(&[3; 32]), Some(on_chain));
@@ -947,7 +997,7 @@ mod test {
             )
             .unwrap();
         assert_eq!(ok.verification, Some(Verification::Verified));
-        assert_eq!(registry.history.covered_to, 1);
+        assert_eq!(registry.history.covered_to(), 1);
         assert_eq!(registry.replay_root(), Some(root_1));
         // The changes the batch covered are no longer the head's lead over the channel.
         assert!(registry.pending_changes.is_empty());
@@ -972,7 +1022,7 @@ mod test {
             Some(Verification::Rejected(ref reason)) if reason.contains("replay to root")
         ));
         // A rejected batch moves nothing: the next honest batch still chains on block 1.
-        assert_eq!(registry.history.covered_to, 1);
+        assert_eq!(registry.history.covered_to(), 1);
         assert_eq!(registry.replay_root(), Some(root_1));
         let root_3 = registry.head.root();
         assert_eq!(registry.pending_changes.len(), 1);
