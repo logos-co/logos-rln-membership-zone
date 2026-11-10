@@ -57,6 +57,9 @@ impl Event {
 #[derive(Debug, Clone)]
 pub struct Block {
     pub block_id: u64,
+    /// The header hashes: the chain a reader checks before applying the block.
+    pub prev_block_hash: [u8; 32],
+    pub hash: [u8; 32],
     pub timestamp_ms: u64,
     pub events: Vec<Event>,
     /// Privacy-preserving transactions with a public effect under the registration program.
@@ -184,7 +187,8 @@ impl SequencerLez {
     fn decode_block(&self, bytes: &[u8]) -> Result<Block> {
         let mut c = Cursor(bytes);
         let block_id = c.u64()?;
-        c.take(64)?;
+        let prev_block_hash = c.bytes32()?;
+        let hash = c.bytes32()?;
         let timestamp_ms = c.u64()?;
         let tx_count = c.u32()?;
         let mut events = vec![];
@@ -202,6 +206,8 @@ impl SequencerLez {
         }
         Ok(Block {
             block_id,
+            prev_block_hash,
+            hash,
             timestamp_ms,
             events,
             private_transaction_count,

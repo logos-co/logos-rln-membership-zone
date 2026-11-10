@@ -23,7 +23,7 @@ use std::{
     sync::LazyLock,
 };
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use rln::prelude::{
     CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, PmTree, PmTreeSledConfig, PoseidonHash,
     SledDB,
@@ -164,6 +164,9 @@ struct Meta {
     tree_id: String,
     #[serde(alias = "applied_block_id")]
     lez_block_id: u64,
+    /// Hash of the last LEZ block applied, hex; empty before any.
+    #[serde(default)]
+    lez_block_hash: String,
     #[serde(alias = "applied_timestamp_ms")]
     lez_timestamp_ms: u64,
     stats: Stats,
@@ -187,6 +190,9 @@ pub struct Reader {
     pub stats: Stats,
     /// Last LEZ `block_id` applied.
     pub lez_block_id: u64,
+    /// Hash of the last LEZ block applied: the next block must chain on it. `None` before any
+    /// (a fresh or upgraded store).
+    lez_block_hash: Option<[u8; 32]>,
     /// `timestamp_ms` of the last LEZ block applied: the clock this reader's tree is at.
     pub lez_timestamp_ms: u64,
     /// The root after every LEZ block that changed the tree: what the tree was at any block
@@ -254,6 +260,7 @@ impl Reader {
             members: HashMap::new(),
             stats: Stats::default(),
             lez_block_id,
+            lez_block_hash: None,
             lez_timestamp_ms: 0,
             roots_by_block: BTreeMap::new(),
         };
@@ -274,6 +281,9 @@ impl Reader {
         }
         reader.stats = meta.stats;
         reader.lez_block_id = meta.lez_block_id;
+        if !meta.lez_block_hash.is_empty() {
+            reader.lez_block_hash = Some(parse_32(&meta.lez_block_hash)?);
+        }
         reader.lez_timestamp_ms = meta.lez_timestamp_ms;
         for (block_id, root) in &meta.roots_by_block {
             let block_id: u64 = block_id.parse().context("root history block id")?;
@@ -287,6 +297,7 @@ impl Reader {
         let meta = Meta {
             tree_id: hex::encode(self.tree_id),
             lez_block_id: self.lez_block_id,
+            lez_block_hash: self.lez_block_hash.map(hex::encode).unwrap_or_default(),
             lez_timestamp_ms: self.lez_timestamp_ms,
             stats: self.stats,
             members: self
@@ -338,6 +349,35 @@ impl Reader {
             .collect();
         leaves.sort_by_key(|(_, m)| m.leaf_index);
         leaves
+    }
+
+    /// Check that `blocks` continue this reader's chain: ids consecutive from the last block
+    /// applied and each `prev_block_hash` the hash of the block before. A gap, a block out of
+    /// order or a history that changed under the reader fails here, before anything is applied.
+    pub fn check_chain(&self, blocks: &[Block]) -> Result<()> {
+        let mut expected_prev = self.lez_block_hash;
+        for (expected_id, block) in (self.lez_block_id + 1..).zip(blocks) {
+            if block.block_id != expected_id {
+                bail!(
+                    "LEZ block {} where {expected_id} was expected (after block {})",
+                    block.block_id,
+                    self.lez_block_id
+                );
+            }
+            if let Some(prev) = expected_prev
+                && block.prev_block_hash != prev
+            {
+                bail!(
+                    "LEZ block {} does not chain on block {}: prev hash {}.., expected {}..",
+                    block.block_id,
+                    block.block_id - 1,
+                    hex::encode(&block.prev_block_hash[..4]),
+                    hex::encode(&prev[..4])
+                );
+            }
+            expected_prev = Some(block.hash);
+        }
+        Ok(())
     }
 
     /// Apply the derivation rules to the events of one LEZ block and return the changes, in
@@ -445,6 +485,7 @@ impl Reader {
             changes.push(Change::remove(leaf_index));
         }
         self.lez_block_id = block.block_id;
+        self.lez_block_hash = Some(block.hash);
         self.lez_timestamp_ms = block.timestamp_ms;
         if !changes.is_empty() {
             self.roots_by_block.insert(block.block_id, self.root());
@@ -569,10 +610,47 @@ mod test {
     fn block(block_id: u64, timestamp_ms: u64, events: Vec<Event>) -> Block {
         Block {
             block_id,
+            prev_block_hash: [0; 32],
+            hash: [0; 32],
             timestamp_ms,
             events,
             private_transaction_count: 0,
         }
+    }
+
+    #[test]
+    fn test_check_chain_refuses_gaps_disorder_and_a_changed_history() {
+        let (mut reader, _) = Reader::open_temporary([0; 32], 0).unwrap();
+        let chained = |id: u64, prev: u8, hash: u8| Block {
+            prev_block_hash: [prev; 32],
+            hash: [hash; 32],
+            ..block(id, 1_000, vec![])
+        };
+        // Nothing applied yet: the first block is taken on its id alone, the next must chain.
+        let good = [chained(1, 0, 1), chained(2, 1, 2)];
+        reader.check_chain(&good).unwrap();
+        assert!(
+            reader
+                .check_chain(&[chained(2, 1, 2), chained(1, 0, 1)])
+                .is_err()
+        );
+        assert!(
+            reader
+                .check_chain(&[chained(1, 0, 1), chained(3, 1, 3)])
+                .is_err()
+        );
+        assert!(
+            reader
+                .check_chain(&[chained(1, 0, 1), chained(2, 9, 2)])
+                .is_err()
+        );
+        for b in &good {
+            reader.apply_block(b).unwrap();
+        }
+        // After block 2 (hash 2): block 3 must say so.
+        reader.check_chain(&[chained(3, 2, 3)]).unwrap();
+        assert!(reader.check_chain(&[chained(3, 1, 3)]).is_err());
+        assert!(reader.check_chain(&[chained(2, 1, 2)]).is_err());
     }
 
     #[test]

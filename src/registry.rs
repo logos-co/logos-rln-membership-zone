@@ -467,6 +467,7 @@ impl Registry {
     /// Apply closed LEZ blocks to the head tree; the changes of blocks after `covered_to` wait
     /// for the next batch.
     pub fn apply_blocks(&mut self, blocks: &[Block]) -> Result<()> {
+        self.head.check_chain(blocks)?;
         let covered_to = self.history.covered_to();
         for block in blocks {
             let changes = self.head.apply_block(block)?;
@@ -841,6 +842,8 @@ mod test {
     fn block(block_id: u64, events: Vec<Event>) -> Block {
         Block {
             block_id,
+            prev_block_hash: [0; 32],
+            hash: [0; 32],
             timestamp_ms: 1_000,
             events,
             private_transaction_count: 0,

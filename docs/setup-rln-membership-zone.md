@@ -424,6 +424,14 @@ fee per batch), `lib_slot` against `slot` (finality), the time from `pending` to
   history); if seen, start a new channel (section 3).
 - `LEZ read failed: getBlockRange: {"code":-32008,... "Response is too big"}` repeating:
   fixed (the span is halved down to one block); an older build needs the fix, not a restart.
+- `LEZ read failed: LEZ block N where M was expected` or `... does not chain on block ...`
+  every poll: the Sequencer answered `getBlockRange` out of order or with a history that
+  differs from the blocks already applied (seen once on 2026-11-10: the slash of leaf 15
+  read at block 79375 live sits at 79376 in the chain since; the sequencer batched the
+  change one block early and an indexer rejects that batch and every later one). The
+  reader applies nothing until the chain continues; if LEZ really rewrote closed blocks,
+  `REBUILD_TREE=true` once re-reads it, and the batches already on Bedrock stay wrong:
+  start a new channel for a clean indexer replay.
 - The first batch of a channel carries a root but `no changes` in the log (empty
   `changes` in `/roots`): fixed (the pending changes are persisted with the tree; before, a
   restart between reading LEZ and publishing lost them). A channel whose first batch is
