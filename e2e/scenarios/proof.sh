@@ -29,6 +29,13 @@ say "fetching the Zone's path for leaf $leaf_index"
 ZONE_MERKLE_PROOF=$(zone "/merkle_proof/$id_commitment") || die "the zone does not know $id_commitment"
 export ZONE_MERKLE_PROOF
 [ "$(printf '%s' "$ZONE_MERKLE_PROOF" | jq -r '.active')" = "true" ] || die "leaf $leaf_index is not active"
+root=$(printf '%s' "$ZONE_MERKLE_PROOF" | jq -r '.head.root')
+
+# The path is over the root at the LEZ head; the verifier below trusts a root only once a
+# Bedrock block holds its batch, so a root the sequencer has just computed is waited for here.
+say "the path is over root $root; waiting until a Bedrock block holds it (verify_proof trusts adopted roots)"
+root_wait_adopted '.root == $r' --arg r "$root" > /dev/null \
+    || die "root $root was not adopted within 30 minutes; the proof would be refused as pending"
 
 say "proving membership of leaf $leaf_index"
 RLN_IDENTITY_SECRET="$identity_secret" RLN_ID_COMMITMENT="$id_commitment" \
@@ -38,7 +45,7 @@ say "fetching the Zone's roots and verifying (adopted at least)"
 ZONE_ROOTS=$(zone /roots/5) || die "cannot read the zone's roots"
 export ZONE_ROOTS
 "$verify_proof" --proof "$proof_file" --min-status adopted >&2 \
-    || die "verify_proof refused a proof over the Zone's own path"
+    || die "verify_proof refused a proof over the Zone's own path (its verdict is above)"
 
 say "verifying a tampered proof (another message, same proof) must fail"
 tampered="$E2E_STATE/proof-$leaf_index-tampered.json"

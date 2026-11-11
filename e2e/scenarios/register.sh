@@ -49,14 +49,10 @@ done
 [ "$(printf '%s' "$membership" | jq -r '.proof.path_elements | length')" = "20" ] \
     || die "the proof path does not have 20 elements"
 root=$(printf '%s' "$membership" | jq -r '.head.root')
-say "leaf $leaf_index active, root $root"
+say "leaf $leaf_index active at LEZ block $(printf '%s' "$membership" | jq -r '.head.lez_block_id'), root $root"
 
-say "waiting for a batch carrying that root"
-for _ in $(seq 1 90); do
-    status=$(zone /roots/5 | jq -r --arg r "$root" '.roots[] | select(.root == $r and (.batches | length) > 0) | .batches[0].status' | head -1)
-    [ -n "$status" ] && break
-    sleep 10
-done
-[ -n "$status" ] || die "no batch with root $root within 15 minutes"
-say "batch with root $root is $status"
+say "waiting for the batch carrying root $root to be adopted by a Bedrock block"
+status=$(root_wait_adopted '.root == $r' --arg r "$root") \
+    || die "the batch carrying root $root was not adopted within 30 minutes"
+say "registration done: leaf $leaf_index is in a root Bedrock holds, proof.sh can verify against it"
 echo "ID_COMMITMENT=$id_commitment LEAF_INDEX=$leaf_index ROOT=$root STATUS=$status"

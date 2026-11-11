@@ -182,6 +182,28 @@ async fn run(args: &Args) -> Result<bool> {
         valid_roots.len(),
         args.min_status
     );
+    // Where the proof's root stands, said before the verdict so a refusal reads with its cause.
+    let root = fr_to_hex(&values.root());
+    match window.roots.iter().find(|e| e.root == root) {
+        Some(entry) => {
+            let status = entry.batches.first().map_or("head", |b| b.status.as_str());
+            println!(
+                "proof root {root} = the Zone's root to LEZ block {} ({status})",
+                entry.to_lez_block_id
+            );
+            if status_rank(status) < Some(args.min_status) {
+                println!(
+                    "that root is below --min-status {:?}: not offered to the verifier, so the \
+                     proof is refused until its batch gets there",
+                    args.min_status
+                );
+            }
+        }
+        None => println!(
+            "proof root {root} is not in the window (taken at the Zone's root {})",
+            file.zone_root
+        ),
+    }
 
     let rln = RLNBuilder::stateless()
         .graph(default_graph_single().clone())
@@ -196,18 +218,6 @@ async fn run(args: &Args) -> Result<bool> {
             false
         }
     };
-    let root = fr_to_hex(&values.root());
-    match window.roots.iter().find(|e| e.root == root) {
-        Some(entry) => println!(
-            "proof root {root} = the Zone's root to LEZ block {} ({})",
-            entry.to_lez_block_id,
-            entry.batches.first().map_or("head", |b| b.status.as_str())
-        ),
-        None => println!(
-            "proof root {root} is not in the window (taken at the Zone's root {})",
-            file.zone_root
-        ),
-    }
     println!("VERIFIED={verified}");
     Ok(verified)
 }

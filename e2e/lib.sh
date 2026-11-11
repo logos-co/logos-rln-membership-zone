@@ -60,6 +60,41 @@ bedrock_info() { bedrock "http://$BEDROCK_HTTP/cryptarchia/info" | jq '.cryptarc
 bedrock_wallet() { bedrock "http://$BEDROCK_HTTP/wallet/$1/balance"; }
 zone() { curl -sS -m 30 "http://$ZONE_HTTP$1"; }
 
+# ---- a root's status on Bedrock -------------------------------------------------------------
+# A root the zone computes is seen at `/roots` in these states: in no batch yet (the LEZ
+# head), `pending` (its batch is published to the channel, no Bedrock block holds it),
+# `adopted` (a Bedrock block holds it; `verify_proof --min-status adopted` trusts it from
+# here), `finalized` (hours later). `orphaned` means the block holding it was forked out; the
+# sequencer republishes, so it goes back to `pending`.
+#
+# root_wait_adopted <jq filter over a root entry> [jq --arg ...]: polls `/roots/5` for the
+# entry the filter selects until its batch is adopted (or finalized), says every status change
+# once and the minutes spent, and prints the final status. Fails after 30 minutes.
+root_wait_adopted() {
+    local filter="$1"; shift
+    local status="" last="-" i
+    for i in $(seq 1 180); do
+        status=$(zone /roots/5 | jq -r "$@" \
+            ".roots[] | select((.batches | length) > 0 and ($filter)) | .batches[0].status" | head -1)
+        if [ "$status" != "$last" ]; then
+            case "$status" in
+                "") say "  no batch yet: the sequencer publishes on its own schedule" ;;
+                pending) say "  pending: published to the channel, no Bedrock block holds it yet" ;;
+                adopted) say "  adopted: a Bedrock block holds the batch" ;;
+                finalized) say "  finalized: Bedrock finality reached" ;;
+                orphaned) say "  orphaned: the Bedrock block holding it was forked out, waiting for the republish" ;;
+                *) say "  status $status" ;;
+            esac
+            last="$status"
+        elif [ $((i % 6)) -eq 0 ]; then
+            say "  still ${status:-without a batch} after $((i / 6)) min"
+        fi
+        case "$status" in adopted|finalized) echo "$status"; return 0 ;; esac
+        sleep 10
+    done
+    return 1
+}
+
 # A base58 account id as the JSON array of its 32 bytes: the deposit metadata is
 # borsh(DepositMetadata { recipient_id }), which is the raw id.
 account_bytes_json() {

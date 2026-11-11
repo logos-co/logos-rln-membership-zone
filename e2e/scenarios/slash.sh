@@ -47,14 +47,11 @@ say "leaf $leaf_index slashed, root $root"
 
 # A removed leaf leaves its slot empty, so the root may be one the zone published before; the
 # proof is a NEW root entry, produced after the slash by a batch whose changes remove the leaf.
-say "waiting for a root entry produced after the slash that removes leaf $leaf_index"
-for _ in $(seq 1 90); do
-    status=$(zone /roots/5 | jq -r --arg r "$root" --argjson t "$slashed_at" --argjson leaf "$leaf_index" \
-        '.roots[] | select(.root == $r and .batches[0].published_at_unix >= $t
-            and any(.changes[]; .kind == "remove" and .leaf_index == $leaf)) | .batches[0].status' | head -1)
-    [ -n "$status" ] && break
-    sleep 10
-done
-[ -n "$status" ] || die "no root entry removing leaf $leaf_index published after the slash within 15 minutes"
-say "root $root, produced by the batch removing leaf $leaf_index, is $status"
+say "waiting for the batch removing leaf $leaf_index (root $root) to be adopted by a Bedrock block"
+status=$(root_wait_adopted \
+    '.root == $r and .batches[0].published_at_unix >= $t
+        and any(.changes[]; .kind == "remove" and .leaf_index == $leaf)' \
+    --arg r "$root" --argjson t "$slashed_at" --argjson leaf "$leaf_index") \
+    || die "no adopted batch removing leaf $leaf_index after the slash within 30 minutes"
+say "slash done: leaf $leaf_index is removed in a root Bedrock holds"
 echo "ID_COMMITMENT=$id_commitment LEAF_INDEX=$leaf_index ROOT=$root STATUS=$status"
