@@ -162,7 +162,9 @@ sed -i 's/^CHANNEL_NAME=.*/CHANNEL_NAME=rln-membership-zone:testnet:v0.3.0-1/' .
 rm -rf data/tree
 ```
 
-`key.hex` can stay. The old channel costs nothing abandoned.
+`key.hex` can stay. The old channel costs nothing abandoned. A tree store written by an
+earlier node version with another store layout is retired the same way: new channel, new
+store, the key stays.
 
 ### Run an indexer
 
