@@ -76,6 +76,15 @@ wait_note() {
 # wallet picks the largest notes first. A transaction spends at most 32 notes, so when the 30
 # largest do not reach the amount plus fee the wallet first merges them into one note, as
 # often as it takes (PoW rewards come as small notes).
+# Whether the node knows a transaction: mined (`/cryptarchia/transaction/:hash`) or waiting in
+# its mempool.
+deposit_known() {
+    local hash="$1"
+    bedrock "http://$BEDROCK_HTTP/cryptarchia/transaction/$hash" | jq -e '.code != 404' >/dev/null 2>&1 \
+        && return 0
+    bedrock "http://$BEDROCK_HTTP/mempool/view" | jq -e --arg h "$hash" 'index($h) != null' >/dev/null 2>&1
+}
+
 make_note() {
     local amount="$1" key largest target
     key=$(funding_key)
@@ -124,6 +133,24 @@ step_fund() {
     if ge "$bal" "$PAYER_MIN"; then
         say "payer holds $bal (>= $PAYER_MIN): funded"
         return 0
+    fi
+
+    # A pending deposit the node does not know: `/cryptarchia/transaction/:id` answers 404 for
+    # a mined tx too once it left the node's index, so this alone does not mean dropped. The
+    # note it spent tells: gone from the wallet, it was mined (keep waiting); still there, the
+    # node dropped the tx. Depositing again is the operator's call (DEPOSIT_RESEND=1).
+    local pending
+    pending=$(state_get pending_deposit)
+    if [ -n "$pending" ] && ! deposit_known "$pending"; then
+        if [ "${DEPOSIT_RESEND:-0}" = "1" ]; then
+            say "deposit $pending forgotten on request (DEPOSIT_RESEND=1): depositing again"
+            state_del pending_deposit
+            state_del pending_from_balance
+        else
+            say "deposit $pending: not in the node's tx index nor in its mempool. If the wallet still" \
+                "holds a note of $DEPOSIT_AMOUNT the node dropped it: re-run with DEPOSIT_RESEND=1." \
+                "If that note is gone it was mined: keep waiting for the credit."
+        fi
     fi
 
     if [ -z "$(state_get pending_deposit)" ]; then
@@ -176,7 +203,7 @@ step_status() {
     say "L1 $key: $(bedrock_wallet "$key" | jq -c '{balance, notes: (.notes | length)}')"
     [ -n "$payer" ] && say "payer $payer: L2 balance $(lez_balance "$payer")"
     [ -n "$(state_get pending_deposit)" ] && say "pending deposit $(state_get pending_deposit)"
-    say "zone:    $(zone / | jq -c '{head, newest_published, newest_adopted}' 2>/dev/null || echo 'not running')"
+    say "zone:    $(zone / | jq -c '{head, newest_published, newest_finalized}' 2>/dev/null || echo 'not running')"
 }
 
 case "$STEP" in
