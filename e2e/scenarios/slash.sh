@@ -6,7 +6,11 @@
 # Reveals the identity secret of a registration register.sh made (the leaf given, else the
 # newest not slashed yet; lez-rln `slash_member`, paid by the payer), then watches the Zone
 # sequencer: the membership turns `active: false`, `removed: slashed`, its proof goes away,
-# and a batch with the new root is published (`Remove leaf N`).
+# and a batch with the new root is published (`Remove leaf N`). `slash_member` waits for the
+# LEZ Sequencer to drop the membership account and times out when LEZ answers slowly; the
+# payer's balance tells whether the transaction landed anyway (a slash costs ~5e6 atomic, a
+# dropped transaction nothing), so a timeout after a charge is not a failure: the zone shows
+# the slash once the LEZ block is adopted on Bedrock, minutes later.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${1:?usage: slash.sh <network.env> [leaf_index]}"
@@ -24,19 +28,23 @@ membership=$(zone "/merkle_proof/$id_commitment") || die "the zone does not know
 
 before=$(lez_balance "$LEZ_RLN_PAYER")
 say "slashing leaf $leaf_index from $LEZ_RLN_PAYER (balance $before)"
-LEZ_RLN_ID_COMMITMENT="$id_commitment" LEZ_RLN_IDENTITY_SECRET="$identity_secret" "$slash_member" >&2 \
-    || die "slash_member failed"
+if ! LEZ_RLN_ID_COMMITMENT="$id_commitment" LEZ_RLN_IDENTITY_SECRET="$identity_secret" "$slash_member" >&2; then
+    after=$(lez_balance "$LEZ_RLN_PAYER")
+    ge "$((before - after))" 1000000 \
+        || die "slash_member failed and the payer was not charged ($before -> $after): the slash did not land"
+    say "slash_member timed out but the payer was charged $((before - after)) atomic: the slash landed, going on"
+fi
 after=$(lez_balance "$LEZ_RLN_PAYER")
 say "payer balance $before -> $after: the slash cost $((before - after)) atomic (fee)"
 
-say "waiting for the zone to remove leaf $leaf_index"
-for _ in $(seq 1 60); do
+say "waiting for the zone to remove leaf $leaf_index (the LEZ block must be adopted on Bedrock first)"
+for _ in $(seq 1 120); do
     membership=$(zone "/merkle_proof/$id_commitment") || die "the zone lost $id_commitment"
     [ "$(printf '%s' "$membership" | jq -r '.active')" = "false" ] && break
     membership=""
     sleep 10
 done
-[ -n "$membership" ] || die "the zone did not apply the slash within 10 minutes"
+[ -n "$membership" ] || die "the zone did not apply the slash within 20 minutes"
 [ "$(printf '%s' "$membership" | jq -r '.removed')" = "slashed" ] \
     || die "removed is $(printf '%s' "$membership" | jq -r '.removed'), not slashed"
 [ "$(printf '%s' "$membership" | jq -r '.proof')" = "null" ] || die "a removed membership still has a proof"
