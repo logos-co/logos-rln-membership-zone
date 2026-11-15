@@ -4,8 +4,6 @@
 //! it; it serves no events, so they are derived from the program's transactions in each block,
 //! decoded with LEZ's own `common` crate, into the program's own `rln_layouts::events` types.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 pub use common::block::{BedrockStatus, BlockHeader};
@@ -90,8 +88,6 @@ pub struct SequencerLez {
     program: AccountId,
     /// The registry followed; the program's transactions for another `tree_id` are dropped.
     tree_id: [u8; 32],
-    /// `Registered` seen so far, the next `leaf_index`.
-    registered: AtomicU64,
     /// Serve only the blocks finalized on Bedrock: a reader that waits for LEZ finality instead
     /// of trusting closed blocks (the indexer).
     finalized_only: bool,
@@ -109,7 +105,6 @@ impl SequencerLez {
             url,
             program: AccountId::new(program_account_id),
             tree_id,
-            registered: AtomicU64::new(0),
             finalized_only,
         }
     }
@@ -149,12 +144,6 @@ impl SequencerLez {
             },
             hex::encode(borsh::to_vec(&self.program).expect("an account id serializes"))
         )
-    }
-
-    /// Tell the source how many `Registered` the reader has applied, so the `leaf_index`
-    /// check continues the count after a restart.
-    pub fn set_registered_count(&self, count: u64) {
-        self.registered.store(count, Ordering::Relaxed);
     }
 
     /// `block_id` of the latest closed block.
@@ -280,14 +269,6 @@ impl SequencerLez {
                 leaf_index,
                 ..
             } => {
-                let expected = self.registered.fetch_add(1, Ordering::Relaxed);
-                if leaf_index != expected {
-                    println!(
-                        "Register carries leaf_index {leaf_index}, {expected} Registered seen \
-                         before it: following the instruction"
-                    );
-                    self.registered.store(leaf_index + 1, Ordering::Relaxed);
-                }
                 let grace_start_ms = now_ms.saturating_add(secs_to_millis(active_duration_sec));
                 RlnEvent::Registered(Registered {
                     tree_id,

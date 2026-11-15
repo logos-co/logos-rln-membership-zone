@@ -482,6 +482,16 @@ impl Reader {
                     expiry_timestamp_ms,
                     leaf_index,
                 }) => {
+                    // The program's `Registered` events of a registry carry 0, 1, 2.. in block
+                    // order (its `events` module); a jump means a block this reader missed or
+                    // a program change. Said once, when the block is applied.
+                    if *leaf_index != self.stats.registered {
+                        println!(
+                            "Registered carries leaf_index {leaf_index} after {} Registered \
+                             applied: following the event",
+                            self.stats.registered
+                        );
+                    }
                     self.stats.registered += 1;
                     if self.members.get(id_commitment).is_some_and(|m| !m.ended()) {
                         println!(

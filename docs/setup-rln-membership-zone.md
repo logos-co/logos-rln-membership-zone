@@ -81,7 +81,7 @@ sed -i "s/^FUNDING_PK=.*/FUNDING_PK=$(yq .public_keys.PoWClaim ~/keystore.yaml)/
 | `FUNDING_PK` | | Node wallet key paying the batches (`PoWClaim`) |
 | `MAX_TX_FEE` | 1000000 | Fee cap per publish, atomic units |
 | `PRIORITY_FEE_PERCENT` | 12 | Reserve over the mandatory fee, the excess is a tip; block builders take the mempool FIFO, so it buys nothing on the testnet (SDK default 12) |
-| `CHANNEL_NAME` | `rln-membership-zone:testnet:v0.3.2` | Channel id = `sha256(CHANNEL_NAME)`; `CHANNEL_ID` (64 hex) overrides |
+| `CHANNEL_NAME` | `rln-membership-zone:testnet:v0.3.2-1` | Channel id = `sha256(CHANNEL_NAME)`; `CHANNEL_ID` (64 hex) overrides |
 | `PROGRAM_ACCOUNT_ID` | `f048...106a` | Registration program on the testnet LEZ (`HAxY9...4bBw` in base58) |
 | `TREE_ID` | `47b2de4f...b4cf` | Registry the program serves, first field of every event |
 | `FIRST_LEZ_BLOCK_ID` | 49431 | Block the program was deployed in; nothing before it is read |
@@ -159,7 +159,7 @@ When the channel holds batches you do not want to continue from (for example tes
 that never got mined), change the name and start clean:
 
 ```bash
-sed -i 's/^CHANNEL_NAME=.*/CHANNEL_NAME=rln-membership-zone:testnet:v0.3.2-1/' .env
+sed -i 's/^CHANNEL_NAME=.*/CHANNEL_NAME=rln-membership-zone:testnet:v0.3.2-x/' .env
 rm -rf data/tree
 ```
 
@@ -422,6 +422,11 @@ batch stays `in_flight` (block production and mempool propagation).
 - `unzip: not found` while building: `sudo apt-get install -y unzip`.
 - `missing manifest in toolchain '1.98.1-...'`: a half-installed toolchain;
   `rustup toolchain uninstall 1.98.1 && rustup toolchain install 1.98.1`.
+- `batch msg M does not apply on our own head (...); stopping instead of publishing it again`:
+  the sequencer's own batch failed its own replay (the error says which check), a bug or a
+  store from another configuration (`FIRST_LEZ_BLOCK_ID`, `TREE_ID`); the process stops so the
+  same batch is not published every poll. The batches already on the channel stay: a batch
+  that does not continue the tip parks every indexer, so continue on a new `CHANNEL_NAME`.
 - A batch stays `in_flight` and `curl localhost:8080/mempool/view` does not list its tx hash:
   the node dropped it as invalid at block building (no log at the default level). Check
   `curl localhost:8080/channel/<channel id hex>`: a `tip_message` that is not your newest

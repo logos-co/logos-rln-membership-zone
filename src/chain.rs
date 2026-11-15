@@ -139,14 +139,16 @@ pub trait Judge {
     fn root_at(&self, to_lez_block_id: u64) -> Option<[u8; 32]>;
 }
 
-/// `tree` after `batch` when it chains on `tip` and the judge, if any, agrees.
+/// `tree` after `batch` when it chains on `tip` (the first batch on `first_lez_block_id`) and
+/// the judge, if any, agrees.
 fn apply_batch(
+    first_lez_block_id: u64,
     tip: Option<&Tip>,
     batch: &Batch,
     tree: &ReplayTree,
     judge: Option<&dyn Judge>,
 ) -> Result<ReplayTree, BatchIngestError> {
-    let expected = tip.map_or(1, |tip| tip.to_lez_block_id + 1);
+    let expected = tip.map_or(first_lez_block_id, |tip| tip.to_lez_block_id + 1);
     if batch.from_lez_block_id != expected {
         return Err(BatchIngestError::UnexpectedBlockId {
             expected,
@@ -282,6 +284,8 @@ struct StoredEntry {
 /// The final tier (irreversible, from `finalized`) and the head, which is always the final
 /// state folded over `view`.
 pub struct ChainState {
+    /// The LEZ block the first batch starts at (the program's deployment block).
+    first_lez_block_id: u64,
     final_state: ReplayTree,
     final_tip: Option<Tip>,
     /// The newest finalized entry on the message lineage, batch or not.
@@ -297,9 +301,10 @@ pub struct ChainState {
 }
 
 impl ChainState {
-    /// Fresh state: the empty tree, no entry.
-    pub fn new() -> Self {
+    /// Fresh state: the empty tree, no entry; the first batch must start at `first_lez_block_id`.
+    pub fn new(first_lez_block_id: u64) -> Self {
         Self {
+            first_lez_block_id,
             final_state: ReplayTree::empty(),
             final_tip: None,
             final_msg: MsgId::root(),
@@ -313,21 +318,25 @@ impl ChainState {
     /// State restored from a persisted final tier (the entries replay in order, the first
     /// parked one freezes the tip) and the persisted view.
     pub fn restore(
+        first_lez_block_id: u64,
         final_entries: Vec<FinalEntry>,
         stall: Option<StallReason>,
         view: &[u8],
         judge: Option<&dyn Judge>,
     ) -> Result<Self> {
-        let mut chain = Self::new();
+        let mut chain = Self::new(first_lez_block_id);
         for entry in final_entries {
             if entry.error.is_none()
                 && let Some(batch) = entry.batch()
             {
-                chain.final_state =
-                    apply_batch(chain.final_tip.as_ref(), &batch, &chain.final_state, None)
-                        .map_err(|e| {
-                            anyhow::anyhow!("final batch msg {}: {e}", hex::encode(entry.msg))
-                        })?;
+                chain.final_state = apply_batch(
+                    first_lez_block_id,
+                    chain.final_tip.as_ref(),
+                    &batch,
+                    &chain.final_state,
+                    None,
+                )
+                .map_err(|e| anyhow::anyhow!("final batch msg {}: {e}", hex::encode(entry.msg)))?;
                 chain.final_tip = Some(Tip::from(&batch));
             }
             chain.final_msg = MsgId::from(entry.msg);
@@ -597,7 +606,13 @@ impl ChainState {
                 to: batch.to_lez_block_id,
             });
         }
-        match apply_batch(self.final_tip.as_ref(), batch, &self.final_state, judge) {
+        match apply_batch(
+            self.first_lez_block_id,
+            self.final_tip.as_ref(),
+            batch,
+            &self.final_state,
+            judge,
+        ) {
             Ok(state) => {
                 self.final_state = state;
                 self.final_tip = Some(Tip::from(batch));
@@ -627,7 +642,13 @@ impl ChainState {
             let Some(batch) = self.final_entries[i].batch() else {
                 continue;
             };
-            match apply_batch(self.final_tip.as_ref(), &batch, &self.final_state, judge) {
+            match apply_batch(
+                self.first_lez_block_id,
+                self.final_tip.as_ref(),
+                &batch,
+                &self.final_state,
+                judge,
+            ) {
                 Ok(state) => {
                     self.final_state = state;
                     self.final_tip = Some(Tip::from(&batch));
@@ -709,7 +730,7 @@ impl ChainState {
                 (&fold.state, fold.tip.as_ref())
             });
         let outcome = match &entry.batch {
-            Some(batch) => apply_batch(tip, batch, state, judge)
+            Some(batch) => apply_batch(self.first_lez_block_id, tip, batch, state, judge)
                 .map(|next| (next, Tip::from(batch), batch.changes.clone())),
             None => Err(BatchIngestError::Deserialize(
                 "the inscription is not a batch".into(),
@@ -796,7 +817,7 @@ mod test {
 
     #[test]
     fn test_view_folds_record_publish_and_finality_move_the_tiers() {
-        let mut chain = ChainState::new();
+        let mut chain = ChainState::new(1);
         let empty = ReplayTree::empty();
         let b1 = batch(1, 3, vec![Change::insert(0, leaf(1))], &empty);
         let one = {
@@ -830,7 +851,7 @@ mod test {
 
         // Persist and restore the view.
         let bytes = chain.encode_view();
-        let mut restored = ChainState::new();
+        let mut restored = ChainState::new(1);
         restored.restore_view(&bytes, None).unwrap();
         assert_eq!(restored.pin(), msg(2));
         assert_eq!(restored.head_root(), chain.head_root());
@@ -851,14 +872,15 @@ mod test {
         );
 
         // Restore from the final tier alone.
-        let again = ChainState::restore(chain.final_entries().to_vec(), None, &[], None).unwrap();
+        let again =
+            ChainState::restore(1, chain.final_entries().to_vec(), None, &[], None).unwrap();
         assert_eq!(again.final_tip(), chain.final_tip());
         assert_eq!(again.head_root(), chain.head_root());
     }
 
     #[test]
     fn test_conflict_rebuilds_the_view_and_returns_what_left_it() {
-        let mut chain = ChainState::new();
+        let mut chain = ChainState::new(1);
         let empty = ReplayTree::empty();
         let b1 = batch(1, 1, vec![Change::insert(0, leaf(1))], &empty);
         let b1_again = Batch {
@@ -905,7 +927,7 @@ mod test {
             roots: vec![(2, root_1), (4, root_2)],
             read_to: 2,
         };
-        let mut chain = ChainState::new();
+        let mut chain = ChainState::new(1);
 
         // Entry 1 chains, LEZ read to 2: applied. Entry 2 needs block 4: undecided, retried.
         chain.apply_extension(
@@ -922,7 +944,7 @@ mod test {
         // A persisted view keeps an undecided entry's batch (it will be judged), not a parked
         // one's.
         let bytes = chain.encode_view();
-        let mut restored = ChainState::new();
+        let mut restored = ChainState::new(1);
         restored.restore_view(&bytes, Some(&oracle)).unwrap();
         assert_eq!(restored.head_root(), root_2);
 
@@ -978,7 +1000,7 @@ mod test {
         assert!(chain.final_entries()[2].error.is_some());
 
         // A derivation mismatch: the batch replays fine but LEZ says otherwise.
-        let mut fresh = ChainState::new();
+        let mut fresh = ChainState::new(1);
         let liar = Oracle {
             roots: vec![(2, [5; 32])],
             read_to: 2,
@@ -994,7 +1016,7 @@ mod test {
 
     #[test]
     fn test_an_undecodable_inscription_and_a_gap_are_held_not_fatal() {
-        let mut chain = ChainState::new();
+        let mut chain = ChainState::new(1);
         let empty = ReplayTree::empty();
         let b1 = batch(1, 1, vec![Change::insert(0, leaf(1))], &empty);
         // Garbage on the channel: an entry without a batch, skipped, the lineage goes on.
@@ -1021,11 +1043,43 @@ mod test {
         let last = chain.view_outcomes().last().unwrap().1.clone();
         assert!(matches!(last, Err(BatchIngestError::Deserialize(_))));
         // Finalizing the garbage entry alone: no batch, no outcome, the final msg moves.
-        let mut chain = ChainState::new();
+        let mut chain = ChainState::new(1);
         assert_eq!(
             chain.apply_finalized(ChannelEntry::new(msg(1), MsgId::root(), &[]), 10, None),
             None
         );
         assert_eq!(chain.final_msg(), msg(1));
+    }
+
+    /// The first batch starts at the program's deployment block, not at LEZ block 1 (the
+    /// testnet program: 49431); one starting anywhere else parks.
+    #[test]
+    fn test_the_first_batch_starts_at_the_first_lez_block() {
+        let mut chain = ChainState::new(49_431);
+        let empty = ReplayTree::empty();
+        let b1 = batch(49_431, 49_500, vec![Change::insert(0, leaf(1))], &empty);
+        assert_eq!(
+            chain.record_publish(entry(1, 0, Some(b1.clone())), None),
+            PublishRecord::Extended
+        );
+        assert_eq!(chain.head_tip().unwrap().to_lez_block_id, 49_500);
+        // The same batch again, chained on the first: it does not continue the tip.
+        assert_eq!(
+            chain.record_publish(entry(2, 1, Some(b1.clone())), None),
+            PublishRecord::Skipped
+        );
+        assert!(matches!(
+            chain.view_outcomes().nth(1).unwrap().1,
+            Err(BatchIngestError::UnexpectedBlockId {
+                expected: 49_501,
+                got: 49_431
+            })
+        ));
+        // A chain that expects block 1 parks the testnet's first batch.
+        let mut from_one = ChainState::new(1);
+        assert_eq!(
+            from_one.record_publish(entry(1, 0, Some(b1)), None),
+            PublishRecord::Skipped
+        );
     }
 }

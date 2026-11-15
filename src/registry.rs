@@ -227,11 +227,11 @@ impl Registry {
             .transpose()
             .context("view in the tree store")?
             .unwrap_or_default();
-        let judge = indexer.then_some(&head as &dyn Judge);
-        let chain = ChainState::restore(final_entries, stall, &view, judge)?;
         let first_lez_block_id = get("first_lez_block_id")
             .and_then(|v| v.as_u64())
             .unwrap_or(first_lez_block_id);
+        let judge = indexer.then_some(&head as &dyn Judge);
+        let chain = ChainState::restore(first_lez_block_id, final_entries, stall, &view, judge)?;
         let own_pending: Vec<String> = get("own_pending")
             .map(serde_json::from_value)
             .transpose()

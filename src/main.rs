@@ -107,7 +107,7 @@ struct Args {
     /// Name of the Zone channel: its id is `sha256(name)`.
     #[arg(
         long,
-        default_value = "rln-membership-zone:testnet:v0.3.2",
+        default_value = "rln-membership-zone:testnet:v0.3.2-1",
         env = "CHANNEL_NAME"
     )]
     channel_name: String,
@@ -755,6 +755,22 @@ async fn publish_batch(
                     format!(" ({record:?})")
                 }
             );
+            // Our own batch not applying on our own head is a bug, not a condition to retry:
+            // the next poll would publish the same batch again, forever.
+            if record == PublishRecord::Skipped {
+                let error = registry
+                    .read()
+                    .expect("registry lock")
+                    .entries()
+                    .last()
+                    .and_then(|e| e.error.as_ref().map(ToString::to_string))
+                    .unwrap_or_default();
+                bail!(
+                    "batch msg {} does not apply on our own head ({error}); stopping instead of \
+                     publishing it again",
+                    short(&info.this_msg.into())
+                );
+            }
         }
         Err(SeqError::Unavailable { reason }) => {
             println!("not ready to publish ({reason}), retry next poll")
@@ -920,14 +936,6 @@ async fn main() -> Result<()> {
             );
         }
     }
-    source.set_registered_count(
-        registry
-            .read()
-            .expect("registry lock")
-            .head
-            .stats
-            .registered,
-    );
     if let Some(msg) = registry.read().expect("registry lock").in_flight() {
         println!(
             "batch msg {} still in flight from the previous run; no new batch until it lands",
