@@ -6,7 +6,7 @@
 # Registers one membership from the payer wallet (lez-rln `register_member`), then watches
 # the Zone sequencer: the membership appears at `/merkle_proof/<id_commitment>` with the
 # leaf index the registration claimed and a proof path, and the root that includes it is
-# published in a batch (`/roots`; `finalized` hours later). The membership (leaf,
+# published in a batch (`/roots`; `bedrock_status` `finalized` hours later). The membership (leaf,
 # id_commitment, identity secret) goes on record for slash.sh and proof.sh.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

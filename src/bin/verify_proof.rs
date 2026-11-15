@@ -65,6 +65,7 @@ struct Roots {
 #[derive(Deserialize)]
 struct Head {
     lez_block_id: u64,
+    root: String,
 }
 
 #[derive(Deserialize)]
@@ -77,8 +78,15 @@ struct RootEntry {
 
 #[derive(Deserialize)]
 struct BatchEntry {
-    #[serde(rename = "finalized")]
-    is_finalized: bool,
+    /// The Zone SDK's word for where the batch stands on Bedrock: `pending`, `adopted` or
+    /// `finalized`.
+    bedrock_status: String,
+}
+
+impl BatchEntry {
+    fn is_finalized(&self) -> bool {
+        self.bedrock_status == "finalized"
+    }
 }
 
 impl RootEntry {
@@ -86,14 +94,14 @@ impl RootEntry {
     fn counts(&self, finalized_only: bool) -> bool {
         self.batches
             .first()
-            .is_some_and(|b| b.is_finalized || !finalized_only)
+            .is_some_and(|b| b.is_finalized() || !finalized_only)
     }
 
-    fn describe(&self) -> &'static str {
+    fn describe(&self) -> String {
         match self.batches.first() {
-            None => "the LEZ head, in no batch yet",
-            Some(b) if b.is_finalized => "finalized on Bedrock",
-            Some(_) => "in a batch, not finalized yet",
+            Some(b) if b.is_finalized() => "finalized on Bedrock".into(),
+            Some(b) => format!("in a batch, {} on Bedrock", b.bedrock_status),
+            None => "in no batch".into(),
         }
     }
 }
@@ -207,6 +215,10 @@ async fn run(args: &Args) -> Result<bool> {
                 );
             }
         }
+        None if window.head.root == root => println!(
+            "proof root {root} is the Zone's root at its LEZ head, in no batch yet: the proof \
+             is refused until a batch carries it"
+        ),
         None => println!(
             "proof root {root} is not in the window (taken at the Zone's root {})",
             file.zone_root

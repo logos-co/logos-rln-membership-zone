@@ -61,24 +61,24 @@ bedrock_wallet() { bedrock "http://$BEDROCK_HTTP/wallet/$1/balance"; }
 zone() { curl -sS -m 30 "http://$ZONE_HTTP$1"; }
 
 # ---- a root on Bedrock ---------------------------------------------------------------------
-# A root the zone computes is seen at `/roots` either at the LEZ head (in no batch yet) or
-# carried by a batch, `finalized` or not (the final tier vs the view, as the Zone SDK reports
-# the channel; a batch the sequencer just published is in the view too, `/` names it
-# `in_flight`). `verify_proof` trusts every root a batch carries, `--finalized-only` the
-# finalized ones (hours later).
+# A root the zone computes is at `head.root` until a batch carries it; `/roots` lists the
+# roots batches carry, each batch with its `bedrock_status` (the Zone SDK's word): `pending`
+# (published, no Bedrock block yet; `/` names it `in_flight`), `adopted` (in a block) or
+# `finalized` (hours later). `verify_proof` trusts every root a batch carries,
+# `--finalized-only` the finalized ones.
 #
 # root_wait_published <jq filter over a root entry> [jq --arg ...]: polls `/roots/5` for the
-# entry the filter selects until a batch carries it, says the minutes spent, and prints
-# `finalized` or `published`. Fails after 30 minutes.
+# entry the filter selects until a batch carries it, says the minutes spent, and prints the
+# producing batch's `bedrock_status`. Fails after 30 minutes.
 root_wait_published() {
     local filter="$1"; shift
-    local finalized="" i
+    local status="" i
     for i in $(seq 1 180); do
-        finalized=$(zone /roots/5 | jq -r "$@" \
-            ".roots[] | select((.batches | length) > 0 and ($filter)) | .batches[0].finalized" | head -1)
-        case "$finalized" in
-            true) say "  a batch carries it, finalized on Bedrock"; echo finalized; return 0 ;;
-            false) say "  a batch carries it (not finalized yet, hours to go)"; echo published; return 0 ;;
+        status=$(zone /roots/5 | jq -r "$@" \
+            ".roots[] | select((.batches | length) > 0 and ($filter)) | .batches[0].bedrock_status" | head -1)
+        case "$status" in
+            finalized) say "  a batch carries it, finalized on Bedrock"; echo "$status"; return 0 ;;
+            adopted|pending) say "  a batch carries it ($status on Bedrock, finality hours away)"; echo "$status"; return 0 ;;
         esac
         [ $((i % 6)) -eq 0 ] && say "  no batch yet after $((i / 6)) min: the sequencer publishes on its own schedule"
         sleep 10

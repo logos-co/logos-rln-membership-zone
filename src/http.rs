@@ -1,13 +1,12 @@
-//! The HTTP API a Module's node reads (its registry access): the roots with the changes that
-//! made them and their batches on Bedrock, finalized or not, the Merkle proof path of a leaf at
-//! the tree of the LEZ head, a membership's state.
-//! 32-byte values are hex, little-endian (RLN-API Appendix B). Every answer carries `head`:
-//! `lez_block_id` and `lez_timestamp_ms`, the LEZ block the tree is at, and the tree's `root`
-//! there. A batch is `finalized` (in the final tier, with the `l1_slot` that finalized it) or
-//! not (in the view: a Bedrock block holds it, or this sequencer just published it, see
-//! `in_flight` in `/`); its `outcome` is the fold's outcome (`applied`, `parked`,
-//! `retryable_failure`, LEZ's `AcceptOutcome` names) with `error` when it is not applied.
-//! Every key is always present: a value that does not apply is `null`, never absent.
+//! The HTTP API a Module's node reads (its registry access): the valid roots with the batches
+//! that carry them, the Merkle proof path of a leaf at the tree of the LEZ head, a membership's
+//! state. 32-byte values are hex, little-endian (RLN-API Appendix B). Every answer carries
+//! `head`: `lez_block_id` and `lez_timestamp_ms`, the LEZ block the tree is at, and the tree's
+//! `root` there. Where a batch stands on Bedrock is its `bedrock_status`, the Zone SDK's word:
+//! `pending` (published, no Bedrock block yet), `adopted` (in a block on the current branch),
+//! `finalized` (with the `l1_slot`). Only the batches that applied are served; the first that
+//! did not is the `stall` in `/` (LEZ `StallReason`). Every key is always present: a value
+//! that does not apply is `null`, never absent.
 
 use std::sync::{Arc, RwLock};
 
@@ -20,7 +19,7 @@ use axum::{
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::registry::{ChangeRecord, EntryView, Registry, RootEntry};
+use crate::registry::{EntryView, Registry, RootEntry};
 
 pub type Shared = Arc<RwLock<Registry>>;
 
@@ -43,47 +42,21 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// A root of the valid-root window as the API shows it: the LEZ blocks it stood for
-/// (`from_lez_block_id` of the batch that produced it to `to_lez_block_id` of the newest batch
-/// carrying it), the `changes` that made it, and `batches`, every batch of the run, the
-/// producing one first, each flagged `finalized` or not.
+/// A root of the valid-root window as the API shows it: `to_lez_block_id` of the newest batch
+/// carrying it, and `batches`, every batch of the run, the producing one first (its `changes`
+/// made the root; the ones after it carry it further with none).
 #[derive(Serialize)]
 struct RootWindowEntry {
     root: String,
-    from_lez_block_id: u64,
     to_lez_block_id: u64,
-    changes: Vec<ChangeRecord>,
     batches: Vec<EntryView>,
 }
 
 impl RootWindowEntry {
-    /// The root at the LEZ head, ahead of any batch: the changes not published yet (the
-    /// sequencer) or not read from the channel yet (the indexer). `None` while no change
-    /// waits, the head's root being the newest batch's then.
-    fn head(registry: &Registry) -> Option<Self> {
-        if registry.pending_changes.is_empty() {
-            return None;
-        }
-        Some(Self {
-            root: hex::encode(registry.head.root()),
-            from_lez_block_id: registry.covered_to() + 1,
-            to_lez_block_id: registry.head.lez_block_id,
-            changes: registry
-                .pending_changes
-                .iter()
-                .filter_map(|(_, change)| ChangeRecord::from_change(change))
-                .collect(),
-            batches: vec![],
-        })
-    }
-
     fn new(run: RootEntry) -> Self {
-        let produced_by = run.produced_by();
         Self {
-            root: produced_by.root.clone().unwrap_or_default(),
-            from_lez_block_id: produced_by.from_lez_block_id.unwrap_or_default(),
+            root: run.produced_by().root.clone().unwrap_or_default(),
             to_lez_block_id: run.carried_to_lez_block_id(),
-            changes: produced_by.changes.clone(),
             batches: run.entries,
         }
     }
@@ -109,8 +82,11 @@ fn root_ref(entry: Option<EntryView>) -> Value {
 
 async fn summary(State(state): State<AppState>) -> Json<Value> {
     let registry = state.registry.read().expect("registry lock");
-    let entries = registry.entries();
-    let count = |outcome: &str| entries.iter().filter(|e| e.outcome == outcome).count();
+    let applied = registry
+        .entries()
+        .iter()
+        .filter(|e| e.outcome == "applied")
+        .count();
     let body = json!({
         "zone_channel_id": state.channel_id,
         "lez_source": state.lez_source,
@@ -124,13 +100,10 @@ async fn summary(State(state): State<AppState>) -> Json<Value> {
         },
         "mode": state.mode,
         "pending_change_count": registry.pending_changes.len(),
-        "batch_count": entries.len(),
-        "applied_batch_count": count("applied"),
-        "parked_batch_count": count("parked"),
-        "retryable_failure_count": count("retryable_failure"),
+        "batch_count": applied,
         "stall": registry.chain.stall(),
-        "replay_root": hex::encode(registry.chain.head_root()),
         "in_flight": registry.in_flight().map(hex::encode),
+        "orphaned_count": registry.orphaned_count(),
         "newest_published": root_ref(registry.newest(false)),
         "newest_finalized": root_ref(registry.newest(true)),
         "endpoints": [
@@ -143,22 +116,16 @@ async fn summary(State(state): State<AppState>) -> Json<Value> {
     with_head(&registry, body)
 }
 
-/// The newest `window_size` roots, newest first: the head's when it is ahead of the batches
-/// (`batches` empty), then each root with the changes that made it, the LEZ blocks it stood
-/// for and every batch that carried it. A validator reads its policy off this: the roots back
-/// to the newest one whose `changes` remove a leaf, say, are the ones no removed member can
-/// still prove under.
+/// The newest `window_size` roots a batch carries, newest first, each with every batch of its
+/// run (the head's own root, ahead of the batches while changes wait, is `head.root`). A
+/// validator reads its policy off the producing batch's `changes`: the roots back to the
+/// newest one that removes a leaf, say, are the ones no removed member can still prove under.
 async fn roots(State(state): State<AppState>, Path(window_size): Path<usize>) -> Json<Value> {
     let registry = state.registry.read().expect("registry lock");
-    let roots: Vec<_> = RootWindowEntry::head(&registry)
+    let roots: Vec<_> = registry
+        .roots(window_size)
         .into_iter()
-        .chain(
-            registry
-                .roots(window_size)
-                .into_iter()
-                .map(RootWindowEntry::new),
-        )
-        .take(window_size)
+        .map(RootWindowEntry::new)
         .collect();
     with_head(&registry, json!({ "roots": roots }))
 }

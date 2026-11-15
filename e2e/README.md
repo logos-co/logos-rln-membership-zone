@@ -34,7 +34,8 @@ leave it, and re-run later (it resumes). A pending deposit the node no longer fi
 answers 404 for a mined tx too) is reported, not re-sent: `DEPOSIT_RESEND=1` deposits again,
 only when the wallet still holds the note. `register.sh` sends one `Register` from the payer,
 then watches `/merkle_proof/<id_commitment>` for the leaf with the claimed index and a
-20-element path, and `/roots` until a batch carries that root (`finalized` comes hours later;
+20-element path, and `/roots` until a batch carries that root (`bedrock_status` `pending` or
+`adopted` first, `finalized` hours later;
 a verifier trusts every root a batch carries unless it asks for finalized ones only). The
 scripts say the minutes spent while they wait.
 

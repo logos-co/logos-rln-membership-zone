@@ -11,7 +11,7 @@ runs the node; the Mac side is only where the code is edited.
 | --- | --- | --- |
 | Logos Blockchain node (Bedrock, L1) | 8080 | HTTP API: wallet, mempool, blocks. The Zone SDK publishes batches through it and pays fees from its wallet. Never expose it: the API has no auth and reaches the wallet. |
 | Zone sequencer, `zone` | 3000 | Reads LEZ blocks, derives the tree, publishes one batch per change or heartbeat on its channel, serves `/roots`, `/merkle_proof`, `/leaves`. |
-| Zone indexer, `zone --mode indexer` | 3001 | Optional, beside the sequencer: derives the same tree, reads the channel's finalized batches and checks each against it, serves the same API with the outcomes. |
+| Zone indexer, `zone --mode indexer` | 3001 | Optional, beside the sequencer: derives the same tree, reads the channel's finalized batches and checks each against it, serves the same API, a parked batch as `stall`. |
 | LEZ Sequencer | 3040 or public | Source of closed LEZ blocks (`getBlockRange`). Default: `https://testnet.lez.logos.co`. Optional: your own, section 5. |
 
 Data flow: LEZ Sequencer (blocks, transactions) -> Zone sequencer (tree, batches) ->
@@ -124,10 +124,11 @@ What happens, in order:
 5. The channel is kept the way LEZ's own `chain_state` keeps it: a final tier (the
    inscriptions Bedrock finalized, irreversible) and a view (the unfinalized lineage the Zone
    SDK reports, chained on the last final entry), the head being the final state folded over
-   the view. A batch of ours enters the view at publish (`/` names it `in_flight` until the
-   channel tip shows a Bedrock block holds it) and the final tier once in finalized history
-   (`finalized: true` with its `l1_slot`, 8 to 10 hours later); a reorg that drops it from the
-   view (the SDK's `Conflict`) has it published again under a new message id. Finality comes
+   the view. A batch of ours enters the view at publish (`bedrock_status` `pending`, `/` names
+   it `in_flight`, until the channel tip shows a Bedrock block holds it: `adopted`) and the
+   final tier once in finalized history (`finalized` with its `l1_slot`, 8 to 10 hours later);
+   a reorg that drops it from the view (the SDK's `Conflict`, `orphaned`) has it published
+   again under a new message id, counted in `orphaned_count`. Finality comes
    from the Zone SDK stream, and every 5 minutes a scan of the finalized L1 blocks from the
    anchor (the slot of the newest final entry) up to the LIB applies what the stream may have
    missed (a restart in between).
@@ -192,18 +193,18 @@ set -a; . ./.env; set +a
 MODE=indexer DATA_DIR=data-indexer HTTP_ADDR=127.0.0.1:3001 cargo run
 ```
 
-`/` reports `applied_batch_count`, `parked_batch_count`, `retryable_failure_count`, `stall`
-and `replay_root` (the root the head's replay is at) in both modes; every batch in `/roots`
-carries `outcome` and `error`. The sequencer trusts its own batches, so its outcomes are
-`applied` unless a batch was malformed. Its `/roots` entry 0 is the LEZ head when changes wait
-that no batch carries yet (no `batches`), so a consumer that wants the live tree takes that one
-and a consumer that wants only what the channel finalized skips it
-(`verify_proof --finalized-only`).
+The outcomes stay inside the node, as in LEZ: `/roots` serves the batches that applied, `/`
+serves `batch_count` (those) and `stall` (the first finalized batch that parked, with its
+error; `null` while none did). A batch the indexer cannot judge yet (`lez_not_read`) and the
+ones behind it are not served until it can, so an indexer's `/roots` trails the sequencer's by
+LEZ finality; the live tree is `head.root` in every answer (`verify_proof --finalized-only`
+takes only what the channel finalized).
 
 An indexer is meant to run on and off: stopped for days, started to check what finalized
 since. Nothing it decides depends on being up: the final tier is re-read from the anchor on
 every start, the view comes back from the SDK, a batch it could not judge yet is judged when
-LEZ finality reaches it, and a missed inscription cannot stick as a wrong outcome.
+LEZ finality reaches it, and a missed inscription cannot stick as a wrong outcome (the log says
+`PARKED` for a finalized batch that failed, with the error).
 
 ### HTTP API
 
@@ -218,12 +219,13 @@ curl -s localhost:3000/health
 
 Words used the same way in every answer: `head` is where the tree is, `lez_block_id` and
 `lez_timestamp_ms` the LEZ block applied last (its timestamp is the clock expiry runs on) and
-`root` the tree's root there; a batch is `finalized` (in the final tier, `l1_slot` the L1
-block that finalized it) or not (`l1_slot` `null`); a membership is `active` (its leaf is in the tree and it proves, through its
-grace period included) or `removed` for `expired`, `slashed` or `erased`. 32-byte values are
-hex, little-endian. Counts end in `_count`. Every key is always present: a value that does not
-apply is `null`, never absent; the one exception is `mode`, the indexer's outcome keys exist
-only in its answers.
+`root` the tree's root there; a batch's `bedrock_status` is the Zone SDK's word for where it
+stands on Bedrock: `pending` (published, no Bedrock block yet), `adopted` (in a block on the
+current branch) or `finalized` (`l1_slot` the L1 slot that finalized it, `null` before); a
+membership is `active` (its leaf is in the tree and it proves, through its grace period
+included) or `removed` for `expired`, `slashed` or `erased`. 32-byte values are hex,
+little-endian. Counts end in `_count`. Every key is always present: a value that does not
+apply is `null`, never absent.
 
 `/` adds `zone_channel_id`, `lez_source`, `first_lez_block_id`, `lez_events` (the program's
 events applied: `registered`, `extended`, `slashed`, `erased`), `private_transaction_count`
@@ -233,25 +235,24 @@ not have, and the reader logs a warning; the ones under other programs are skipp
 `tree` (`active_leaf_count`, `removed_leaf_count`, and `changes` the rules made beyond the one
 insert per `Registered`: `removed_expired` by the LEZ clock, `removed_ended` by a slash or an
 erase while active, `reinserted` by an `Extended` that landed after the reader had expired the
-leaf), `pending_change_count` (waiting for the next batch), `batch_count` (final tier and
-view together), the outcome counts and `stall` (section "Run an indexer"), `replay_root`,
-`in_flight` (the message id of our batch no Bedrock block holds yet, `null` otherwise),
-`newest_published` and `newest_finalized` (root and `to_lez_block_id` of the newest applied
-batch, any and in the final tier).
+leaf), `pending_change_count` (waiting for the next batch), `batch_count` (batches applied,
+final tier and view together), `stall` (section "Run an indexer"), `in_flight` (the message
+id of our batch no Bedrock block holds yet, `null` otherwise), `orphaned_count` (publishes of
+ours a reorg dropped, published again), `newest_published` and `newest_finalized` (root and
+`to_lez_block_id` of the newest applied batch, any and finalized).
 
-`/roots` lists the roots by recency: first the LEZ head when changes wait that no batch
-carries yet (`batches` empty, `changes` those), then one entry per run of batches carrying
-the same root. An entry carries the `root`, the LEZ blocks it stood for (`from_lez_block_id`
-of the batch that produced it to `to_lez_block_id` of the newest batch carrying it),
-`changes`, the tree changes that made the root in order (`kind` `insert` with the
-`rate_commitment` inserted or `remove` with `null`, and the `leaf_index`), and `batches`,
+`/roots` lists the roots batches carry, newest first, one entry per run of batches carrying
+the same root: the `root`, `to_lez_block_id` of the newest batch carrying it, and `batches`,
 every batch of the run, the producing one first, each with `msg_id`, `parent_msg`,
-`from_lez_block_id`, `to_lez_block_id`, `root`, `changes`, `finalized`, `l1_slot`, `outcome`
-and `error` (heartbeats carry the root further, their span is the proof). A root the tree comes back to
-(a leaf inserted then removed empties its slot again) is a new entry, so the window is the
-newest roots, not the newest values. A validator reads its policy off `changes`: the roots
-from the newest back to the newest whose `changes` remove a leaf are the ones no removed
-member can still prove under; older roots in the window still hold that leaf.
+`from_lez_block_id`, `to_lez_block_id`, `root`, `changes` (the tree changes it made in order:
+`kind` `insert` with the `rate_commitment` inserted or `remove` with `null`, and the
+`leaf_index`; the producing batch's made the root, heartbeats carry it further with none),
+`bedrock_status` and `l1_slot`. The head's own root, ahead of the batches while changes wait,
+is `head.root`. A root the tree comes back to (a leaf inserted then removed empties its slot
+again) is a new entry, so the window is the newest roots, not the newest values. A validator
+reads its policy off the producing batch's `changes`: the roots from the newest back to the
+newest that removes a leaf are the ones no removed member can still prove under; older roots
+in the window still hold that leaf.
 
 `/merkle_proof` answers 404 for an unknown leaf index or identity commitment. The answer
 carries the membership (`leaf_index`, `id_commitment`, `active`, `registered_at_lez_block_id`,
@@ -478,9 +479,9 @@ batch stays `in_flight` (block production and mempool propagation).
   (keep `key.hex`), start again.
 - `WARNING the final tier is frozen at batch msg M (L1 slot S): ...` at start, or a batch
   `PARKED` in the log: a finalized batch did not apply on the final tier (its error says
-  which check), every later one parks after it. On the indexer that is its outcome on the
-  channel; on the sequencer it means its own batch was malformed. Only a new channel mends
-  it.
+  which check), every later one parks after it; `/` shows it as `stall`. On the indexer that
+  is what it holds against the channel; on the sequencer it means its own batch was malformed. Only a
+  new channel mends it.
 - `LEZ unreachable: getLastBlockId` once in a while: network; the next poll retries, nothing
   to do unless it repeats for long.
 - WSL2: `ngrok http 3000` inside WSL; from a Windows browser `http://localhost:3000` works

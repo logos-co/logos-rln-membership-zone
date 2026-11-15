@@ -384,6 +384,7 @@ impl ChainState {
     }
 
     /// The root the head's replay is at.
+    #[cfg(test)]
     pub fn head_root(&self) -> [u8; 32] {
         self.folds
             .last()

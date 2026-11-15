@@ -50,8 +50,8 @@ say "leaf $leaf_index slashed at LEZ block $removed_at, root $root"
 # changes remove the leaf.
 say "waiting for the batch removing leaf $leaf_index (root $root)"
 status=$(root_wait_published \
-    '.root == $r and .from_lez_block_id <= $b and .to_lez_block_id >= $b
-        and any(.changes[]; .kind == "remove" and .leaf_index == $leaf)' \
+    '.root == $r and .batches[0].from_lez_block_id <= $b and .to_lez_block_id >= $b
+        and any(.batches[0].changes[]; .kind == "remove" and .leaf_index == $leaf)' \
     --arg r "$root" --argjson b "$removed_at" --argjson leaf "$leaf_index") \
     || die "no batch removing leaf $leaf_index after the slash within 30 minutes"
 say "slash done: leaf $leaf_index is removed in a root a batch carries"

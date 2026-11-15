@@ -144,7 +144,7 @@ the following sections specify each part.
 | Registration program | LEZ | configuration account, escrow, membership accounts | runs when the LEZ Sequencer executes a transaction that calls it, directly or through a chained call |
 | Bedrock | Logos Blockchain nodes | the LEZ channel (LEZ blocks) and the Zone channel (batches), totally ordered and finalized up to the latest immutable block (LIB); the notes that pay Mantle Transaction fees | lets anyone read every channel; lets only accredited keys write to their channel |
 | Zone sequencer | the Zone operator's hosts, one per accredited key | the tree, node wallet notes, the batch in flight | reads LEZ blocks from the LEZ Sequencer; publishes batches to the Zone channel on Bedrock; takes no input from any Module |
-| Zone indexer | any node, local to a Module or as a service; holds no accredited key | the tree, the channel as a final tier and a view with the root `(root_after, to_lez_block_id)` of every applied batch, the parked batches and the first one that froze its final tier as evidence | reads the finalized LEZ blocks from the LEZ Sequencer; follows the Zone channel on Bedrock and judges each batch against what it derived; serves roots, Merkle proof paths, membership state and outcomes to Modules ([Zone Indexer](#zone-indexer)) |
+| Zone indexer | any node, local to a Module or as a service; holds no accredited key | the tree, the channel as a final tier and a view with the root `(root_after, to_lez_block_id)` of every applied batch, the parked batches and the first one that froze its final tier as evidence | reads the finalized LEZ blocks from the LEZ Sequencer; follows the Zone channel on Bedrock and judges each batch against what it derived; serves roots, Merkle proof paths, membership state and the stall to Modules ([Zone Indexer](#zone-indexer)) |
 | Slasher | any host | a funded account on LEZ | gets `recovered_secret` from its Module; sends `Slash` to LEZ |
 
 The Module acts as proof generator when it calls `generate_proof`
@@ -405,7 +405,8 @@ A Zone indexer is the registry access of Modules ([Module Requirements](#module-
 It serves:
 
 - the valid roots: the `root_after` and `to_lez_block_id` of every applied batch within the valid-root window,
-  each flagged finalized or not so a Module picks its reference depth, and the outcome of any batch;
+  each with where it stands on Bedrock (pending, adopted or finalized, the Zone SDK's words) so a Module picks its reference depth,
+  and the first parked batch of the final tier with its cause (the stall), as evidence;
 - for a leaf, its Merkle proof path at the newest valid root;
 - for an identity commitment, the membership state it reads from LEZ
   (open or closed, and how it closed, `leaf_index`, `rate_limit`, `expiry_timestamp_ms`, `holder`),

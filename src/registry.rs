@@ -69,8 +69,11 @@ impl ChangeRecord {
     }
 }
 
-/// A channel entry as the API shows it: `finalized` (in the final tier, with the L1 slot that
-/// finalized it) or in the view.
+/// A channel entry as the API shows it. Where it stands on Bedrock is the Zone SDK's word:
+/// `pending` (a publish of ours no Bedrock block holds yet), `adopted` (in a Bedrock block on
+/// the current branch: the view) or `finalized` (the final tier, with the L1 slot of the block
+/// that finalized it). The fold's outcome and error stay internal (LEZ `AcceptOutcome` names):
+/// the API serves the applied entries and the `stall`.
 #[derive(Debug, Clone, Serialize)]
 pub struct EntryView {
     pub msg_id: String,
@@ -80,12 +83,12 @@ pub struct EntryView {
     pub to_lez_block_id: Option<u64>,
     pub root: Option<String>,
     pub changes: Vec<ChangeRecord>,
-    #[serde(rename = "finalized")]
-    pub is_finalized: bool,
+    pub bedrock_status: &'static str,
     /// The L1 slot of the block that finalized it; `null` before.
     pub l1_slot: Option<u64>,
-    /// The fold's outcome: `applied`, `parked` or `retryable_failure` (LEZ `AcceptOutcome`).
+    #[serde(skip)]
     pub outcome: &'static str,
+    #[serde(skip)]
     pub error: Option<BatchIngestError>,
 }
 
@@ -95,6 +98,7 @@ impl EntryView {
         parent: [u8; 32],
         batch: Option<&Batch>,
         l1_slot: Option<u64>,
+        pending: bool,
         error: Option<&BatchIngestError>,
     ) -> Self {
         Self {
@@ -109,7 +113,11 @@ impl EntryView {
                     .filter_map(ChangeRecord::from_change)
                     .collect()
             }),
-            is_finalized: l1_slot.is_some(),
+            bedrock_status: match (l1_slot, pending) {
+                (Some(_), _) => "finalized",
+                (None, true) => "pending",
+                (None, false) => "adopted",
+            },
             l1_slot,
             outcome: match error {
                 None if batch.is_some() => "applied",
@@ -161,6 +169,8 @@ pub struct Registry {
     pub pending_changes: Vec<(u64, Change)>,
     /// Our own publishes not seen in a Bedrock block yet, in publish order.
     own_pending: Vec<[u8; 32]>,
+    /// Publishes of ours a Bedrock reorg dropped (the SDK's `orphaned`), published again.
+    orphaned: u64,
     anchor: Option<ZoneAnchorRecord>,
     /// The Zone SDK checkpoint, as JSON.
     checkpoint: Option<Value>,
@@ -241,6 +251,7 @@ impl Registry {
             .iter()
             .map(|h| crate::reader::parse_32(h))
             .collect::<Result<_>>()?;
+        let orphaned = get("orphaned").and_then(|v| v.as_u64()).unwrap_or(0);
         let anchor = get("anchor")
             .map(serde_json::from_value)
             .transpose()
@@ -270,6 +281,7 @@ impl Registry {
             first_lez_block_id,
             pending_changes,
             own_pending,
+            orphaned,
             anchor,
             checkpoint,
             indexer,
@@ -293,6 +305,7 @@ impl Registry {
             "stall": self.chain.stall(),
             "anchor": self.anchor,
             "own_pending": self.own_pending.iter().map(hex::encode).collect::<Vec<_>>(),
+            "orphaned": self.orphaned,
             "pending_changes": pending_changes,
             "checkpoint": self.checkpoint,
         });
@@ -409,6 +422,7 @@ impl Registry {
     pub fn apply_conflict(&mut self, canonical: Vec<ChannelEntry>) -> Vec<ChannelEntry> {
         let judge = self.indexer.then_some(&self.head as &dyn Judge);
         let dropped = self.chain.apply_conflict(canonical, judge);
+        self.orphaned += dropped.len() as u64;
         for entry in &dropped {
             let msg: [u8; 32] = entry.msg.into();
             self.own_pending.retain(|m| *m != msg);
@@ -449,6 +463,11 @@ impl Registry {
         self.own_pending.last().copied()
     }
 
+    /// How many publishes of ours a Bedrock reorg dropped (published again each time).
+    pub fn orphaned_count(&self) -> u64 {
+        self.orphaned
+    }
+
     /// The indexer folds again what the judge could not decide: LEZ read further.
     pub fn retry_folds(&mut self) -> usize {
         let decided = self.chain.retry_folds(Some(&self.head));
@@ -473,16 +492,19 @@ impl Registry {
                     f.parent,
                     f.batch().as_ref(),
                     Some(f.l1_slot),
+                    false,
                     f.error.as_ref(),
                 )
             })
             .collect();
         for (entry, outcome) in self.chain.view_outcomes() {
+            let msg: [u8; 32] = entry.msg.into();
             out.push(EntryView::new(
-                entry.msg.into(),
+                msg,
                 entry.parent.into(),
                 entry.batch.as_ref(),
                 None,
+                self.own_pending.contains(&msg),
                 outcome.as_ref().err(),
             ));
         }
@@ -513,10 +535,9 @@ impl Registry {
 
     /// The newest applied entry, a finalized one only when `finalized_only`.
     pub fn newest(&self, finalized_only: bool) -> Option<EntryView> {
-        self.entries()
-            .into_iter()
-            .rev()
-            .find(|e| e.outcome == "applied" && (e.is_finalized || !finalized_only))
+        self.entries().into_iter().rev().find(|e| {
+            e.outcome == "applied" && (e.bedrock_status == "finalized" || !finalized_only)
+        })
     }
 }
 
@@ -574,11 +595,11 @@ mod test {
         assert_eq!(registry.covered_to(), 2);
         assert_eq!(registry.next_batch(), None);
         assert_eq!(registry.in_flight(), Some([1; 32]));
-        assert!(!registry.entries()[0].is_finalized);
+        assert_eq!(registry.entries()[0].bedrock_status, "pending");
         // The channel tip is our batch: adopted.
         assert_eq!(registry.mark_adopted_up_to([1; 32]), vec![[1; 32]]);
         assert_eq!(registry.in_flight(), None);
-        assert!(!registry.entries()[0].is_finalized);
+        assert_eq!(registry.entries()[0].bedrock_status, "adopted");
         // Finality: into the final tier, the anchor moves.
         let entry = ChannelEntry {
             msg: msg(1),
@@ -589,7 +610,7 @@ mod test {
             registry.apply_finalized(entry, 500),
             Some(AcceptOutcome::Applied(_))
         ));
-        assert!(registry.entries()[0].is_finalized);
+        assert_eq!(registry.entries()[0].bedrock_status, "finalized");
         assert_eq!(registry.entries()[0].l1_slot, Some(500));
         assert_eq!(registry.anchor().unwrap().slot, 500);
         assert_eq!(registry.anchor().unwrap().to_lez_block_id, 2);
@@ -684,7 +705,7 @@ mod test {
             batch: Some(honest.clone()),
         }]);
         assert_eq!(registry.entries()[0].outcome, "applied");
-        assert!(!registry.entries()[0].is_finalized);
+        assert_eq!(registry.entries()[0].bedrock_status, "adopted");
         assert!(registry.pending_changes.is_empty());
         // A batch for blocks the indexer has not read yet: it replays (a heartbeat keeps the
         // root), so only the judge is missing; retryable, decided once LEZ is read.
@@ -738,6 +759,7 @@ mod test {
             },
         ]);
         assert_eq!(dropped.len(), 1);
+        assert_eq!(registry.orphaned_count(), 1);
         assert_eq!(registry.entries()[1].outcome, "applied");
         assert_eq!(registry.covered_to(), 3);
         assert_eq!(registry.chain.head_root(), root_3);
