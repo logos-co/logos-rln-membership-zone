@@ -45,7 +45,7 @@ say "fetching the Zone's roots and verifying"
 ZONE_ROOTS=$(zone /roots/5) || die "cannot read the zone's roots"
 export ZONE_ROOTS
 "$verify_proof" --proof "$proof_file" >&2 \
-    || die "verify_proof refused a proof over the Zone's own path (its verdict is above)"
+    || die "verify_proof refused a proof over the Zone's own path (its output is above)"
 
 say "verifying a tampered proof (another message, same proof) must fail"
 tampered="$E2E_STATE/proof-$leaf_index-tampered.json"

@@ -105,7 +105,7 @@ the following sections specify each part.
 - LEZ blocks are inscribed on Bedrock in the LEZ channel.
   A LEZ block has no finality of its own: it is final once the Bedrock block holding its inscription is.
 - The LEZ Sequencer serves the LEZ blocks it has closed before they are finalized on Bedrock,
-  and marks each block's standing (`bedrock_status`: pending until the Bedrock block holding its inscription is final).
+  and marks each block's `bedrock_status`: pending until the Bedrock block holding its inscription is finalized.
   A closed block is the LEZ Sequencer's own statement: a restart can produce a pending block again with other contents,
   so a reader that takes closed blocks checks that each block chains on the one before (`prev_block_hash`)
   and goes back to the last block both agree on when it does not;
@@ -391,7 +391,7 @@ A batch applies only when:
 
 A batch that applies becomes the tip, and `(root_after, to_lez_block_id)` joins the valid roots.
 A batch that fails is parked: the tip freezes there, every later batch parks after it,
-and the first parked batch of the final tier is kept with its cause as the Zone indexer's standing on the channel.
+and the first parked batch of the final tier is kept with its cause as the stall (LEZ `StallReason`).
 A parked batch is public evidence against the Zone operator:
 the batch, signed by an accredited key, and the LEZ blocks it should match.
 Its root is never a valid root: a Zone sequencer that leaves a removal out

@@ -247,7 +247,7 @@ pub struct FinalEntry {
     pub l1_slot: u64,
     /// The batch, prost bytes in hex; `None` for an entry that carried none.
     pub batch: Option<String>,
-    /// The final tier's verdict: `None` applied, `Some` the error it parked on.
+    /// The final tier's outcome: `None` applied, `Some` the error it parked on.
     pub error: Option<BatchIngestError>,
 }
 
@@ -360,7 +360,7 @@ impl ChainState {
         &self.view
     }
 
-    /// The verdict of every view entry, in view order.
+    /// The outcome of every view entry, in view order.
     pub fn view_outcomes(
         &self,
     ) -> impl Iterator<Item = (&ChannelEntry, &Result<Vec<Change>, BatchIngestError>)> {
@@ -617,7 +617,7 @@ impl ChainState {
     }
 
     /// The final tier's batches still waiting for the judge, in order; the first still
-    /// undecided keeps the ones after it waiting. Returns how many got a verdict.
+    /// undecided keeps the ones after it waiting. Returns how many got an outcome.
     fn retry_final(&mut self, judge: Option<&dyn Judge>) -> usize {
         let mut decided = 0;
         for i in 0..self.final_entries.len() {
@@ -669,7 +669,7 @@ impl ChainState {
 
     /// Judges again what the judge could not decide yet, once LEZ is read further: the final
     /// tier's waiting batches first, then the view from its first undecided fold. Returns how
-    /// many entries got a verdict.
+    /// many entries got an outcome.
     pub fn retry_folds(&mut self, judge: Option<&dyn Judge>) -> usize {
         let final_decided = self.retry_final(judge);
         let first = if final_decided > 0 {
@@ -982,9 +982,9 @@ mod test {
             roots: vec![(2, [5; 32])],
             read_to: 2,
         };
-        let verdict = fresh.apply_finalized(entry(1, 0, Some(b1)), 100, Some(&liar));
+        let outcome = fresh.apply_finalized(entry(1, 0, Some(b1)), 100, Some(&liar));
         assert!(matches!(
-            verdict,
+            outcome,
             Some(AcceptOutcome::Parked(
                 BatchIngestError::DerivationMismatch { .. }
             ))

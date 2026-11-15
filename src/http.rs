@@ -1,11 +1,11 @@
 //! The HTTP API a Module's node reads (its registry access): the roots with the changes that
-//! made them and the standing of their batches on Bedrock, the Merkle proof path of a leaf at
+//! made them and their batches on Bedrock, finalized or not, the Merkle proof path of a leaf at
 //! the tree of the LEZ head, a membership's state.
 //! 32-byte values are hex, little-endian (RLN-API Appendix B). Every answer carries `head`:
 //! `lez_block_id` and `lez_timestamp_ms`, the LEZ block the tree is at, and the tree's `root`
 //! there. A batch is `finalized` (in the final tier, with the `l1_slot` that finalized it) or
 //! not (in the view: a Bedrock block holds it, or this sequencer just published it, see
-//! `in_flight` in `/`); its `outcome` is the fold's verdict (`applied`, `parked`,
+//! `in_flight` in `/`); its `outcome` is the fold's outcome (`applied`, `parked`,
 //! `retryable_failure`, LEZ's `AcceptOutcome` names) with `error` when it is not applied.
 //! Every key is always present: a value that does not apply is `null`, never absent.
 
@@ -46,7 +46,7 @@ pub fn router(state: AppState) -> Router {
 /// A root of the valid-root window as the API shows it: the LEZ blocks it stood for
 /// (`from_lez_block_id` of the batch that produced it to `to_lez_block_id` of the newest batch
 /// carrying it), the `changes` that made it, and `batches`, every batch of the run, the
-/// producing one first with its standing on Bedrock.
+/// producing one first, each flagged `finalized` or not.
 #[derive(Serialize)]
 struct RootWindowEntry {
     root: String,

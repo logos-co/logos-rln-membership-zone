@@ -38,7 +38,7 @@ struct Args {
     #[arg(long, default_value_t = 5)]
     window_size: usize,
     /// Count only the roots whose batch is finalized on Bedrock (hours behind); otherwise every
-    /// root a batch carries counts, final or not. The LEZ head's root (in no batch yet) never
+    /// root a batch carries counts, finalized or not. The LEZ head's root (in no batch yet) never
     /// counts.
     #[arg(long)]
     finalized_only: bool,
@@ -82,18 +82,18 @@ struct BatchEntry {
 }
 
 impl RootEntry {
-    /// Whether the root counts: a batch carries it, final when asked.
+    /// Whether the root counts: a batch carries it, finalized when asked.
     fn counts(&self, finalized_only: bool) -> bool {
         self.batches
             .first()
             .is_some_and(|b| b.is_finalized || !finalized_only)
     }
 
-    fn standing(&self) -> &'static str {
+    fn describe(&self) -> &'static str {
         match self.batches.first() {
             None => "the LEZ head, in no batch yet",
             Some(b) if b.is_finalized => "finalized on Bedrock",
-            Some(_) => "in a batch, not final yet",
+            Some(_) => "in a batch, not finalized yet",
         }
     }
 }
@@ -186,14 +186,14 @@ async fn run(args: &Args) -> Result<bool> {
             ""
         }
     );
-    // Where the proof's root stands, said before the verdict so a refusal reads with its cause.
+    // Where the proof's root stands, said before the outcome so a refusal reads with its cause.
     let root = fr_to_hex(&values.root());
     match window.roots.iter().find(|e| e.root == root) {
         Some(entry) => {
             println!(
                 "proof root {root} = the Zone's root to LEZ block {} ({})",
                 entry.to_lez_block_id,
-                entry.standing()
+                entry.describe()
             );
             if !entry.counts(args.finalized_only) {
                 println!(
@@ -217,7 +217,7 @@ async fn run(args: &Args) -> Result<bool> {
         .graph(default_graph_single().clone())
         .zkey(default_zkey_single().clone())
         .build();
-    // `Ok(false)` is the zkSNARK's verdict; `Err` is a public input that does not match the
+    // `Ok(false)` is the zkSNARK's outcome; `Err` is a public input that does not match the
     // proof (the signal, the roots), a refusal for a validator all the same.
     let verified = match rln.verify_with_roots(&proof, &values, &x, &valid_roots) {
         Ok(verified) => verified,

@@ -84,7 +84,7 @@ pub struct EntryView {
     pub is_finalized: bool,
     /// The L1 slot of the block that finalized it; `null` before.
     pub l1_slot: Option<u64>,
-    /// The fold's verdict: `applied`, `parked` or `retryable_failure` (LEZ `AcceptOutcome`).
+    /// The fold's outcome: `applied`, `parked` or `retryable_failure` (LEZ `AcceptOutcome`).
     pub outcome: &'static str,
     pub error: Option<BatchIngestError>,
 }

@@ -11,7 +11,7 @@ runs the node; the Mac side is only where the code is edited.
 | --- | --- | --- |
 | Logos Blockchain node (Bedrock, L1) | 8080 | HTTP API: wallet, mempool, blocks. The Zone SDK publishes batches through it and pays fees from its wallet. Never expose it: the API has no auth and reaches the wallet. |
 | Zone sequencer, `zone` | 3000 | Reads LEZ blocks, derives the tree, publishes one batch per change or heartbeat on its channel, serves `/roots`, `/merkle_proof`, `/leaves`. |
-| Zone indexer, `zone --mode indexer` | 3001 | Optional, beside the sequencer: derives the same tree, reads the channel's finalized batches and checks each against it, serves the same API with the verdicts. |
+| Zone indexer, `zone --mode indexer` | 3001 | Optional, beside the sequencer: derives the same tree, reads the channel's finalized batches and checks each against it, serves the same API with the outcomes. |
 | LEZ Sequencer | 3040 or public | Source of closed LEZ blocks (`getBlockRange`). Default: `https://testnet.lez.logos.co`. Optional: your own, section 5. |
 
 Data flow: LEZ Sequencer (blocks, transactions) -> Zone sequencer (tree, batches) ->
@@ -173,7 +173,7 @@ start slot to give) and derives the tree from LEZ like the sequencer, but from t
 final on Bedrock only (LEZ's `bedrock_status`), so its tree can never be rewritten under it.
 Every batch of the channel is folded the way LEZ folds a block, with the indexer as judge: it
 must continue the tip (`from_lez_block_id`), its `changes` must replay to its `root_after`, and
-that root must be the indexer's own tree at `to_lez_block_id`. The verdict is LEZ's
+that root must be the indexer's own tree at `to_lez_block_id`. The outcome is LEZ's
 `AcceptOutcome`: `applied`; `parked` with the `error` (`unexpected_block_range`,
 `root_mismatch`, `derivation_mismatch`, `change_does_not_apply`, `deserialize`), after which
 the tip is frozen and every later batch parks too, the first one recorded as the `stall`; or
@@ -189,7 +189,7 @@ MODE=indexer DATA_DIR=data-indexer HTTP_ADDR=127.0.0.1:3001 cargo run
 
 `/` reports `applied_batch_count`, `parked_batch_count`, `retryable_failure_count`, `stall`
 and `replay_root` (the root the head's replay is at) in both modes; every batch in `/roots`
-carries `outcome` and `error`. The sequencer trusts its own batches, so its verdicts are
+carries `outcome` and `error`. The sequencer trusts its own batches, so its outcomes are
 `applied` unless a batch was malformed. Its `/roots` entry 0 is the LEZ head when changes wait
 that no batch carries yet (no `batches`), so a consumer that wants the live tree takes that one
 and a consumer that wants only what the channel finalized skips it
@@ -198,7 +198,7 @@ and a consumer that wants only what the channel finalized skips it
 An indexer is meant to run on and off: stopped for days, started to check what finalized
 since. Nothing it decides depends on being up: the final tier is re-read from the anchor on
 every start, the view comes back from the SDK, a batch it could not judge yet is judged when
-LEZ finality reaches it, and a missed inscription cannot stick as a wrong verdict.
+LEZ finality reaches it, and a missed inscription cannot stick as a wrong outcome.
 
 ### HTTP API
 
@@ -217,7 +217,7 @@ Words used the same way in every answer: `head` is where the tree is, `lez_block
 block that finalized it) or not (`l1_slot` `null`); a membership is `active` (its leaf is in the tree and it proves, through its
 grace period included) or `removed` for `expired`, `slashed` or `erased`. 32-byte values are
 hex, little-endian. Counts end in `_count`. Every key is always present: a value that does not
-apply is `null`, never absent; the one exception is `mode`, the indexer's verdict keys exist
+apply is `null`, never absent; the one exception is `mode`, the indexer's outcome keys exist
 only in its answers.
 
 `/` adds `zone_channel_id`, `lez_source`, `first_lez_block_id`, `lez_events` (the program's
@@ -229,7 +229,7 @@ not have, and the reader logs a warning; the ones under other programs are skipp
 insert per `Registered`: `removed_expired` by the LEZ clock, `removed_ended` by a slash or an
 erase while active, `reinserted` by an `Extended` that landed after the reader had expired the
 leaf), `pending_change_count` (waiting for the next batch), `batch_count` (final tier and
-view together), the verdict counts and `stall` (section "Run an indexer"), `replay_root`,
+view together), the outcome counts and `stall` (section "Run an indexer"), `replay_root`,
 `in_flight` (the message id of our batch no Bedrock block holds yet, `null` otherwise),
 `newest_published` and `newest_finalized` (root and `to_lez_block_id` of the newest applied
 batch, any and in the final tier).
@@ -311,7 +311,7 @@ missing a change until the decoder is fixed and the sequencer restarted once wit
 LEZ). A change found again in a block after the last one covered goes into the next batch; a
 change in a block already covered is in no batch's change list, so the next batch carries the
 corrected root whose `changes` do not account for it (a Zone indexer replaying
-the batches would reject it; the rebuild is an operator's repair, not a protocol path).
+the batches would park it; the rebuild is an operator's repair, not a protocol path).
 
 Check the source by hand:
 
@@ -468,7 +468,7 @@ batch stays `in_flight` (block production and mempool propagation).
   (keep `key.hex`), start again.
 - `WARNING the final tier is frozen at batch msg M (L1 slot S): ...` at start, or a batch
   `PARKED` in the log: a finalized batch did not apply on the final tier (its error says
-  which check), every later one parks after it. On the indexer that is its verdict on the
+  which check), every later one parks after it. On the indexer that is its outcome on the
   channel; on the sequencer it means its own batch was malformed. Only a new channel mends
   it.
 - `LEZ unreachable: getLastBlockId` once in a while: network; the next poll retries, nothing
