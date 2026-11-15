@@ -178,11 +178,12 @@ its tree can never be rewritten under it.
 Every batch of the channel is folded the way LEZ folds a block, with the indexer as judge: it
 must continue the tip (`from_lez_block_id`), its `changes` must replay to its `root_after`, and
 that root must be the indexer's own tree at `to_lez_block_id`. The outcome is LEZ's
-`AcceptOutcome`: `applied`; `parked` with the `error` (`unexpected_block_range`,
-`root_mismatch`, `derivation_mismatch`, `change_does_not_apply`, `deserialize`), after which
+`AcceptOutcome`: `applied`; `parked` with the `error` (`kind` = `unexpected_block_id`,
+`hash_mismatch`, `derivation_mismatch` or `deserialize`, LEZ's `BlockIngestError` names), after which
 the tip is frozen and every later batch parks too, the first one recorded as the `stall`; or
 `retryable_failure` (`lez_not_read`: the finalized LEZ blocks have not reached the batch's
-`to` yet), judged again at every LEZ poll, about when the batch itself is final on L1. No
+`to` yet; every batch behind an undecided one waits with it), judged again at every LEZ poll,
+about when the batch itself is final on L1. No
 funds, no publishing: only the node's HTTP API and the LEZ source. Run it beside the
 sequencer with its own data dir and port:
 

@@ -729,7 +729,17 @@ impl ChainState {
             .map_or((&self.final_state, self.final_tip.as_ref()), |fold| {
                 (&fold.state, fold.tip.as_ref())
             });
+        // Behind an entry the judge has still to decide nothing can be judged: the tip it would
+        // chain on is not confirmed yet (as the final tier waits in `apply_final_batch`).
+        let waiting = self.folds.last().is_some_and(|fold| {
+            fold.outcome
+                .as_ref()
+                .is_err_and(BatchIngestError::is_retryable)
+        });
         let outcome = match &entry.batch {
+            Some(batch) if waiting => Err(BatchIngestError::LezNotRead {
+                to: batch.to_lez_block_id,
+            }),
             Some(batch) => apply_batch(self.first_lez_block_id, tip, batch, state, judge)
                 .map(|next| (next, Tip::from(batch), batch.changes.clone())),
             None => Err(BatchIngestError::Deserialize(
@@ -925,15 +935,23 @@ mod test {
         let root_2 = Tip::from(&b2).root;
         let mut oracle = Oracle {
             roots: vec![(2, root_1), (4, root_2)],
-            read_to: 2,
+            read_to: 0,
         };
         let mut chain = ChainState::new(1);
 
-        // Entry 1 chains, LEZ read to 2: applied. Entry 2 needs block 4: undecided, retried.
+        // LEZ not read at all: both entries wait, the second behind the first (it cannot park
+        // on a tip the judge has not confirmed), the head stays empty.
         chain.apply_extension(
             vec![entry(1, 0, Some(b1.clone())), entry(2, 1, Some(b2.clone()))],
             Some(&oracle),
         );
+        let outcomes: Vec<_> = chain.view_outcomes().map(|(_, o)| o.clone()).collect();
+        assert_eq!(outcomes[0], Err(BatchIngestError::LezNotRead { to: 2 }));
+        assert_eq!(outcomes[1], Err(BatchIngestError::LezNotRead { to: 4 }));
+        assert_eq!(chain.head_tip(), None);
+        // LEZ read to 2: entry 1 applied. Entry 2 needs block 4: undecided, retried.
+        oracle.read_to = 2;
+        assert_eq!(chain.retry_folds(Some(&oracle)), 1);
         let outcomes: Vec<_> = chain.view_outcomes().map(|(_, o)| o.clone()).collect();
         assert!(outcomes[0].is_ok());
         assert_eq!(outcomes[1], Err(BatchIngestError::LezNotRead { to: 4 }));
