@@ -104,11 +104,14 @@ the following sections specify each part.
 - Bedrock totally orders and finalizes channel inscriptions and keeps them available.
 - LEZ blocks are inscribed on Bedrock in the LEZ channel.
   A LEZ block has no finality of its own: it is final once the Bedrock block holding its inscription is.
-- The LEZ Sequencer serves the LEZ blocks it has closed and does not change one afterwards,
-  also when it inscribes a block again after a Bedrock reorg,
-  which means it stores a block durably before serving it.
-  Every LEZ consumer already relies on this, so a reader takes LEZ blocks and their events from the LEZ Sequencer
-  without waiting for their finality; a reader that trusts nobody re-executes the LEZ channel on Bedrock instead,
+- The LEZ Sequencer serves the LEZ blocks it has closed before they are finalized on Bedrock,
+  and marks each block's standing (`bedrock_status`: pending until the Bedrock block holding its inscription is final).
+  A closed block is the LEZ Sequencer's own statement: a restart can produce a pending block again with other contents,
+  so a reader that takes closed blocks checks that each block chains on the one before (`prev_block_hash`)
+  and goes back to the last block both agree on when it does not;
+  a finalized block never changes.
+  The Zone sequencer takes closed blocks, for the latest state; every Zone indexer takes only finalized blocks,
+  so its tree can never be rewritten under it; a reader that trusts nobody re-executes the LEZ channel on Bedrock instead,
   as the LEZ Indexer does.
   A LEZ block holds its transactions only; the events a program emits come from executing them,
   are not covered by the block hash nor inscribed on Bedrock, and are served by whoever executed the block.
@@ -141,7 +144,7 @@ the following sections specify each part.
 | Registration program | LEZ | configuration account, escrow, membership accounts | runs when the LEZ Sequencer executes a transaction that calls it, directly or through a chained call |
 | Bedrock | Logos Blockchain nodes | the LEZ channel (LEZ blocks) and the Zone channel (batches), totally ordered and finalized up to the latest immutable block (LIB); the notes that pay Mantle Transaction fees | lets anyone read every channel; lets only accredited keys write to their channel |
 | Zone sequencer | the Zone operator's hosts, one per accredited key | the tree, node wallet notes, the batch in flight | reads LEZ blocks from the LEZ Sequencer; publishes batches to the Zone channel on Bedrock; takes no input from any Module |
-| Zone indexer | any node, local to a Module or as a service; holds no accredited key | the tree, root history `(root_after, to_lez_block_id)`, Rejected batches as evidence | reads LEZ blocks from the LEZ Sequencer; reads batches from Bedrock and checks each against what it derived; serves roots, Merkle proof paths, membership state and verdicts to Modules ([Zone Indexer](#zone-indexer)) |
+| Zone indexer | any node, local to a Module or as a service; holds no accredited key | the tree, the channel as a final tier and a view with the root `(root_after, to_lez_block_id)` of every applied batch, the parked batches and the first one that froze its final tier as evidence | reads the finalized LEZ blocks from the LEZ Sequencer; follows the Zone channel on Bedrock and judges each batch against what it derived; serves roots, Merkle proof paths, membership state and outcomes to Modules ([Zone Indexer](#zone-indexer)) |
 | Slasher | any host | a funded account on LEZ | gets `recovered_secret` from its Module; sends `Slash` to LEZ |
 
 The Module acts as proof generator when it calls `generate_proof`
@@ -226,15 +229,15 @@ flowchart LR
 | 2 | The Module sends `Register`, `Extend` or `Erase` to the LEZ Sequencer, signed by the funded account (`Register`) or the `holder` (`Extend`, `Erase`). | `Register` once per membership; `Extend` in the grace period; `Erase` after the withdrawal delay. |
 | 3 | The LEZ Sequencer executes it with the registration program; for `Register`: the checks, the deposit to the escrow, `registration_fee` to the Zone operator, a new `leaf_index`, and a `Registered` event. | In the same LEZ block. |
 | 4 | The LEZ Sequencer inscribes the LEZ block in the LEZ channel on Bedrock. | Every LEZ block. |
-| 5 | Every reader (the Zone sequencer, every Zone indexer) reads the LEZ block and the registration program's events from the LEZ Sequencer and applies the derivation rules. | As soon as a LEZ block is closed. |
+| 5 | Every reader (the Zone sequencer, every Zone indexer) reads the LEZ block and the registration program's events from the LEZ Sequencer and applies the derivation rules. | The Zone sequencer as soon as a LEZ block is closed; a Zone indexer once the block is finalized on Bedrock. |
 | 6 | The Zone sequencer publishes a batch with the changes and the root to the Zone channel. | On its turn to write, covering every LEZ block not yet covered. |
-| 7 | The Zone indexer reads the batch from the Zone channel, compares it with the changes and the root it derived at step 5, and marks it Verified or Rejected. | Once the batch is in a Bedrock block; Bedrock finality confirms it about 60 min later on testnet. |
+| 7 | The Zone indexer reads the batch from the Zone channel, compares it with the changes and the root it derived at step 5, and applies it or parks it. | Once the batch is in a Bedrock block, provisionally; for good once Bedrock finality reaches it and the LEZ blocks it covers. |
 | 8 | The Module reads from its registry access the newest valid root (a batch root deep enough on Bedrock), its Merkle proof path at that root and its membership state; the membership is `MEMBERSHIP_ACTIVE` from here. | Once the batch is at the reference depth. |
 | 9 | A Module that starts, or lost its registry access, answers `RLN_ERR_NOT_READY` until its registry access serves a root recent enough. | At start, or after a disconnection. |
 | 10 | The sender's Module, as proof generator, sends a message with its RLN proof; another node's Module, as validator, checks it. | Every message. |
 | 11 | The validator detects a double-signal and hands `recovered_secret`, the identity secret, to a slasher, or sends the `Slash` itself. | When a nullifier repeats with a different `share_x`. |
 | 12 | The slasher sends `Slash{identity_secret}`; the registration program slashes the deposit to the treasury and emits `Slashed`. | As soon as the slasher has the identity secret. |
-| 13 | Every reader applies the LEZ block holding the `Slash` and removes the leaf. | As soon as that block is closed. |
+| 13 | Every reader applies the LEZ block holding the `Slash` and removes the leaf. | The Zone sequencer as soon as that block is closed; a Zone indexer once it is finalized. |
 | 14 | Steps 5-7 run again: the next batch carries `Remove{leaf_index}` for the slashed leaf. | In the next batch. |
 | 15 | Zone indexers check the batch; once it is deep enough, every validator drops the roots from before the removal and stops accepting the slashed leaf. The violator's Module reports `MEMBERSHIP_SLASHED` from its membership state since step 12. | Once that batch is at the reference depth. |
 
@@ -333,7 +336,7 @@ A batch carries only what changes the tree; each leaf's expiry and the reason fo
 - The Zone sequencers, one per accredited key, take turns to write in Mantle's round-robin;
   `posting_timeout` passes a missed turn to the next one.
   On its turn, a Zone sequencer SHOULD publish one batch covering every LEZ block the LEZ Sequencer has closed
-  and no Verified or in-flight batch has covered, when there are changes,
+  and no applied or in-flight batch has covered, when there are changes,
   and an empty batch once `heartbeat_ms` have passed without a batch.
   It SHOULD publish within `max_delay_ms` of the first unpublished change
   (both Zone sequencer configuration, like the fee cap of its node wallet);
@@ -354,14 +357,15 @@ A batch carries only what changes the tree; each leaf's expiry and the reason fo
   since the next batch covers every LEZ block closed in the meantime,
   and a dropped batch invalidates every batch published after it.
 
-Zone indexers mark each batch Verified or Rejected ([Zone Indexer](#zone-indexer)) in Bedrock order,
-and a Zone sequencer checks its own batches the same way,
-so it sees a Rejected batch of its own and publishes again from the last Verified one.
-If a reorg drops or reorders a batch, the Zone sequencer publishes it and every batch after it again, unchanged;
-a batch Rejected on its range because of a reorg is no misbehaviour.
+Every reader keeps the Zone channel the way LEZ keeps its own: a final tier, the inscriptions Bedrock finalized,
+and a view, the unfinalized lineage chained on the last finalized one, the head being the final tier folded over the view.
+Zone indexers apply or park each batch ([Zone Indexer](#zone-indexer)) as they fold it,
+and a Zone sequencer folds its own batches the same way,
+so it sees a parked batch of its own and knows the channel needs a correction.
+If a reorg drops batches from the view, the Zone sequencer publishes them again on the new tip, unchanged, in order.
 If the mempool drops a batch, the Zone sequencer builds it again.
 After a restart, a dropped batch or a switch to another Zone sequencer,
-a Zone sequencer continues from the last Verified batch on the Zone channel, which it reads as a Zone indexer does.
+a Zone sequencer continues from the channel's head, which it reads as a Zone indexer does.
 An outage stops the batches but loses no data or funds:
 every reader keeps following LEZ, and the Zone sequencer resumes from LEZ at any time;
 while it lasts no new root reaches the validators, so new memberships stay `MEMBERSHIP_PENDING` and removals wait.
@@ -369,39 +373,39 @@ The loss of all accredited keys is open.
 
 ## Zone Indexer
 
-A Zone indexer derives the membership set with the Derivation Rules,
-from the blocks and events the LEZ Sequencer serves or, trailing by Bedrock finality,
-from a LEZ Indexer that re-executes the LEZ channel,
-and reads every batch once it is in a Bedrock block, how deep being open, to check it against what it derived.
-It MUST reject a batch unless:
+A Zone indexer derives the membership set with the Derivation Rules
+from the LEZ blocks finalized on Bedrock, as the LEZ Sequencer serves them with their `bedrock_status`
+or as a LEZ Indexer re-executes them from the LEZ channel,
+and folds every batch of the Zone channel the way LEZ folds a block of its own channel,
+once the batch is in a Bedrock block (into the view) and once it is finalized (into the final tier).
+A batch applies only when:
 
-1. **Range.** The batch starts right after the last Verified batch ended
-   (`from_lez_block_id` = its `to_lez_block_id` + 1; the first batch starts at `first_lez_block_id`,
+1. **Range.** The batch starts right after the tip it folds on
+   (`from_lez_block_id` = the tip's `to_lez_block_id` + 1; the first batch starts at `first_lez_block_id`,
    the LEZ block that created `ConfigState`, a parameter of the registry like `zone_channel_id`),
    so no LEZ block is skipped or covered twice.
-2. **Changes.** `changes` equal what the derivation rules give for that range.
-   A LEZ block the Zone indexer cannot read yet only delays the check.
-   An omission is provable censorship.
-3. **Root.** `root_after` equals the root after applying `changes`.
+2. **Changes.** `changes` replay to `root_after` on the tip's tree.
+3. **Root.** `root_after` equals the Zone indexer's own root at `to_lez_block_id`.
+   A `to_lez_block_id` the finalized LEZ blocks have not reached yet only delays the check;
+   the batch waits, and so does every batch after it.
 
-A batch that passes is Verified, and `(root_after, to_lez_block_id)` joins the root history.
-A Rejected batch changes nothing: `to_lez_block_id` stays where the last Verified batch left it,
-so the next batch must continue from there, and any batch that continues from a Rejected one is Rejected too.
-The Zone sequencer runs the same checks and publishes a correct batch again from the last Verified one.
-A batch a reorg removes comes back unchanged; one that comes back different is Rejected.
-A batch Rejected on its changes or its root is public evidence against the Zone operator:
+A batch that applies becomes the tip, and `(root_after, to_lez_block_id)` joins the valid roots.
+A batch that fails is parked: the tip freezes there, every later batch parks after it,
+and the first parked batch of the final tier is kept with its cause as the Zone indexer's standing on the channel.
+A parked batch is public evidence against the Zone operator:
 the batch, signed by an accredited key, and the LEZ blocks it should match.
 Its root is never a valid root: a Zone sequencer that leaves a removal out
-only stops the registry at its Zone indexers until a correct batch arrives, it does not keep the leaf usable.
-What follows from it is outside this document.
+only stops the registry at its Zone indexers, it does not keep the leaf usable.
+How a Zone sequencer corrects a channel with a parked batch is open ([Q6](#q6-trust-in-the-lez-sequencer-replaced-blocks-and-clock-jumps-medium));
+what follows from the evidence is outside this document.
 
 ### Serving
 
 A Zone indexer is the registry access of Modules ([Module Requirements](#module-requirements)).
 It serves:
 
-- the valid roots: the `root_after` and `to_lez_block_id` of every Verified batch at the reference depth on Bedrock
-  within the valid-root window, and the verdict of any batch;
+- the valid roots: the `root_after` and `to_lez_block_id` of every applied batch within the valid-root window,
+  each flagged finalized or not so a Module picks its reference depth, and the outcome of any batch;
 - for a leaf, its Merkle proof path at the newest valid root;
 - for an identity commitment, the membership state it reads from LEZ
   (open or closed, and how it closed, `leaf_index`, `rate_limit`, `expiry_timestamp_ms`, `holder`),
@@ -750,8 +754,8 @@ That raises several points:
 the Zone sequencer then publishes it and every batch after it again ([Zone Sequencer](#zone-sequencer)).
 The tree is unaffected, since every reader derives it from LEZ.
 What stops is the registry: until the batches are back, validators get no newer root,
-so new memberships stay `MEMBERSHIP_PENDING` and removals wait,
-and Zone indexers hold Rejected-on-range verdicts that are no misbehaviour.
+so new memberships stay `MEMBERSHIP_PENDING` and removals wait;
+a Zone indexer's view follows the reorg, so nothing is parked by it.
 How deep a batch must be before it counts is the reference depth of [Q4](#q3-parameters-window-length-reference-depth-withdrawal-delay-medium).
 Open: whether a republished batch must be byte-identical to the dropped one (today it must),
 and how a Module tells a reorg from a Zone sequencer that stopped.
@@ -765,15 +769,15 @@ and how a Module tells a reorg from a Zone sequencer that stopped.
 
 ### Q6. Trust in the LEZ Sequencer: replaced blocks and clock jumps (Medium)
 
-**Problem, replaced blocks.** Readers apply a LEZ block as soon as the LEZ Sequencer serves it,
-before its inscription is in a Bedrock block,
-on the assumption that the LEZ Sequencer never serves a different block under a known `block_id`.
-The realistic way to break it is a LEZ Sequencer that crashes after serving a block
-and before storing or inscribing it, and closes a different block with the same `block_id` on restart.
-Every reader that applied the first block then holds a tree LEZ never had and roots no other reader shares,
-and nothing in this document detects it.
-The damage is bounded by how rarely this can happen and how many readers took the block,
-and it ends when those readers rebuild from LEZ.
+**Problem, replaced blocks.** The Zone sequencer applies a LEZ block as soon as the LEZ Sequencer serves it,
+before its inscription is finalized on Bedrock.
+A LEZ Sequencer that restarts produces its unfinalized blocks again, with other contents under the same `block_id`
+(on the testnet about once every twenty blocks, one or two blocks deep, mostly without events).
+The Zone sequencer detects it by the hash chain and goes back to the last block both agree on;
+when a replaced block changed the tree it must rebuild from LEZ instead, and stops until then.
+Zone indexers take finalized LEZ blocks only and are not affected.
+What stays open is a batch already on Bedrock whose `root_after` the rewritten history contradicts:
+every Zone indexer parks it and every batch after it, and nothing yet tells the Zone sequencer how to correct the channel.
 
 **Problem, clock jumps.** The LEZ Sequencer sets each `timestamp` from its own clock,
 and LEZ checks neither order nor step size, so the registry takes LEZ time as it comes.
@@ -784,16 +788,16 @@ and can expire so many leaves in one LEZ block that its changes exceed one inscr
 which a batch cannot split.
 LEZ may enforce order and step size one day, which closes this part; nothing here handles it.
 
-**Design choices (replaced blocks):**
+**Design choices (a batch the rewritten history contradicts):**
 
-- **Trust and require durability.** Keep the assumption,
-  and require the LEZ Sequencer to store a block durably before serving it, so that a crash cannot replace it.
-- **Detect and rebuild.** Readers compare each applied block with its inscription in the LEZ channel
-  once that inscription is on Bedrock, and on a mismatch rebuild from `first_lez_block_id` or from a snapshot ([Serving](#serving));
-  Zone indexers discard the Verified batches from the replaced block on,
-  and the Zone sequencer publishes again from the block before it.
-- **Wait for the inscription.** Apply a LEZ block only once its inscription is in a Bedrock block;
-  the registry then trails LEZ by the Bedrock latency, which the removal latency and the withdrawal delay must absorb.
+- **Correction batch.** The Zone sequencer publishes a batch that starts at the replaced block again;
+  Zone indexers accept a batch from an accredited key that re-covers a span from a parked batch on,
+  rebuilding the replay from the root before it. Keeps the minutes of latency; costs an indexer rule
+  and reasoning about a root that was valid for a while.
+- **New channel.** The parked channel is abandoned, the Zone sequencer starts a new one from `first_lez_block_id`;
+  Modules switch `zone_channel_id`. Simple, loses the root history.
+- **Finalized LEZ blocks only, for the Zone sequencer too.** Never a false statement, roots hours late;
+  the removal latency and the withdrawal delay must absorb it.
 
 ### Q7. Governance of `ConfigState` (Low)
 

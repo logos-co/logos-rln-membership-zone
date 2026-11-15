@@ -1,42 +1,42 @@
-//! The registry the sequencer holds and the HTTP API serves: the tree at the LEZ head, the
-//! changes not yet in a batch, and every batch published with the status of its Mantle
-//! Transaction on Bedrock. Everything is kept in the tree store (`data/tree/`): the tree and
-//! the reader's state by the reader, the batch history (every batch with its changes, so the
-//! inscription it carried can be built again), the pending changes and the Zone SDK checkpoint
-//! as the reader's `extra`. What the channel holds, this store holds too.
+//! One node's state: the tree derived from LEZ (`Reader`), the Zone channel as the Zone SDK
+//! reports it (`ChainState`), the changes no batch carries yet, and the SDK checkpoint. All of
+//! it lives in the tree store's metadata, so a restart opens the store and continues.
 
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
+use lb_core::mantle::ops::channel::MsgId;
 use prost::Message as _;
-use rln::prelude::{Fr, PoseidonHash};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use zerokit_utils::merkle_tree::{OptimalMerkleConfig, OptimalMerkleTree, ZerokitMerkleTree};
 
 use crate::{
     batch::{Batch, Change, Kind},
+    chain::{
+        AcceptOutcome, BatchIngestError, ChainState, ChannelEntry, FinalEntry, Judge,
+        PublishRecord, StallReason, Tip,
+    },
     lez::Block,
-    reader::{EMPTY_ROOT, Reader, TREE_DEPTH, fr_from_bytes_le, fr_to_bytes_le},
+    reader::{EMPTY_ROOT, Reader},
 };
 
-/// Where the Mantle Transaction carrying a batch stands, in the Zone SDK's words: it is
-/// `pending` from `publish`, `adopted` or `orphaned` through `ChannelUpdate`, `finalized`
-/// through `FinalizedTx`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "status")]
-pub enum Status {
-    /// Published, not yet seen in a Bedrock block.
-    Pending,
-    /// In a Bedrock block on the canonical branch, not yet final.
-    Adopted,
-    /// Dropped from the canonical branch by a reorg; published again as a new transaction.
-    Orphaned,
-    /// In finalized chain history.
-    Finalized { l1_slot: u64 },
+impl Judge for Reader {
+    fn root_at(&self, to_lez_block_id: u64) -> Option<[u8; 32]> {
+        Reader::root_at(self, to_lez_block_id)
+    }
 }
 
-/// One tree change a batch carried, as the history keeps it and the API shows it.
+/// Where the final tier was last read up to on L1 (LEZ `ZoneAnchorRecord`): the slot of the
+/// newest finalized entry and the final tip there.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ZoneAnchorRecord {
+    pub slot: u64,
+    pub to_lez_block_id: u64,
+    #[serde(with = "hex::serde")]
+    pub root: [u8; 32],
+}
+
+/// One tree change a batch carried, as the API shows it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChangeRecord {
     pub kind: ChangeKind,
@@ -53,7 +53,6 @@ pub enum ChangeKind {
 }
 
 impl ChangeRecord {
-    /// A change without a kind (prost's `None`) cannot come from this sequencer.
     pub fn from_change(change: &Change) -> Option<Self> {
         Some(match change.kind.as_ref()? {
             Kind::Insert(insert) => Self {
@@ -68,157 +67,117 @@ impl ChangeRecord {
             },
         })
     }
-
-    pub fn to_change(&self) -> Option<Change> {
-        Some(match self.kind {
-            ChangeKind::Insert => Change::insert(
-                self.leaf_index,
-                hex::decode(self.rate_commitment.as_ref()?).ok()?,
-            ),
-            ChangeKind::Remove => Change::remove(self.leaf_index),
-        })
-    }
 }
 
-/// One batch this sequencer published, tracked by its inscription's message id: the Zone SDK
-/// re-funds a transaction that stays unmined (`stale_refund_slots`) under a new transaction
-/// hash but the same message id.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Published {
-    /// The inscription's message id in the channel.
-    #[serde(with = "hex::serde")]
-    pub msg_id: [u8; 32],
-    /// Hash of the latest Mantle Transaction carrying it.
-    #[serde(with = "hex::serde")]
-    pub tx_hash: [u8; 32],
-    pub from_lez_block_id: u64,
-    pub to_lez_block_id: u64,
-    #[serde(with = "hex::serde")]
-    pub root_after: [u8; 32],
-    /// The changes the batch carried, in order. Empty while the root moved only for a batch
-    /// published before the history kept them (`History::lacks_changes`).
-    #[serde(default)]
+/// A channel entry as the API shows it: `finalized` (in the final tier, with the L1 slot that
+/// finalized it) or in the view.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryView {
+    pub msg_id: String,
+    pub parent_msg: String,
+    /// `None` for an entry that carries no batch.
+    pub from_lez_block_id: Option<u64>,
+    pub to_lez_block_id: Option<u64>,
+    pub root: Option<String>,
     pub changes: Vec<ChangeRecord>,
-    pub published_at_unix: u64,
-    /// The sequencer's L1 slot at publish time: where the finality scan starts looking for
-    /// it. `None` for a batch published before the slot was recorded, and for an indexer's.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub published_at_slot: Option<u64>,
-    #[serde(flatten)]
-    pub status: Status,
-    /// What an indexer found checking the batch against its own derivation; `None` for the
-    /// sequencer's own batches.
-    #[serde(default)]
-    pub verification: Option<Verification>,
+    #[serde(rename = "finalized")]
+    pub is_finalized: bool,
+    /// The L1 slot of the block that finalized it; `null` before.
+    pub l1_slot: Option<u64>,
+    /// The fold's verdict: `applied`, `parked` or `retryable_failure` (LEZ `AcceptOutcome`).
+    pub outcome: &'static str,
+    pub error: Option<BatchIngestError>,
 }
 
-/// An indexer's verdict on a batch read from the channel.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Verification {
-    /// Contiguous with the previous batch, its changes replay to its root, and that root is
-    /// the indexer's own at `to_lez_block_id`.
-    Verified,
-    /// A check failed; the reason says which. The batch is kept, so the history stays a
-    /// faithful copy of the channel, but it did not move the replay tree.
-    Rejected(String),
-    /// The indexer has not read LEZ up to `to_lez_block_id` yet; checked again then.
-    Pending,
-    /// Starts after LEZ blocks no verified batch covers: the batch in between may not have
-    /// been read yet (a node still filling its history); checked again when one arrives.
-    Uncovered,
-}
-
-impl Verification {
-    /// Whether the verdict can still change.
-    fn is_open(&self) -> bool {
-        matches!(self, Self::Pending | Self::Uncovered)
+impl EntryView {
+    fn new(
+        msg: [u8; 32],
+        parent: [u8; 32],
+        batch: Option<&Batch>,
+        l1_slot: Option<u64>,
+        error: Option<&BatchIngestError>,
+    ) -> Self {
+        Self {
+            msg_id: hex::encode(msg),
+            parent_msg: hex::encode(parent),
+            from_lez_block_id: batch.map(|b| b.from_lez_block_id),
+            to_lez_block_id: batch.map(|b| b.to_lez_block_id),
+            root: batch.map(|b| hex::encode(Tip::from(b).root)),
+            changes: batch.map_or_else(Vec::new, |b| {
+                b.changes
+                    .iter()
+                    .filter_map(ChangeRecord::from_change)
+                    .collect()
+            }),
+            is_finalized: l1_slot.is_some(),
+            l1_slot,
+            outcome: match error {
+                None if batch.is_some() => "applied",
+                None => "skipped",
+                Some(e) if e.is_retryable() => "retryable_failure",
+                Some(_) => "parked",
+            },
+            error: error.cloned(),
+        }
     }
 }
 
-/// The published batches.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct History {
-    pub first_lez_block_id: u64,
-    pub published: Vec<Published>,
-    /// The L1 slot the finality scan has read the finalized blocks up to.
-    #[serde(default)]
-    pub finality_scanned_to: Option<u64>,
+/// The batches carrying one root, the one that produced it first (its changes made the root).
+pub struct RootEntry {
+    pub entries: Vec<EntryView>,
 }
 
-impl History {
-    /// Last LEZ block a batch covers: the newest published (the sequencer; an orphaned one
-    /// still covers, it goes out again) or verified (the indexer); the block before the first
-    /// one while there is none.
-    pub fn covered_to(&self) -> u64 {
-        self.published
+impl RootEntry {
+    pub fn produced_by(&self) -> &EntryView {
+        &self.entries[0]
+    }
+
+    pub fn carried_to_lez_block_id(&self) -> u64 {
+        self.entries
             .iter()
-            .rev()
-            .find(|p| {
-                p.verification
-                    .as_ref()
-                    .is_none_or(|v| *v == Verification::Verified)
-            })
-            .map_or(self.first_lez_block_id.saturating_sub(1), |p| {
-                p.to_lez_block_id
-            })
-    }
-
-    /// Whether the batch at `at` moved the root without the history having its changes: one
-    /// published before the history kept them (a batch without changes keeps the root).
-    pub fn lacks_changes(&self, at: usize) -> bool {
-        let p = &self.published[at];
-        p.changes.is_empty() && p.root_after != self.root_before(at)
-    }
-
-    /// The root the batch at `at` started from: the newest batch's before it that counts, the
-    /// empty tree's for the first.
-    fn root_before(&self, at: usize) -> [u8; 32] {
-        self.published[..at]
-            .iter()
-            .rev()
-            .find(|p| p.counts())
-            .map_or(*EMPTY_ROOT, |p| p.root_after)
+            .filter_map(|e| e.to_lez_block_id)
+            .max()
+            .unwrap_or_default()
     }
 }
 
-impl Published {
-    /// Whether the batch is part of the tree's history: not orphaned, and verified when an
-    /// indexer judged it.
-    fn counts(&self) -> bool {
-        self.status != Status::Orphaned
-            && self
-                .verification
-                .as_ref()
-                .is_none_or(|v| *v == Verification::Verified)
-    }
+/// A pending change as the tree store keeps it: the LEZ block that made it and the change,
+/// prost in hex.
+#[derive(Serialize, Deserialize)]
+struct PendingChangeRecord {
+    block: u64,
+    change: String,
 }
 
 pub struct Registry {
-    pub history: History,
     /// The tree at the latest LEZ block applied.
     pub head: Reader,
-    /// Changes of the LEZ blocks after `covered_to`, in derivation-rule order, each with the
+    /// The channel: final tier and view.
+    pub chain: ChainState,
+    pub first_lez_block_id: u64,
+    /// Changes of the LEZ blocks after the head tip, in derivation-rule order, each with the
     /// block that made it: the next batch's content for the sequencer, the head's lead over
-    /// the channel for the indexer; trimmed as `covered_to` advances.
+    /// the channel for the indexer; trimmed as the tip advances.
     pub pending_changes: Vec<(u64, Change)>,
+    /// Our own publishes not seen in a Bedrock block yet, in publish order.
+    own_pending: Vec<[u8; 32]>,
+    anchor: Option<ZoneAnchorRecord>,
     /// The Zone SDK checkpoint, as JSON.
     checkpoint: Option<Value>,
-    /// Indexer: the tree the verified batches' changes replay to, in memory, rebuilt from the
-    /// history at start. Its root after a batch must be the batch's `root_after`.
-    replay: Option<OptimalMerkleTree<PoseidonHash>>,
+    /// The indexer judges every batch against its tree; the sequencer trusts its own.
+    indexer: bool,
 }
 
 impl Registry {
-    /// Open the tree store under `data_dir` and the batch history kept with it; a fresh store
+    /// Open the tree store under `data_dir` and the Zone channel state kept with it; a fresh store
     /// starts at `first_lez_block_id`. With `rebuild`, the tree and the reader's state are
-    /// dropped and read again from LEZ while the batch history and the checkpoint are kept:
-    /// the way out after a decoder that skipped transactions.
+    /// dropped and read again from LEZ while the Zone channel state and the checkpoint are kept.
     pub fn open(
         data_dir: &Path,
         tree_id: [u8; 32],
         first_lez_block_id: u64,
         rebuild: bool,
+        indexer: bool,
     ) -> Result<Self> {
         let dir = data_dir.join("tree");
         let mut kept = None;
@@ -236,288 +195,104 @@ impl Registry {
             }
             None => extra,
         };
-        let history = match extra.get("history") {
-            Some(h) => {
-                serde_json::from_value(h.clone()).context("batch history in the tree store")?
-            }
-            None => History {
-                first_lez_block_id,
-                published: vec![],
-                finality_scanned_to: None,
-            },
-        };
-        let checkpoint = extra.get("checkpoint").filter(|c| !c.is_null()).cloned();
-        // The changes applied but not yet published survive a restart with the tree they
+        Self::from_parts(head, &extra, first_lez_block_id, rebuild, indexer)
+    }
+
+    /// A throwaway store, for tests.
+    #[cfg(test)]
+    pub fn open_temporary(first_lez_block_id: u64, indexer: bool) -> Result<Self> {
+        let (head, extra) = Reader::open_temporary([0; 32], first_lez_block_id.saturating_sub(1))?;
+        Self::from_parts(head, &extra, first_lez_block_id, false, indexer)
+    }
+
+    fn from_parts(
+        head: Reader,
+        extra: &Value,
+        first_lez_block_id: u64,
+        rebuild: bool,
+        indexer: bool,
+    ) -> Result<Self> {
+        let get = |key: &str| extra.get(key).filter(|v| !v.is_null()).cloned();
+        let final_entries: Vec<FinalEntry> = get("final")
+            .map(serde_json::from_value)
+            .transpose()
+            .context("final entries in the tree store")?
+            .unwrap_or_default();
+        let stall: Option<StallReason> = get("stall")
+            .map(serde_json::from_value)
+            .transpose()
+            .context("stall record in the tree store")?;
+        let view = get("view")
+            .and_then(|v| v.as_str().map(hex::decode))
+            .transpose()
+            .context("view in the tree store")?
+            .unwrap_or_default();
+        let judge = indexer.then_some(&head as &dyn Judge);
+        let chain = ChainState::restore(final_entries, stall, &view, judge)?;
+        let first_lez_block_id = get("first_lez_block_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(first_lez_block_id);
+        let own_pending: Vec<String> = get("own_pending")
+            .map(serde_json::from_value)
+            .transpose()
+            .context("own pending publishes in the tree store")?
+            .unwrap_or_default();
+        let own_pending = own_pending
+            .iter()
+            .map(|h| crate::reader::parse_32(h))
+            .collect::<Result<_>>()?;
+        let anchor = get("anchor")
+            .map(serde_json::from_value)
+            .transpose()
+            .context("anchor in the tree store")?;
+        let checkpoint = get("checkpoint");
+        // The changes applied but not yet in a batch survive a restart with the tree they
         // changed; a rebuild derives them again from LEZ.
-        let pending_changes = match extra.get("pending_changes") {
+        let pending_changes = match get("pending_changes") {
             Some(encoded) if !rebuild => {
-                let encoded: Vec<PendingChangeRecord> = serde_json::from_value(encoded.clone())
-                    .context("pending changes in the tree store")?;
+                let encoded: Vec<PendingChangeRecord> =
+                    serde_json::from_value(encoded).context("pending changes in the tree store")?;
                 encoded
                     .iter()
                     .map(|record| {
                         let bytes =
-                            hex::decode(record.change()).context("pending change is not hex")?;
+                            hex::decode(&record.change).context("pending change is not hex")?;
                         let change = Change::decode(bytes.as_slice()).context("pending change")?;
-                        // A record written before the block was kept counts as just after
-                        // `covered_to`, the only thing known about it.
-                        Ok((record.block().unwrap_or(history.covered_to() + 1), change))
+                        Ok((record.block, change))
                     })
                     .collect::<Result<_>>()?
             }
             _ => vec![],
         };
         Ok(Self {
-            history,
             head,
+            chain,
+            first_lez_block_id,
             pending_changes,
+            own_pending,
+            anchor,
             checkpoint,
-            replay: None,
+            indexer,
         })
     }
 
-    /// Turn this registry into an indexer's: a replay tree rebuilt from the verified batches
-    /// of the history, so `observe_batch` can check the next ones.
-    pub fn start_replay(&mut self) -> Result<()> {
-        let mut tree = OptimalMerkleTree::<PoseidonHash>::new(
-            TREE_DEPTH,
-            Fr::default(),
-            OptimalMerkleConfig::default(),
-        )
-        .context("replay tree")?;
-        for p in self
-            .history
-            .published
-            .iter()
-            .filter(|p| p.verification == Some(Verification::Verified))
-        {
-            apply_changes(&mut tree, &p.changes)?;
-        }
-        self.replay = Some(tree);
-        Ok(())
-    }
-
-    /// Indexer: forget the batches read from L1 slot `from_slot` on and move the scan cursor
-    /// back there, so the channel is read again: after a scan that missed an inscription (a
-    /// node still filling its history), which rejects every batch after it as not
-    /// contiguous. Call before `start_replay`. Returns how many batches were forgotten.
-    pub fn rescan_channel_from(&mut self, from_slot: u64) -> usize {
-        let before = self.history.published.len();
-        self.history
-            .published
-            .retain(|p| !matches!(p.status, Status::Finalized { l1_slot } if l1_slot >= from_slot));
-        self.history.finality_scanned_to = from_slot.checked_sub(1);
-        before - self.history.published.len()
-    }
-
-    /// Indexer: when `payload` is a batch not judged yet that would leave LEZ blocks uncovered
-    /// after the last batch counted, the L1 slot after that batch's: where to read the channel
-    /// again before judging it, in case the scan missed an inscription in between.
-    pub fn gap_before(&self, msg_id: &[u8; 32], payload: &[u8]) -> Option<u64> {
-        let judged = self.history.published.iter().any(|p| {
-            p.msg_id == *msg_id && !p.verification.as_ref().is_some_and(Verification::is_open)
-        });
-        let batch = Batch::decode(payload).ok()?;
-        if judged || batch.from_lez_block_id <= self.history.covered_to() + 1 {
-            return None;
-        }
-        let last = self.history.published.iter().rev().find(|p| p.counts());
-        Some(match last.map(|p| &p.status) {
-            Some(Status::Finalized { l1_slot }) => l1_slot + 1,
-            _ => 0,
-        })
-    }
-
-    /// Indexer: a batch read from the channel (`payload` its inscription, finalized at
-    /// `l1_slot`), checked and kept. A message id already on record is checked again only
-    /// while `Pending`. Returns the entry as kept.
-    pub fn observe_batch(
-        &mut self,
-        msg_id: [u8; 32],
-        tx_hash: [u8; 32],
-        payload: &[u8],
-        l1_slot: u64,
-    ) -> Result<&Published> {
-        // An inscription that is no batch is kept as a rejected one, not an error: the scan
-        // goes on and the history still says what the channel holds.
-        let (batch, not_a_batch) = match Batch::decode(payload) {
-            Ok(batch) => (batch, None),
-            Err(e) => (Batch::default(), Some(e)),
-        };
-        let changes: Vec<ChangeRecord> = batch
-            .changes
-            .iter()
-            .filter_map(ChangeRecord::from_change)
-            .collect();
-        let mut root_after = [0u8; 32];
-        if batch.root_after.len() == 32 {
-            root_after.copy_from_slice(&batch.root_after);
-        }
-        let position = self
-            .history
-            .published
-            .iter()
-            .position(|p| p.msg_id == msg_id);
-        if let Some(at) = position
-            && !self.history.published[at]
-                .verification
-                .as_ref()
-                .is_some_and(Verification::is_open)
-        {
-            return Ok(&self.history.published[at]);
-        }
-        let verification = match not_a_batch {
-            Some(e) => Verification::Rejected(format!("the inscription is not a batch: {e}")),
-            None => self.verify(&batch, &changes, root_after)?,
-        };
-        if verification == Verification::Verified {
-            self.trim_pending(batch.to_lez_block_id);
-        }
-        let entry = Published {
-            msg_id,
-            tx_hash,
-            from_lez_block_id: batch.from_lez_block_id,
-            to_lez_block_id: batch.to_lez_block_id,
-            root_after,
-            changes,
-            published_at_unix: now_unix(),
-            published_at_slot: None,
-            status: Status::Finalized { l1_slot },
-            verification: Some(verification),
-        };
-        match position {
-            Some(at) => {
-                self.history.published[at] = entry;
-                Ok(&self.history.published[at])
-            }
-            None => {
-                // In channel order, whatever order the slots were read in (a look-back reads
-                // earlier slots later): the replay and the roots window follow the history.
-                let at = self
-                    .history
-                    .published
-                    .iter()
-                    .position(
-                        |p| matches!(p.status, Status::Finalized { l1_slot: s } if s > l1_slot),
-                    )
-                    .unwrap_or(self.history.published.len());
-                self.history.published.insert(at, entry);
-                Ok(&self.history.published[at])
-            }
-        }
-    }
-
-    /// The three checks of a batch: contiguous with what was verified so far, its changes
-    /// replay to its root, and that root is this indexer's own tree at `to_lez_block_id`.
-    /// Only a verified batch moves the replay tree.
-    fn verify(
-        &mut self,
-        batch: &Batch,
-        changes: &[ChangeRecord],
-        root_after: [u8; 32],
-    ) -> Result<Verification> {
-        let Some(own_root) = self.head.root_at(batch.to_lez_block_id) else {
-            return Ok(Verification::Pending);
-        };
-        let covered_to = self.history.covered_to();
-        if batch.from_lez_block_id > covered_to + 1 {
-            return Ok(Verification::Uncovered);
-        }
-        if batch.from_lez_block_id != covered_to + 1 {
-            return Ok(Verification::Rejected(format!(
-                "covers LEZ blocks from {}, the previous batch covered to {covered_to}",
-                batch.from_lez_block_id
-            )));
-        }
-        if changes.len() != batch.changes.len() {
-            return Ok(Verification::Rejected("a change has no kind".into()));
-        }
-        let replay = self
-            .replay
-            .as_mut()
-            .context("indexer replay tree not started")?;
-        let mut trial = replay.clone();
-        if let Err(e) = apply_changes(&mut trial, changes) {
-            return Ok(Verification::Rejected(format!(
-                "the changes do not apply: {e:#}"
-            )));
-        }
-        let replayed = fr_to_bytes_le(&trial.root());
-        if replayed != root_after {
-            return Ok(Verification::Rejected(format!(
-                "the changes replay to root {}, the batch claims {}",
-                hex::encode(replayed),
-                hex::encode(root_after)
-            )));
-        }
-        if own_root != root_after {
-            return Ok(Verification::Rejected(format!(
-                "the tree derived from LEZ is {} at block {}, the batch claims {}",
-                hex::encode(own_root),
-                batch.to_lez_block_id,
-                hex::encode(root_after)
-            )));
-        }
-        *replay = trial;
-        Ok(Verification::Verified)
-    }
-
-    /// Indexer: check again, in channel order, the batches whose verdict is still open:
-    /// `Pending` (LEZ not read far enough then) and `Uncovered` (the batch before it not seen
-    /// then). Stops at the first still pending (the later ones chain on it). Returns how many
-    /// got a verdict.
-    pub fn recheck(&mut self) -> Result<usize> {
-        let mut decided = 0;
-        let open: Vec<usize> = self
-            .history
-            .published
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.verification.as_ref().is_some_and(Verification::is_open))
-            .map(|(at, _)| at)
-            .collect();
-        for at in open {
-            let p = &self.history.published[at];
-            let Some(payload) = self.payload(&p.msg_id) else {
-                continue;
-            };
-            let batch = Batch::decode(payload.as_slice()).context("a batch on record")?;
-            let changes = p.changes.clone();
-            let root_after = p.root_after;
-            let verification = self.verify(&batch, &changes, root_after)?;
-            if verification == Verification::Pending {
-                break;
-            }
-            if verification.is_open() {
-                continue;
-            }
-            self.history.published[at].verification = Some(verification);
-            self.trim_pending(self.history.covered_to());
-            decided += 1;
-        }
-        Ok(decided)
-    }
-
-    /// Indexer: the root the replay tree is at, the last verified batch's.
-    pub fn replay_root(&self) -> Option<[u8; 32]> {
-        self.replay
-            .as_ref()
-            .map(|tree| fr_to_bytes_le(&tree.root()))
-    }
-
-    /// Write the reader's state, the history, the pending changes and the checkpoint into the
-    /// tree store.
+    /// Write everything into the tree store.
     pub fn save(&mut self) -> Result<()> {
         let pending_changes: Vec<PendingChangeRecord> = self
             .pending_changes
             .iter()
-            .map(|(block, change)| PendingChangeRecord::WithBlock {
+            .map(|(block, change)| PendingChangeRecord {
                 block: *block,
                 change: hex::encode(change.encode_to_vec()),
             })
             .collect();
         let extra = json!({
-            "history": self.history,
+            "first_lez_block_id": self.first_lez_block_id,
+            "view": hex::encode(self.chain.encode_view()),
+            "final": self.chain.final_entries(),
+            "stall": self.chain.stall(),
+            "anchor": self.anchor,
+            "own_pending": self.own_pending.iter().map(hex::encode).collect::<Vec<_>>(),
             "pending_changes": pending_changes,
             "checkpoint": self.checkpoint,
         });
@@ -536,22 +311,35 @@ impl Registry {
         self.checkpoint = Some(checkpoint);
     }
 
-    /// Apply closed LEZ blocks to the head tree; the changes of blocks after `covered_to` wait
-    /// for the next batch.
+    pub fn anchor(&self) -> Option<ZoneAnchorRecord> {
+        self.anchor
+    }
+
+    /// The LEZ block the head tip covers to: the block before the first while no batch does.
+    pub fn covered_to(&self) -> u64 {
+        self.chain
+            .head_tip()
+            .map_or(self.first_lez_block_id.saturating_sub(1), |tip| {
+                tip.to_lez_block_id
+            })
+    }
+
+    /// Apply LEZ blocks in order (`Reader::apply_block`); the changes of the blocks after the
+    /// head tip become pending.
     pub fn apply_blocks(&mut self, blocks: &[Block]) -> Result<()> {
         self.head.check_chain(blocks)?;
-        let covered_to = self.history.covered_to();
+        let covered_to = self.covered_to();
         for block in blocks {
             let changes = self.head.apply_block(block)?;
-            if block.block_id > covered_to {
+            if block.block_id() > covered_to {
                 self.pending_changes
-                    .extend(changes.into_iter().map(|change| (block.block_id, change)));
+                    .extend(changes.into_iter().map(|change| (block.block_id(), change)));
             }
         }
         Ok(())
     }
 
-    /// LEZ rewrote its blocks after `block_id` (`ChainBreak::Fork`): forget them and the
+    /// LEZ rewrote its blocks after `block_id` (`BrokenChainLink`): forget them and the
     /// pending changes they made so they are read again.
     pub fn rewind_to(&mut self, block_id: u64) -> Result<()> {
         self.head.rewind_to(block_id)?;
@@ -559,27 +347,25 @@ impl Registry {
         Ok(())
     }
 
-    /// The published batches whose root is not what the tree derived from LEZ says at their
-    /// `to_lez_block_id`: statements LEZ has since contradicted (its blocks were rewritten
-    /// with other events). An indexer rejects them and every later one; only a new channel
-    /// mends that.
-    pub fn contradicted(&self) -> Vec<&Published> {
-        self.history
-            .published
-            .iter()
-            .filter(|p| p.status != Status::Orphaned)
-            .filter(|p| {
-                self.head
-                    .root_at(p.to_lez_block_id)
-                    .is_some_and(|root| root != p.root_after)
+    /// The batches whose root is not what the tree derived from LEZ says at their
+    /// `to_lez_block_id`: statements LEZ has since contradicted. An indexer parks on them.
+    pub fn contradicted(&self) -> Vec<EntryView> {
+        self.entries()
+            .into_iter()
+            .filter(|e| match (e.to_lez_block_id, &e.root) {
+                (Some(to), Some(root)) => self
+                    .head
+                    .root_at(to)
+                    .is_some_and(|derived| hex::encode(derived) != *root),
+                _ => false,
             })
             .collect()
     }
 
-    /// The next batch: every LEZ block after `covered_to` up to the head, with the pending
+    /// The next batch: every LEZ block after the head tip up to the head, with the pending
     /// changes and the root after them; `None` when the head is already covered.
     pub fn next_batch(&self) -> Option<Batch> {
-        let covered_to = self.history.covered_to();
+        let covered_to = self.covered_to();
         if self.head.lez_block_id <= covered_to {
             return None;
         }
@@ -595,358 +381,149 @@ impl Registry {
         })
     }
 
-    /// Record a batch handed to the SDK.
-    pub fn on_published(
-        &mut self,
-        msg_id: [u8; 32],
-        tx_hash: [u8; 32],
-        batch: &Batch,
-        published_at_slot: Option<u64>,
-    ) {
-        let mut root_after = [0u8; 32];
-        root_after.copy_from_slice(&batch.root_after);
-        self.history.published.push(Published {
-            msg_id,
-            tx_hash,
-            from_lez_block_id: batch.from_lez_block_id,
-            to_lez_block_id: batch.to_lez_block_id,
-            root_after,
-            changes: batch
-                .changes
-                .iter()
-                .filter_map(ChangeRecord::from_change)
-                .collect(),
-            published_at_unix: now_unix(),
-            published_at_slot,
-            status: Status::Pending,
-            verification: None,
-        });
-        self.trim_pending(batch.to_lez_block_id);
+    /// A batch of ours handed to the SDK: into the view on the pin it was built on.
+    pub fn record_publish(&mut self, msg: MsgId, parent: MsgId, batch: &Batch) -> PublishRecord {
+        let entry = ChannelEntry {
+            msg,
+            parent,
+            batch: Some(batch.clone()),
+        };
+        let judge = self.indexer.then_some(&self.head as &dyn Judge);
+        let record = self.chain.record_publish(entry, judge);
+        if record != PublishRecord::AlreadyInView {
+            self.own_pending.push(msg.into());
+        }
+        self.trim_pending();
+        record
     }
 
-    /// A batch covers the LEZ blocks up to `to`: the changes of those blocks are no longer
-    /// pending.
-    fn trim_pending(&mut self, to: u64) {
+    /// Entries that entered the view (`ChannelUpdate::Extension`).
+    pub fn apply_extension(&mut self, adopted: Vec<ChannelEntry>) {
+        let judge = self.indexer.then_some(&self.head as &dyn Judge);
+        self.chain.apply_extension(adopted, judge);
+        self.trim_pending();
+    }
+
+    /// The whole view at the new tip (`ChannelUpdate::Conflict`); returns the entries of ours
+    /// that left it, to publish again.
+    pub fn apply_conflict(&mut self, canonical: Vec<ChannelEntry>) -> Vec<ChannelEntry> {
+        let judge = self.indexer.then_some(&self.head as &dyn Judge);
+        let dropped = self.chain.apply_conflict(canonical, judge);
+        for entry in &dropped {
+            let msg: [u8; 32] = entry.msg.into();
+            self.own_pending.retain(|m| *m != msg);
+        }
+        self.trim_pending();
+        dropped
+    }
+
+    /// A finalized inscription of the channel (the SDK stream or the finality scan).
+    pub fn apply_finalized(&mut self, entry: ChannelEntry, l1_slot: u64) -> Option<AcceptOutcome> {
+        let msg: [u8; 32] = entry.msg.into();
+        let judge = self.indexer.then_some(&self.head as &dyn Judge);
+        let outcome = self.chain.apply_finalized(entry, l1_slot, judge);
+        self.own_pending.retain(|m| *m != msg);
+        let tip = self.chain.final_tip();
+        self.anchor = Some(ZoneAnchorRecord {
+            slot: l1_slot.max(self.anchor.map_or(0, |a| a.slot)),
+            to_lez_block_id: tip.map_or(self.first_lez_block_id.saturating_sub(1), |t| {
+                t.to_lez_block_id
+            }),
+            root: tip.map_or(*EMPTY_ROOT, |t| t.root),
+        });
+        self.trim_pending();
+        outcome
+    }
+
+    /// The channel tip is one of our batches: it and every pending publish before it are in a
+    /// Bedrock block. Returns the ones that just landed.
+    pub fn mark_adopted_up_to(&mut self, tip: [u8; 32]) -> Vec<[u8; 32]> {
+        let Some(at) = self.own_pending.iter().position(|m| *m == tip) else {
+            return vec![];
+        };
+        self.own_pending.drain(..=at).collect()
+    }
+
+    /// Our newest publish not seen in a Bedrock block yet.
+    pub fn in_flight(&self) -> Option<[u8; 32]> {
+        self.own_pending.last().copied()
+    }
+
+    /// The indexer folds again what the judge could not decide: LEZ read further.
+    pub fn retry_folds(&mut self) -> usize {
+        let decided = self.chain.retry_folds(Some(&self.head));
+        self.trim_pending();
+        decided
+    }
+
+    fn trim_pending(&mut self) {
+        let to = self.covered_to();
         self.pending_changes.retain(|(block, _)| *block > to);
     }
 
-    /// A reorg dropped the message `old`: the same batch goes out again as `new_msg_id` (a
-    /// new message, since its parent changed).
-    pub fn on_republished(&mut self, old: [u8; 32], new_msg_id: [u8; 32], new_tx_hash: [u8; 32]) {
-        let Some(entry) = self.published_mut(&old) else {
-            return;
-        };
-        let mut again = entry.clone();
-        entry.status = Status::Orphaned;
-        again.msg_id = new_msg_id;
-        again.tx_hash = new_tx_hash;
-        again.status = Status::Pending;
-        again.published_at_unix = now_unix();
-        self.history.published.push(again);
-    }
-
-    /// The inscription the batch `msg_id` carried, built again from the history (the batch
-    /// wire format is deterministic): to publish it again after a reorg and to recognise it
-    /// when Bedrock finality reaches it. `None` for an unknown message id or a batch whose
-    /// changes the history does not have.
-    pub fn payload(&self, msg_id: &[u8; 32]) -> Option<Vec<u8>> {
-        let at = self
-            .history
-            .published
+    /// Every entry of the channel, final tier first then the view, as the API shows them.
+    pub fn entries(&self) -> Vec<EntryView> {
+        let mut out: Vec<EntryView> = self
+            .chain
+            .final_entries()
             .iter()
-            .position(|p| p.msg_id == *msg_id)?;
-        if self.history.lacks_changes(at) {
-            return None;
-        }
-        let p = &self.history.published[at];
-        let changes = p
-            .changes
-            .iter()
-            .map(ChangeRecord::to_change)
-            .collect::<Option<Vec<_>>>()?;
-        Some(
-            Batch {
-                from_lez_block_id: p.from_lez_block_id,
-                to_lez_block_id: p.to_lez_block_id,
-                changes,
-                root_after: p.root_after.to_vec(),
-            }
-            .encode_to_vec(),
-        )
-    }
-
-    /// A batch published before the history kept the changes learns them from its inscription
-    /// as the chain holds it: `payload` must decode to a batch with the span and root on
-    /// record. Returns whether the history changed.
-    pub fn fill_changes(&mut self, msg_id: &[u8; 32], payload: &[u8]) -> bool {
-        let Some(at) = self
-            .history
-            .published
-            .iter()
-            .position(|p| p.msg_id == *msg_id)
-        else {
-            return false;
-        };
-        if !self.history.lacks_changes(at) {
-            return false;
-        }
-        let Ok(batch) = Batch::decode(payload) else {
-            return false;
-        };
-        let entry = &mut self.history.published[at];
-        if batch.from_lez_block_id != entry.from_lez_block_id
-            || batch.to_lez_block_id != entry.to_lez_block_id
-            || batch.root_after[..] != entry.root_after[..]
-        {
-            return false;
-        }
-        entry.changes = batch
-            .changes
-            .iter()
-            .filter_map(ChangeRecord::from_change)
+            .map(|f| {
+                EntryView::new(
+                    f.msg,
+                    f.parent,
+                    f.batch().as_ref(),
+                    Some(f.l1_slot),
+                    f.error.as_ref(),
+                )
+            })
             .collect();
-        true
-    }
-
-    /// The finalized batches whose changes the history does not have, with the L1 slot of
-    /// the block that holds their inscription: one block read each fills them.
-    pub fn finalized_without_changes(&self) -> Vec<([u8; 32], u64)> {
-        self.history
-            .published
-            .iter()
-            .enumerate()
-            .filter(|(at, _)| self.history.lacks_changes(*at))
-            .filter_map(|(_, p)| match p.status {
-                Status::Finalized { l1_slot } => Some((p.msg_id, l1_slot)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Bedrock finality reached the batch `msg_id` at `l1_slot`, carrying `tx_hash` and
-    /// `payload`: mark it, unless it is not ours, already final, or the payload on record (when
-    /// there is one) differs. A batch whose changes the history lacks takes them from the
-    /// payload. Returns the entry marked.
-    pub fn on_finalized(
-        &mut self,
-        msg_id: &[u8; 32],
-        tx_hash: [u8; 32],
-        payload: &[u8],
-        l1_slot: u64,
-    ) -> Result<Option<&Published>, FinalizeRefused> {
-        // The message id is ours (it is in the history, signed by our key); the payload on
-        // record, when there is one, must be the one finalized.
-        if self.payload(msg_id).is_some_and(|p| p[..] != payload[..]) {
-            return Err(FinalizeRefused::PayloadDiffers);
+        for (entry, outcome) in self.chain.view_outcomes() {
+            out.push(EntryView::new(
+                entry.msg.into(),
+                entry.parent.into(),
+                entry.batch.as_ref(),
+                None,
+                outcome.as_ref().err(),
+            ));
         }
-        self.fill_changes(msg_id, payload);
-        let Some(entry) = self.published_mut(msg_id) else {
-            return Err(FinalizeRefused::NotOurs);
-        };
-        if matches!(entry.status, Status::Finalized { .. }) {
-            return Ok(None);
-        }
-        entry.status = Status::Finalized { l1_slot };
-        entry.tx_hash = tx_hash;
-        Ok(self.history.published.iter().find(|p| p.msg_id == *msg_id))
+        out
     }
 
-    /// The L1 slot the finality scan starts at: after the last slot scanned, and no earlier
-    /// than the oldest batch still waiting; `None` when nothing waits. A batch published
-    /// before the slot was recorded borrows one from a finalized batch: slots are seconds, so
-    /// its slot is about the finalized one's minus the seconds between the two publishes, with
-    /// a margin; without any finalized batch such a batch is left to the SDK stream.
-    pub fn finality_scan_from(&self) -> Option<u64> {
-        let reference = self.history.published.iter().find_map(|p| match p.status {
-            Status::Finalized { l1_slot } => Some((l1_slot, p.published_at_unix)),
-            _ => None,
-        });
-        let oldest = self
-            .history
-            .published
-            .iter()
-            .filter(|p| !matches!(p.status, Status::Finalized { .. } | Status::Orphaned))
-            .filter_map(|p| {
-                p.published_at_slot.or_else(|| {
-                    let (slot, unix) = reference?;
-                    Some(
-                        slot.saturating_sub(unix.saturating_sub(p.published_at_unix))
-                            .saturating_sub(SLOT_ESTIMATE_MARGIN),
-                    )
-                })
-            })
-            .min()?;
-        Some(match self.history.finality_scanned_to {
-            Some(scanned) => oldest.max(scanned + 1),
-            None => oldest,
-        })
-    }
-
-    pub fn published_mut(&mut self, msg_id: &[u8; 32]) -> Option<&mut Published> {
-        self.history
-            .published
-            .iter_mut()
-            .find(|p| p.msg_id == *msg_id)
-    }
-
-    /// The newest batch published, whatever its status but orphaned.
-    pub fn newest_published(&self) -> Option<&Published> {
-        self.history
-            .published
-            .iter()
-            .rev()
-            .find(|p| p.status != Status::Orphaned)
-    }
-
-    /// The newest batch in a Bedrock block (Adopted or Finalized).
-    pub fn newest_adopted(&self) -> Option<&Published> {
-        self.history
-            .published
-            .iter()
-            .rev()
-            .find(|p| matches!(p.status, Status::Adopted | Status::Finalized { .. }))
-    }
-
-    /// The newest Finalized batch, if any.
-    pub fn newest_finalized(&self) -> Option<&Published> {
-        self.history
-            .published
-            .iter()
-            .rev()
-            .find(|p| matches!(p.status, Status::Finalized { .. }))
-    }
-
-    /// The roots newest first, at most `window_size`: one entry per run of batches carrying
-    /// the same root, the batch that produced it first (its changes are what made the root)
-    /// and every batch of the run after it (heartbeats as a rule, carrying the root further).
-    /// A root the tree comes back to later (a leaf inserted then removed empties its slot
-    /// again) is a new run, so the window stays ordered by recency. Orphaned batches are left
-    /// out.
-    pub fn roots(&self, window_size: usize) -> Vec<RootEntry<'_>> {
-        let mut entries: Vec<RootEntry<'_>> = vec![];
-        for p in self
-            .history
-            .published
-            .iter()
-            .filter(|p| p.status != Status::Orphaned)
+    /// The roots newest first, at most `window_size`: one entry per run of applied batches
+    /// carrying the same root, the batch that produced it first and every batch of the run
+    /// after it (heartbeats as a rule). A root the tree comes back to later is a new run.
+    pub fn roots(&self, window_size: usize) -> Vec<RootEntry> {
+        let mut runs: Vec<RootEntry> = vec![];
+        for entry in self
+            .entries()
+            .into_iter()
+            .filter(|e| e.outcome == "applied")
         {
-            match entries.last_mut() {
-                Some(entry) if entry.batches[0].root_after == p.root_after => entry.batches.push(p),
-                _ => entries.push(RootEntry { batches: vec![p] }),
+            match runs.last_mut() {
+                Some(run) if run.produced_by().root == entry.root => run.entries.push(entry),
+                _ => runs.push(RootEntry {
+                    entries: vec![entry],
+                }),
             }
         }
-        entries.reverse();
-        entries.truncate(window_size);
-        entries
-    }
-}
-
-/// Slots the finality scan starts early when a batch's slot is estimated from another's.
-const SLOT_ESTIMATE_MARGIN: u64 = 600;
-
-/// A pending change as the tree store keeps it: the LEZ block that made it and the change,
-/// prost in hex. A store written before the block was kept holds the bare hex string.
-#[derive(Serialize, Deserialize)]
-#[serde(untagged)]
-enum PendingChangeRecord {
-    WithBlock { block: u64, change: String },
-    Bare(String),
-}
-
-impl PendingChangeRecord {
-    fn block(&self) -> Option<u64> {
-        match self {
-            Self::WithBlock { block, .. } => Some(*block),
-            Self::Bare(_) => None,
-        }
+        runs.reverse();
+        runs.truncate(window_size);
+        runs
     }
 
-    fn change(&self) -> &str {
-        match self {
-            Self::WithBlock { change, .. } | Self::Bare(change) => change,
-        }
+    /// The newest applied entry, a finalized one only when `finalized_only`.
+    pub fn newest(&self, finalized_only: bool) -> Option<EntryView> {
+        self.entries()
+            .into_iter()
+            .rev()
+            .find(|e| e.outcome == "applied" && (e.is_finalized || !finalized_only))
     }
-}
-
-/// Apply a batch's changes to a tree: an insert sets the leaf, a removal empties it.
-fn apply_changes(
-    tree: &mut OptimalMerkleTree<PoseidonHash>,
-    changes: &[ChangeRecord],
-) -> Result<()> {
-    for change in changes {
-        let leaf_index = change.leaf_index as usize;
-        match change.kind {
-            ChangeKind::Insert => {
-                let hex = change
-                    .rate_commitment
-                    .as_deref()
-                    .context("an insert without a leaf")?;
-                let bytes: [u8; 32] = hex::decode(hex)
-                    .ok()
-                    .and_then(|v| v.try_into().ok())
-                    .context("a leaf that is not 32 bytes of hex")?;
-                let leaf = fr_from_bytes_le(&bytes).map_err(|e| anyhow::anyhow!(e))?;
-                tree.set(leaf_index, leaf)
-                    .with_context(|| format!("insert leaf {leaf_index}"))?;
-            }
-            ChangeKind::Remove => tree
-                .delete(leaf_index)
-                .with_context(|| format!("remove leaf {leaf_index}"))?,
-        }
-    }
-    Ok(())
-}
-
-/// Why `Registry::on_finalized` left a batch as it was.
-#[derive(Debug, PartialEq)]
-pub enum FinalizeRefused {
-    /// The message id is not in the history.
-    NotOurs,
-    /// The payload finalized is not the one published under that message id.
-    PayloadDiffers,
-}
-
-/// A root of the valid-root window: the run of batches that carried it, the one that produced
-/// it first.
-pub struct RootEntry<'a> {
-    pub batches: Vec<&'a Published>,
-}
-
-impl RootEntry<'_> {
-    /// The batch whose changes made the root.
-    pub fn produced_by(&self) -> &Published {
-        self.batches[0]
-    }
-
-    /// `to_lez_block_id` of the newest batch carrying the root.
-    pub fn carried_to_lez_block_id(&self) -> u64 {
-        self.batches[self.batches.len() - 1].to_lez_block_id
-    }
-}
-
-pub fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
     use crate::lez::Event;
-
-    fn block(block_id: u64, events: Vec<Event>) -> Block {
-        Block {
-            block_id,
-            prev_block_hash: [0; 32],
-            hash: [0; 32],
-            timestamp_ms: 1_000,
-            events,
-            private_transaction_count: 0,
-            bedrock_status: crate::lez::BedrockStatus::Finalized,
-        }
-    }
 
     fn registered(n: u8, leaf_index: u64) -> Event {
         let mut id_commitment = [0u8; 32];
@@ -959,356 +536,209 @@ mod test {
         }
     }
 
-    #[test]
-    fn test_roots_window_finality_marks_and_the_history_rebuilds_the_payloads() {
-        let dir = std::env::temp_dir().join(format!("zone-roots-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
-        // Batch `n` covers block `n` with one change (the roots here are stand-ins).
-        let batch_of = |n: u8, root: u8| Batch {
-            from_lez_block_id: u64::from(n),
-            to_lez_block_id: u64::from(n),
-            changes: vec![Change::insert(u64::from(n), vec![root; 32])],
-            root_after: vec![root; 32],
-        };
-        let publish = |registry: &mut Registry, n: u8, root: u8| {
-            registry.on_published([n; 32], [n; 32], &batch_of(n, root), Some(u64::from(n)));
-        };
-        // The inscription a published batch carried, as the history builds it again.
-        let payload_of = |n: u8, root: u8| batch_of(n, root).encode_to_vec();
-        // Root A, a heartbeat carrying A, root B, back to A (a leaf inserted then removed).
-        publish(&mut registry, 1, 0xA);
-        publish(&mut registry, 2, 0xA);
-        publish(&mut registry, 3, 0xB);
-        publish(&mut registry, 4, 0xA);
-        let roots = registry.roots(10);
-        let runs: Vec<(u8, u64, u64, usize)> = roots
-            .iter()
-            .map(|e| {
-                (
-                    e.produced_by().root_after[0],
-                    e.produced_by().from_lez_block_id,
-                    e.carried_to_lez_block_id(),
-                    e.batches.len(),
-                )
-            })
-            .collect();
-        assert_eq!(runs, vec![(0xA, 4, 4, 1), (0xB, 3, 3, 1), (0xA, 1, 2, 2)]);
-        assert_eq!(registry.roots(1)[0].produced_by().root_after[0], 0xA);
-        // Finality: the oldest waiting batch is where the scan starts; a wrong payload is
-        // refused; a batch marked final drops its payload and leaves the scan range.
-        assert_eq!(registry.finality_scan_from(), Some(1));
-        assert_eq!(
-            registry.on_finalized(&[1; 32], [9; 32], &[0xB], 500).err(),
-            Some(FinalizeRefused::PayloadDiffers)
-        );
-        assert_eq!(
-            registry.on_finalized(&[7; 32], [9; 32], &[], 500).err(),
-            Some(FinalizeRefused::NotOurs)
-        );
-        let marked = registry
-            .on_finalized(&[1; 32], [9; 32], &payload_of(1, 0xA), 500)
-            .unwrap()
-            .unwrap();
-        assert_eq!(marked.status, Status::Finalized { l1_slot: 500 });
-        assert!(
-            registry
-                .on_finalized(&[1; 32], [9; 32], &payload_of(1, 0xA), 500)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(registry.finality_scan_from(), Some(2));
-        registry.history.finality_scanned_to = Some(600);
-        assert_eq!(registry.finality_scan_from(), Some(601));
-        // A batch without a slot borrows one from the finalized batch (slot 500, published
-        // now): published 100 s earlier, its slot is about 400, the scan starts 600 early.
-        registry.history.finality_scanned_to = None;
-        let now = now_unix();
-        registry.history.published[1].published_at_slot = None;
-        registry.history.published[1].published_at_unix = now - 100;
-        registry.history.published[0].published_at_unix = now;
-        registry.history.published[2].published_at_slot = Some(5000);
-        registry.history.published[3].published_at_slot = Some(5000);
-        assert_eq!(registry.finality_scan_from(), Some(0));
-        registry.history.published[0].status = Status::Finalized { l1_slot: 2000 };
-        assert_eq!(registry.finality_scan_from(), Some(2000 - 100 - 600));
-        registry.history.finality_scanned_to = Some(600);
-        // A batch recorded without its changes learns them from the inscription on chain,
-        // when span and root agree.
-        registry.history.published[2].changes.clear();
-        let on_chain = Batch {
-            from_lez_block_id: 3,
-            to_lez_block_id: 3,
-            changes: vec![Change::insert(9, vec![0xC; 32])],
-            root_after: vec![0xB; 32],
+    fn block(block_id: u64, events: Vec<Event>) -> Block {
+        Block {
+            header: crate::lez::BlockHeader {
+                block_id,
+                prev_block_hash: common::HashType([0; 32]),
+                hash: common::HashType([0; 32]),
+                timestamp: 1_000,
+            },
+            bedrock_status: crate::lez::BedrockStatus::Finalized,
+            events,
+            private_transaction_count: 0,
         }
-        .encode_to_vec();
-        assert_eq!(registry.payload(&[3; 32]), None);
-        assert!(!registry.fill_changes(&[3; 32], &payload_of(3, 0xC)));
-        assert!(registry.fill_changes(&[3; 32], &on_chain));
-        assert_eq!(registry.history.published[2].changes[0].leaf_index, 9);
-        assert_eq!(registry.payload(&[3; 32]), Some(on_chain));
-        // The history survives a restart and still builds every batch's inscription.
-        registry.save().unwrap();
-        registry.close().unwrap();
-        drop(registry);
-        let registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
-        assert_eq!(registry.payload(&[1; 32]), Some(payload_of(1, 0xA)));
-        assert_eq!(registry.payload(&[4; 32]), Some(payload_of(4, 0xA)));
-        assert_eq!(registry.payload(&[7; 32]), None);
-        assert_eq!(registry.history.finality_scanned_to, Some(600));
-        drop(registry);
+    }
+
+    fn msg(n: u8) -> MsgId {
+        MsgId::from([n; 32])
+    }
+
+    #[test]
+    fn test_sequencer_builds_publishes_and_sees_its_batches_land() {
+        let mut registry = Registry::open_temporary(1, false).unwrap();
+        registry
+            .apply_blocks(&[block(1, vec![registered(1, 0)]), block(2, vec![])])
+            .unwrap();
+        assert_eq!(registry.pending_changes.len(), 1);
+        let batch = registry.next_batch().unwrap();
+        assert_eq!((batch.from_lez_block_id, batch.to_lez_block_id), (1, 2));
+        assert_eq!(batch.changes.len(), 1);
+        assert_eq!(
+            registry.record_publish(msg(1), MsgId::root(), &batch),
+            PublishRecord::Extended
+        );
+        // Published: the changes are no longer pending, the head is covered, one in flight.
+        assert!(registry.pending_changes.is_empty());
+        assert_eq!(registry.covered_to(), 2);
+        assert_eq!(registry.next_batch(), None);
+        assert_eq!(registry.in_flight(), Some([1; 32]));
+        assert!(!registry.entries()[0].is_finalized);
+        // The channel tip is our batch: adopted.
+        assert_eq!(registry.mark_adopted_up_to([1; 32]), vec![[1; 32]]);
+        assert_eq!(registry.in_flight(), None);
+        assert!(!registry.entries()[0].is_finalized);
+        // Finality: into the final tier, the anchor moves.
+        let entry = ChannelEntry {
+            msg: msg(1),
+            parent: MsgId::root(),
+            batch: Some(batch.clone()),
+        };
+        assert!(matches!(
+            registry.apply_finalized(entry, 500),
+            Some(AcceptOutcome::Applied(_))
+        ));
+        assert!(registry.entries()[0].is_finalized);
+        assert_eq!(registry.entries()[0].l1_slot, Some(500));
+        assert_eq!(registry.anchor().unwrap().slot, 500);
+        assert_eq!(registry.anchor().unwrap().to_lez_block_id, 2);
+        assert_eq!(registry.roots(5).len(), 1);
+        assert_eq!(registry.newest(true).unwrap().msg_id, hex::encode([1; 32]));
+        // A heartbeat carries the root on: same run.
+        registry.apply_blocks(&[block(3, vec![])]).unwrap();
+        let heartbeat = registry.next_batch().unwrap();
+        assert!(heartbeat.changes.is_empty());
+        registry.record_publish(msg(2), msg(1), &heartbeat);
+        assert_eq!(registry.roots(5).len(), 1);
+        assert_eq!(registry.roots(5)[0].entries.len(), 2);
+        assert_eq!(registry.roots(5)[0].carried_to_lez_block_id(), 3);
+        // Nothing LEZ contradicts.
+        assert!(registry.contradicted().is_empty());
+    }
+
+    #[test]
+    fn test_reopen_keeps_the_channel_state_and_the_pending_changes() {
+        let dir = std::env::temp_dir().join(format!("zone-registry-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let batch;
+        {
+            let mut registry = Registry::open(&dir, [0; 32], 1, false, false).unwrap();
+            registry
+                .apply_blocks(&[block(1, vec![registered(1, 0)])])
+                .unwrap();
+            batch = registry.next_batch().unwrap();
+            registry.record_publish(msg(1), MsgId::root(), &batch);
+            registry
+                .apply_blocks(&[block(2, vec![registered(2, 1)])])
+                .unwrap();
+            assert_eq!(registry.pending_changes.len(), 1);
+            registry.set_checkpoint(json!({"lib": 7}));
+            registry.save().unwrap();
+            registry.close().unwrap();
+        }
+        {
+            let mut registry = Registry::open(&dir, [0; 32], 1, false, false).unwrap();
+            assert_eq!(registry.chain.view().len(), 1);
+            assert_eq!(registry.in_flight(), Some([1; 32]));
+            assert_eq!(registry.covered_to(), 1);
+            assert_eq!(registry.pending_changes.len(), 1);
+            assert_eq!(registry.checkpoint(), Some(&json!({"lib": 7})));
+            // The next batch continues from the view's tip.
+            let next = registry.next_batch().unwrap();
+            assert_eq!((next.from_lez_block_id, next.to_lez_block_id), (2, 2));
+            // Finalize the first: reopen keeps the final tier.
+            registry.apply_finalized(
+                ChannelEntry {
+                    msg: msg(1),
+                    parent: MsgId::root(),
+                    batch: Some(batch.clone()),
+                },
+                100,
+            );
+            registry.save().unwrap();
+            registry.close().unwrap();
+        }
+        {
+            let registry = Registry::open(&dir, [0; 32], 1, false, false).unwrap();
+            assert_eq!(registry.chain.final_entries().len(), 1);
+            assert_eq!(registry.chain.final_tip().unwrap().to_lez_block_id, 1);
+            assert_eq!(registry.anchor().unwrap().slot, 100);
+            assert!(registry.chain.view().is_empty());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn test_indexer_checks_the_batches_against_its_own_derivation() {
-        let dir = std::env::temp_dir().join(format!("zone-indexer-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
-        registry.start_replay().unwrap();
-        // The indexer has read LEZ block 1 (two registrations).
+    fn test_indexer_judges_batches_against_its_own_tree() {
+        let mut registry = Registry::open_temporary(1, true).unwrap();
         registry
             .apply_blocks(&[block(1, vec![registered(1, 0), registered(2, 1)])])
             .unwrap();
         let root_1 = registry.head.root();
-        let batch = |from: u64, to: u64, changes: Vec<Change>, root: [u8; 32]| {
-            Batch {
-                from_lez_block_id: from,
-                to_lez_block_id: to,
-                changes,
-                root_after: root.to_vec(),
-            }
-            .encode_to_vec()
-        };
-        let changes_1: Vec<Change> = registry
-            .pending_changes
-            .iter()
-            .map(|(_, c)| c.clone())
-            .collect();
-        assert_eq!(changes_1.len(), 2);
-
-        // A batch claiming the right root with the right changes: verified.
-        let ok = registry
-            .observe_batch(
-                [1; 32],
-                [1; 32],
-                &batch(1, 1, changes_1.clone(), root_1),
-                100,
-            )
-            .unwrap();
-        assert_eq!(ok.verification, Some(Verification::Verified));
-        assert_eq!(registry.history.covered_to(), 1);
-        assert_eq!(registry.replay_root(), Some(root_1));
-        // The changes the batch covered are no longer the head's lead over the channel.
-        assert!(registry.pending_changes.is_empty());
-
-        // A batch for blocks the indexer has not read yet: pending, then checked.
-        let pending = registry
-            .observe_batch(
-                [2; 32],
-                [2; 32],
-                &batch(2, 3, vec![Change::remove(0)], [7; 32]),
-                200,
-            )
-            .unwrap();
-        assert_eq!(pending.verification, Some(Verification::Pending));
-        registry
-            .apply_blocks(&[block(2, vec![]), block(3, vec![registered(3, 2)])])
-            .unwrap();
-        assert_eq!(registry.recheck().unwrap(), 1);
-        let rejected = &registry.history.published[1];
-        assert!(matches!(
-            rejected.verification,
-            Some(Verification::Rejected(ref reason)) if reason.contains("replay to root")
-        ));
-        // A rejected batch moves nothing: the next honest batch still chains on block 1.
-        assert_eq!(registry.history.covered_to(), 1);
-        assert_eq!(registry.replay_root(), Some(root_1));
-        let root_3 = registry.head.root();
-        assert_eq!(registry.pending_changes.len(), 1);
-        let changes_3: Vec<Change> = registry
-            .pending_changes
-            .iter()
-            .map(|(_, c)| c.clone())
-            .collect();
-        let ok = registry
-            .observe_batch([3; 32], [3; 32], &batch(2, 3, changes_3, root_3), 300)
-            .unwrap();
-        assert_eq!(ok.verification, Some(Verification::Verified));
-        assert_eq!(registry.replay_root(), Some(root_3));
-        // Seen again, a decided batch is left as it is.
-        let again = registry
-            .observe_batch([3; 32], [3; 32], &batch(2, 3, vec![], [9; 32]), 300)
-            .unwrap();
-        assert_eq!(again.verification, Some(Verification::Verified));
-        registry.close().unwrap();
-        drop(registry);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// An inscription that is no batch, or a batch whose changes cannot apply, is a rejected
-    /// entry: the scan goes on, nothing moves.
-    #[test]
-    fn test_a_malformed_inscription_is_rejected_not_fatal() {
-        let dir = std::env::temp_dir().join(format!("zone-malformed-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
-        registry.start_replay().unwrap();
-        registry
-            .apply_blocks(&[block(1, vec![registered(1, 0)])])
-            .unwrap();
-        let garbage = registry
-            .observe_batch([1; 32], [1; 32], &[0xff, 0xff, 0xff], 100)
-            .unwrap();
-        assert!(matches!(
-            garbage.verification,
-            Some(Verification::Rejected(ref reason)) if reason.contains("not a batch")
-        ));
-        let short_leaf = Batch {
-            from_lez_block_id: 1,
-            to_lez_block_id: 1,
-            changes: vec![Change::insert(0, vec![1, 2, 3])],
-            root_after: registry.head.root().to_vec(),
-        }
-        .encode_to_vec();
-        let bad = registry
-            .observe_batch([2; 32], [2; 32], &short_leaf, 200)
-            .unwrap();
-        assert!(matches!(
-            bad.verification,
-            Some(Verification::Rejected(ref reason)) if reason.contains("do not apply")
-        ));
-        assert_eq!(registry.history.covered_to(), 0);
-        assert_eq!(registry.history.published.len(), 2);
-        registry.close().unwrap();
-        drop(registry);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A scan that missed an inscription rejects the batches after it; a rescan from the
-    /// missed slot forgets them and the channel is read again from there.
-    #[test]
-    fn test_rescan_forgets_the_batches_from_a_slot_on_and_checks_them_again() {
-        let dir = std::env::temp_dir().join(format!("zone-rescan-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
-        registry.start_replay().unwrap();
-        registry
-            .apply_blocks(&[
-                block(1, vec![registered(1, 0)]),
-                block(2, vec![registered(2, 1)]),
-            ])
-            .unwrap();
-        let batch = |from: u64, to: u64, changes: Vec<Change>, root: [u8; 32]| {
-            Batch {
-                from_lez_block_id: from,
-                to_lez_block_id: to,
-                changes,
-                root_after: root.to_vec(),
-            }
-            .encode_to_vec()
-        };
         let changes: Vec<Change> = registry
             .pending_changes
             .iter()
             .map(|(_, c)| c.clone())
             .collect();
-        let root_1 = registry.head.root_at(1).unwrap();
-        let root_2 = registry.head.root();
-        // The batch for block 1 sits at slot 100; the scan missed it and read block 2's at 200.
-        let second_payload = batch(2, 2, changes[1..].to_vec(), root_2);
-        // Before judging it: a gap, nothing counted yet, so the channel is read again from 0.
-        assert_eq!(registry.gap_before(&[2; 32], &second_payload), Some(0));
-        let late = registry
-            .observe_batch([2; 32], [2; 32], &second_payload, 200)
-            .unwrap();
-        // Not a rejection: an open verdict, the batch before it may still turn up.
-        assert_eq!(late.verification, Some(Verification::Uncovered));
-        assert_eq!(registry.history.covered_to(), 0);
-        assert_eq!(registry.gap_before(&[2; 32], &second_payload), Some(0));
-
-        // The missed batch turns up (a look-back): it goes before the later one in the
-        // history, verifies, and the second look gives the uncovered batch its verdict.
-        let first_payload = batch(1, 1, changes[..1].to_vec(), root_1);
-        let first = registry
-            .observe_batch([1; 32], [1; 32], &first_payload, 100)
-            .unwrap();
-        assert_eq!(first.verification, Some(Verification::Verified));
-        assert_eq!(registry.history.published[0].msg_id, [1; 32]);
-        assert_eq!(registry.recheck().unwrap(), 1);
-        assert_eq!(
-            registry.history.published[1].verification,
-            Some(Verification::Verified)
-        );
-        assert_eq!(registry.history.covered_to(), 2);
-        assert_eq!(registry.replay_root(), Some(root_2));
-        // Contiguous or judged: no look-back; a batch from block 4 would look back from the
-        // slot after the last counted batch's.
-        assert_eq!(registry.gap_before(&[2; 32], &second_payload), None);
-        assert_eq!(
-            registry.gap_before(&[4; 32], &batch(4, 4, vec![], root_2)),
-            Some(201)
-        );
-        registry.history.finality_scanned_to = Some(250);
-
-        // Rescan from the second batch's slot: it is forgotten, the cursor moves back, the
-        // replay is the first batch's again, and the batch verifies once more when read.
-        assert_eq!(registry.rescan_channel_from(200), 1);
-        assert_eq!(registry.history.published.len(), 1);
-        assert_eq!(registry.history.finality_scanned_to, Some(199));
-        registry.start_replay().unwrap();
-        assert_eq!(registry.replay_root(), Some(root_1));
-        let second = registry
-            .observe_batch([2; 32], [2; 32], &second_payload, 200)
-            .unwrap();
-        assert_eq!(second.verification, Some(Verification::Verified));
-        assert_eq!(registry.history.covered_to(), 2);
-
-        // From slot 0: nothing read yet, the first start's slot applies again.
-        assert_eq!(registry.rescan_channel_from(0), 2);
-        assert_eq!(registry.history.finality_scanned_to, None);
-        registry.close().unwrap();
-        drop(registry);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_pending_change_records_read_the_bare_format_too() {
-        let records: Vec<PendingChangeRecord> =
-            serde_json::from_str(r#"["0a00", {"block": 7, "change": "1200"}]"#).unwrap();
-        assert_eq!(records[0].block(), None);
-        assert_eq!(records[0].change(), "0a00");
-        assert_eq!(records[1].block(), Some(7));
-        assert_eq!(records[1].change(), "1200");
-    }
-
-    #[test]
-    fn test_reopen_keeps_the_pending_changes() {
-        let dir = std::env::temp_dir().join(format!("zone-registry-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let batch = {
-            let mut registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
-            registry
-                .apply_blocks(&[
-                    block(1, vec![registered(1, 0), registered(2, 1)]),
-                    block(2, vec![registered(3, 2)]),
-                ])
-                .unwrap();
-            registry.save().unwrap();
-            let batch = registry.next_batch().unwrap();
-            assert_eq!(batch.changes.len(), 3);
-            registry.close().unwrap();
-            batch
+        let honest = Batch {
+            from_lez_block_id: 1,
+            to_lez_block_id: 1,
+            changes: changes.clone(),
+            root_after: root_1.to_vec(),
         };
-        {
-            let registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
-            assert_eq!(registry.next_batch().unwrap(), batch);
-        }
-        {
-            let registry = Registry::open(&dir, [0; 32], 1, true).unwrap();
-            assert!(registry.pending_changes.is_empty());
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+        // Adopted on the channel: applied, the pending changes are the head's lead no more.
+        registry.apply_extension(vec![ChannelEntry {
+            msg: msg(1),
+            parent: MsgId::root(),
+            batch: Some(honest.clone()),
+        }]);
+        assert_eq!(registry.entries()[0].outcome, "applied");
+        assert!(!registry.entries()[0].is_finalized);
+        assert!(registry.pending_changes.is_empty());
+        // A batch for blocks the indexer has not read yet: it replays (a heartbeat keeps the
+        // root), so only the judge is missing; retryable, decided once LEZ is read.
+        let early = Batch {
+            from_lez_block_id: 2,
+            to_lez_block_id: 3,
+            changes: vec![],
+            root_after: root_1.to_vec(),
+        };
+        registry.apply_extension(vec![ChannelEntry {
+            msg: msg(2),
+            parent: msg(1),
+            batch: Some(early),
+        }]);
+        assert_eq!(registry.entries()[1].outcome, "retryable_failure");
+        registry
+            .apply_blocks(&[block(2, vec![]), block(3, vec![registered(3, 2)])])
+            .unwrap();
+        assert_eq!(registry.retry_folds(), 1);
+        // Decided: block 3 registered someone, the tree derived from LEZ moved on.
+        assert_eq!(registry.entries()[1].outcome, "parked");
+        assert!(matches!(
+            registry.entries()[1].error,
+            Some(BatchIngestError::DerivationMismatch { .. })
+        ));
+        // The head tip stays at the last applied batch.
+        assert_eq!(registry.covered_to(), 1);
+        // A conflict replaces the parked entry by an honest one for the same blocks.
+        let root_3 = registry.head.root();
+        let changes_3: Vec<Change> = registry
+            .pending_changes
+            .iter()
+            .map(|(_, c)| c.clone())
+            .collect();
+        let honest_3 = Batch {
+            from_lez_block_id: 2,
+            to_lez_block_id: 3,
+            changes: changes_3,
+            root_after: root_3.to_vec(),
+        };
+        let dropped = registry.apply_conflict(vec![
+            ChannelEntry {
+                msg: msg(1),
+                parent: MsgId::root(),
+                batch: Some(honest),
+            },
+            ChannelEntry {
+                msg: msg(3),
+                parent: msg(1),
+                batch: Some(honest_3),
+            },
+        ]);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(registry.entries()[1].outcome, "applied");
+        assert_eq!(registry.covered_to(), 3);
+        assert_eq!(registry.chain.head_root(), root_3);
     }
 }

@@ -1,12 +1,13 @@
 //! Verify an RLN proof (`generate_proof`'s file) against the valid-root window the Zone
-//! sequencer serves: its `GET /roots/{window_size}` answer, the newest roots with the status of
-//! their batch on Bedrock, handed in as JSON (`--roots`, `ZONE_ROOTS`) or fetched from
+//! node serves: its `GET /roots/{window_size}` answer, the newest roots with the batches that
+//! carried them to Bedrock, handed in as JSON (`--roots`, `ZONE_ROOTS`) or fetched from
 //! `--zone-url`. This is the validator side of a Module: the proof is valid when the zkSNARK
-//! verifies and its root is one of the window.
+//! verifies and its root is one of the window. A root counts once a batch carries it; with
+//! `--finalized-only`, once that batch is finalized on Bedrock.
 //!
 //! ```bash
 //! ZONE_ROOTS=$(curl -s localhost:3000/roots/5) \
-//!     cargo run --bin verify_proof -- --proof proof.json [--min-status adopted]
+//!     cargo run --bin verify_proof -- --proof proof.json [--finalized-only]
 //! ```
 //!
 //! Exit code 0 when the proof verifies, 1 when it does not, 2 on an error.
@@ -14,7 +15,7 @@
 use std::{fs, path::PathBuf, process::ExitCode};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use rln::prelude::{
     CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, PoseidonHash, Proof, RLNBuilder,
     RLNProofValues, default_graph_single, default_zkey_single, hash_to_field_le,
@@ -36,19 +37,11 @@ struct Args {
     /// How many of the newest roots count as valid, when they are fetched.
     #[arg(long, default_value_t = 5)]
     window_size: usize,
-    /// The least a root must have reached to count: `head` (the LEZ head, in no batch yet),
-    /// or its batch's status on Bedrock.
-    #[arg(long, value_enum, default_value_t = MinStatus::Pending)]
-    min_status: MinStatus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, ValueEnum)]
-enum MinStatus {
-    /// The root at the LEZ head, in no batch yet.
-    Head,
-    Pending,
-    Adopted,
-    Finalized,
+    /// Count only the roots whose batch is finalized on Bedrock (hours behind); otherwise every
+    /// root a batch carries counts, final or not. The LEZ head's root (in no batch yet) never
+    /// counts.
+    #[arg(long)]
+    finalized_only: bool,
 }
 
 /// The fields of `generate_proof`'s file the verifier reads.
@@ -84,7 +77,25 @@ struct RootEntry {
 
 #[derive(Deserialize)]
 struct BatchEntry {
-    status: String,
+    #[serde(rename = "finalized")]
+    is_finalized: bool,
+}
+
+impl RootEntry {
+    /// Whether the root counts: a batch carries it, final when asked.
+    fn counts(&self, finalized_only: bool) -> bool {
+        self.batches
+            .first()
+            .is_some_and(|b| b.is_finalized || !finalized_only)
+    }
+
+    fn standing(&self) -> &'static str {
+        match self.batches.first() {
+            None => "the LEZ head, in no batch yet",
+            Some(b) if b.is_finalized => "finalized on Bedrock",
+            Some(_) => "in a batch, not final yet",
+        }
+    }
 }
 
 fn fr_from_hex(hex: &str, what: &str) -> Result<Fr> {
@@ -101,16 +112,6 @@ fn fr_to_hex(fr: &Fr) -> String {
     fr.serialize_compressed(&mut out[..])
         .expect("an Fr is 32 bytes");
     hex::encode(out)
-}
-
-fn status_rank(status: &str) -> Option<MinStatus> {
-    match status {
-        "head" => Some(MinStatus::Head),
-        "pending" => Some(MinStatus::Pending),
-        "adopted" => Some(MinStatus::Adopted),
-        "finalized" => Some(MinStatus::Finalized),
-        _ => None,
-    }
 }
 
 async fn run(args: &Args) -> Result<bool> {
@@ -167,35 +168,42 @@ async fn run(args: &Args) -> Result<bool> {
         }
     };
     let mut valid_roots = vec![];
-    for entry in &window.roots {
-        // A root entry without batches is the LEZ head, ahead of any batch.
-        let status = entry.batches.first().map_or("head", |b| b.status.as_str());
-        let rank = status_rank(status).ok_or_else(|| anyhow!("unknown status {status}"))?;
-        if rank >= args.min_status {
-            valid_roots.push(fr_from_hex(&entry.root, "root")?);
-        }
+    for entry in window
+        .roots
+        .iter()
+        .filter(|e| e.counts(args.finalized_only))
+    {
+        valid_roots.push(fr_from_hex(&entry.root, "root")?);
     }
     println!(
-        "zone at LEZ block {}: {} root(s) in the window, {} at least {:?}",
+        "zone at LEZ block {}: {} root(s) in the window, {} carried by a batch{}",
         window.head.lez_block_id,
         window.roots.len(),
         valid_roots.len(),
-        args.min_status
+        if args.finalized_only {
+            " finalized on Bedrock"
+        } else {
+            ""
+        }
     );
     // Where the proof's root stands, said before the verdict so a refusal reads with its cause.
     let root = fr_to_hex(&values.root());
     match window.roots.iter().find(|e| e.root == root) {
         Some(entry) => {
-            let status = entry.batches.first().map_or("head", |b| b.status.as_str());
             println!(
-                "proof root {root} = the Zone's root to LEZ block {} ({status})",
-                entry.to_lez_block_id
+                "proof root {root} = the Zone's root to LEZ block {} ({})",
+                entry.to_lez_block_id,
+                entry.standing()
             );
-            if status_rank(status) < Some(args.min_status) {
+            if !entry.counts(args.finalized_only) {
                 println!(
-                    "that root is below --min-status {:?}: not offered to the verifier, so the \
-                     proof is refused until its batch gets there",
-                    args.min_status
+                    "that root is not offered to the verifier{}, so the proof is refused until \
+                     its batch gets there",
+                    if args.finalized_only {
+                        " (--finalized-only)"
+                    } else {
+                        ""
+                    }
                 );
             }
         }

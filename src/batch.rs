@@ -69,7 +69,7 @@ impl Change {
                 hex::encode(&i.rate_commitment[..4])
             ),
             Some(Kind::Remove(r)) => format!("Remove leaf {}", r.leaf_index),
-            None => "empty change".into(),
+            None => "None".into(),
         }
     }
 }

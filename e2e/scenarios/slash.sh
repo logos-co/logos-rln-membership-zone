@@ -23,7 +23,6 @@ membership=$(zone "/merkle_proof/$id_commitment") || die "the zone does not know
 [ "$(printf '%s' "$membership" | jq -r '.active')" = "true" ] || die "leaf $leaf_index is not active, nothing to slash"
 
 before=$(lez_balance "$LEZ_RLN_PAYER")
-slashed_at=$(date +%s)
 say "slashing leaf $leaf_index from $LEZ_RLN_PAYER (balance $before)"
 LEZ_RLN_ID_COMMITMENT="$id_commitment" LEZ_RLN_IDENTITY_SECRET="$identity_secret" "$slash_member" >&2 \
     || die "slash_member failed"
@@ -42,16 +41,18 @@ done
     || die "removed is $(printf '%s' "$membership" | jq -r '.removed'), not slashed"
 [ "$(printf '%s' "$membership" | jq -r '.proof')" = "null" ] || die "a removed membership still has a proof"
 root=$(printf '%s' "$membership" | jq -r '.head.root')
+removed_at=$(printf '%s' "$membership" | jq -r '.removed_at_lez_block_id')
 membership_mark_slashed "$leaf_index"
-say "leaf $leaf_index slashed, root $root"
+say "leaf $leaf_index slashed at LEZ block $removed_at, root $root"
 
 # A removed leaf leaves its slot empty, so the root may be one the zone published before; the
-# proof is a NEW root entry, produced after the slash by a batch whose changes remove the leaf.
-say "waiting for the batch removing leaf $leaf_index (root $root) to be adopted by a Bedrock block"
-status=$(root_wait_adopted \
-    '.root == $r and .batches[0].published_at_unix >= $t
+# proof is a NEW root entry, produced by the batch covering the LEZ block of the slash, whose
+# changes remove the leaf.
+say "waiting for the batch removing leaf $leaf_index (root $root)"
+status=$(root_wait_published \
+    '.root == $r and .from_lez_block_id <= $b and .to_lez_block_id >= $b
         and any(.changes[]; .kind == "remove" and .leaf_index == $leaf)' \
-    --arg r "$root" --argjson t "$slashed_at" --argjson leaf "$leaf_index") \
-    || die "no adopted batch removing leaf $leaf_index after the slash within 30 minutes"
-say "slash done: leaf $leaf_index is removed in a root Bedrock holds"
-echo "ID_COMMITMENT=$id_commitment LEAF_INDEX=$leaf_index ROOT=$root STATUS=$status"
+    --arg r "$root" --argjson b "$removed_at" --argjson leaf "$leaf_index") \
+    || die "no batch removing leaf $leaf_index after the slash within 30 minutes"
+say "slash done: leaf $leaf_index is removed in a root a batch carries"
+echo "ID_COMMITMENT=$id_commitment LEAF_INDEX=$leaf_index ROOT=$root BATCH=$status"

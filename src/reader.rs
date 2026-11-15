@@ -45,43 +45,42 @@ pub const TREE_DEPTH: usize = 20;
 /// recognised (LEZ closes a block every one to two minutes, so several days).
 pub const HASH_HISTORY: usize = 4096;
 
-/// Why a span of LEZ blocks does not continue the reader's chain.
+/// Why a span of LEZ blocks does not continue the reader's chain (the two chain checks of
+/// LEZ's `BlockIngestError`, same names).
 #[derive(Debug)]
-pub enum ChainBreak {
+pub enum BlockIngestError {
     /// A block id out of sequence: the answer is out of order or has a gap.
-    Gap { block_id: u64, expected_id: u64 },
-    /// `block_id` does not chain on the block the reader applied before it: LEZ rewrote its
+    UnexpectedBlockId { expected: u64, got: u64 },
+    /// The block does not chain on the block the reader applied before it: LEZ rewrote its
     /// history, the reader must find the last block both agree on.
-    Fork {
+    BrokenChainLink {
         block_id: u64,
-        prev_block_hash: [u8; 32],
-        expected: [u8; 32],
+        expected_prev: [u8; 32],
+        got_prev: [u8; 32],
     },
 }
 
-impl std::fmt::Display for ChainBreak {
+impl std::fmt::Display for BlockIngestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Gap {
+            Self::UnexpectedBlockId { expected, got } => {
+                write!(f, "Unexpected block id: expected {expected}, got {got}")
+            }
+            Self::BrokenChainLink {
                 block_id,
-                expected_id,
-            } => write!(f, "LEZ block {block_id} where {expected_id} was expected"),
-            Self::Fork {
-                block_id,
-                prev_block_hash,
-                expected,
+                expected_prev,
+                got_prev,
             } => write!(
                 f,
-                "LEZ block {block_id} does not chain on block {}: prev hash {}.., expected {}..",
-                block_id - 1,
-                hex::encode(&prev_block_hash[..4]),
-                hex::encode(&expected[..4])
+                "Broken chain link at LEZ block {block_id}: expected prev {}.., got prev {}..",
+                hex::encode(&expected_prev[..4]),
+                hex::encode(&got_prev[..4])
             ),
         }
     }
 }
 
-impl std::error::Error for ChainBreak {}
+impl std::error::Error for BlockIngestError {}
 
 /// The root of the empty tree, what every registry starts from.
 pub static EMPTY_ROOT: LazyLock<[u8; 32]> = LazyLock::new(|| {
@@ -410,25 +409,25 @@ impl Reader {
     /// Check that `blocks` continue this reader's chain: ids consecutive from the last block
     /// applied and each `prev_block_hash` the hash of the block before. A gap, a block out of
     /// order or a history that changed under the reader fails here, before anything is applied.
-    pub fn check_chain(&self, blocks: &[Block]) -> Result<(), ChainBreak> {
+    pub fn check_chain(&self, blocks: &[Block]) -> Result<(), BlockIngestError> {
         let mut expected_prev = self.block_hashes.last_key_value().map(|(_, h)| *h);
-        for (expected_id, block) in (self.lez_block_id + 1..).zip(blocks) {
-            if block.block_id != expected_id {
-                return Err(ChainBreak::Gap {
-                    block_id: block.block_id,
-                    expected_id,
+        for (expected, block) in (self.lez_block_id + 1..).zip(blocks) {
+            if block.block_id() != expected {
+                return Err(BlockIngestError::UnexpectedBlockId {
+                    expected,
+                    got: block.block_id(),
                 });
             }
             if let Some(prev) = expected_prev
-                && block.prev_block_hash != prev
+                && block.prev_block_hash() != prev
             {
-                return Err(ChainBreak::Fork {
-                    block_id: block.block_id,
-                    prev_block_hash: block.prev_block_hash,
-                    expected: prev,
+                return Err(BlockIngestError::BrokenChainLink {
+                    block_id: block.block_id(),
+                    expected_prev: prev,
+                    got_prev: block.prev_block_hash(),
                 });
             }
-            expected_prev = Some(block.hash);
+            expected_prev = Some(block.hash());
         }
         Ok(())
     }
@@ -502,7 +501,7 @@ impl Reader {
                             rate_commitment: fr_to_bytes_le(&leaf),
                             active: true,
                             removed: None,
-                            registered_at_lez_block_id: block.block_id,
+                            registered_at_lez_block_id: block.block_id(),
                             removed_at_lez_block_id: None,
                         },
                     );
@@ -545,11 +544,11 @@ impl Reader {
                 }
                 Event::Erased { id_commitment } => {
                     self.stats.erased += 1;
-                    changes.extend(self.end(id_commitment, Removed::Erased, block.block_id)?);
+                    changes.extend(self.end(id_commitment, Removed::Erased, block.block_id())?);
                 }
                 Event::Slashed { id_commitment } => {
                     self.stats.slashed += 1;
-                    changes.extend(self.end(id_commitment, Removed::Slashed, block.block_id)?);
+                    changes.extend(self.end(id_commitment, Removed::Slashed, block.block_id())?);
                 }
             }
         }
@@ -557,7 +556,7 @@ impl Reader {
         let mut expired: Vec<_> = self
             .members
             .iter()
-            .filter(|(_, m)| m.active && block.timestamp_ms >= m.expiry_timestamp_ms)
+            .filter(|(_, m)| m.active && block.timestamp_ms() >= m.expiry_timestamp_ms)
             .map(|(id, m)| (m.leaf_index, *id))
             .collect();
         expired.sort();
@@ -565,7 +564,7 @@ impl Reader {
             let member = self.members.get_mut(&id).expect("listed above");
             member.active = false;
             member.removed = Some(Removed::Expired);
-            member.removed_at_lez_block_id = Some(block.block_id);
+            member.removed_at_lez_block_id = Some(block.block_id());
             self.stats.removed_expired += 1;
             let leaf_index = member.leaf_index;
             self.tree
@@ -573,17 +572,17 @@ impl Reader {
                 .with_context(|| format!("delete leaf {leaf_index}"))?;
             changes.push(Change::remove(leaf_index));
         }
-        self.lez_block_id = block.block_id;
-        self.block_hashes.insert(block.block_id, block.hash);
+        self.lez_block_id = block.block_id();
+        self.block_hashes.insert(block.block_id(), block.hash());
         while self.block_hashes.len() > HASH_HISTORY {
             self.block_hashes.pop_first();
         }
         if !block.events.is_empty() {
-            self.last_event_block_id = block.block_id;
+            self.last_event_block_id = block.block_id();
         }
-        self.lez_timestamp_ms = block.timestamp_ms;
+        self.lez_timestamp_ms = block.timestamp_ms();
         if !changes.is_empty() {
-            self.roots_by_block.insert(block.block_id, self.root());
+            self.roots_by_block.insert(block.block_id(), self.root());
         }
         Ok(changes)
     }
@@ -668,7 +667,7 @@ impl Reader {
     }
 }
 
-fn parse_32(hex_str: &str) -> Result<[u8; 32]> {
+pub fn parse_32(hex_str: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(hex_str).context("tree store metadata: hex")?;
     <[u8; 32]>::try_from(bytes).map_err(|_| anyhow!("tree store metadata: not 32 bytes"))
 }
@@ -704,23 +703,26 @@ mod test {
 
     fn block(block_id: u64, timestamp_ms: u64, events: Vec<Event>) -> Block {
         Block {
-            block_id,
-            prev_block_hash: [0; 32],
-            hash: [0; 32],
-            timestamp_ms,
+            header: crate::lez::BlockHeader {
+                block_id,
+                prev_block_hash: common::HashType([0; 32]),
+                hash: common::HashType([0; 32]),
+                timestamp: timestamp_ms,
+            },
+            bedrock_status: crate::lez::BedrockStatus::Finalized,
             events,
             private_transaction_count: 0,
-            bedrock_status: crate::lez::BedrockStatus::Finalized,
         }
     }
 
     #[test]
     fn test_check_chain_refuses_gaps_disorder_and_a_changed_history() {
         let (mut reader, _) = Reader::open_temporary([0; 32], 0).unwrap();
-        let chained = |id: u64, prev: u8, hash: u8| Block {
-            prev_block_hash: [prev; 32],
-            hash: [hash; 32],
-            ..block(id, 1_000, vec![])
+        let chained = |id: u64, prev: u8, hash: u8| {
+            let mut b = block(id, 1_000, vec![]);
+            b.header.prev_block_hash = common::HashType([prev; 32]);
+            b.header.hash = common::HashType([hash; 32]);
+            b
         };
         // Nothing applied yet: the first block is taken on its id alone, the next must chain.
         let good = [chained(1, 0, 1), chained(2, 1, 2)];
@@ -747,11 +749,11 @@ mod test {
         reader.check_chain(&[chained(3, 2, 3)]).unwrap();
         assert!(matches!(
             reader.check_chain(&[chained(3, 1, 3)]),
-            Err(ChainBreak::Fork { block_id: 3, .. })
+            Err(BlockIngestError::BrokenChainLink { block_id: 3, .. })
         ));
         assert!(matches!(
             reader.check_chain(&[chained(2, 1, 2)]),
-            Err(ChainBreak::Gap { block_id: 2, .. })
+            Err(BlockIngestError::UnexpectedBlockId { got: 2, .. })
         ));
         // LEZ rewrote block 2: back to block 1 (its hash is kept), block 2 is read again.
         assert_eq!(reader.block_hash(2), Some([2; 32]));

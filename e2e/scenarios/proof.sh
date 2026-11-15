@@ -7,7 +7,7 @@
 # (`/merkle_proof/{id_commitment}` for the leaf given, else the newest registration not
 # slashed; `/roots/5`) and handed to the bins, which only compute: `generate_proof` proves
 # membership with zerokit over that path, `verify_proof` checks the proof against those
-# roots, adopted on Bedrock at least. A proof over another message must then fail: same
+# roots (every root a batch carries). A proof over another message must then fail: same
 # roots, wrong signal.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,25 +32,25 @@ export ZONE_MERKLE_PROOF
 root=$(printf '%s' "$ZONE_MERKLE_PROOF" | jq -r '.head.root')
 
 # The path is over the root at the LEZ head; the verifier below trusts a root only once a
-# Bedrock block holds its batch, so a root the sequencer has just computed is waited for here.
-say "the path is over root $root; waiting until a Bedrock block holds it (verify_proof trusts adopted roots)"
-root_wait_adopted '.root == $r' --arg r "$root" > /dev/null \
-    || die "root $root was not adopted within 30 minutes; the proof would be refused as pending"
+# batch carries it, so a root the sequencer has just computed is waited for here.
+say "the path is over root $root; waiting until a batch carries it (verify_proof trusts those roots)"
+root_wait_published '.root == $r' --arg r "$root" > /dev/null \
+    || die "no batch carried root $root within 30 minutes; the proof would be refused"
 
 say "proving membership of leaf $leaf_index"
 RLN_IDENTITY_SECRET="$identity_secret" RLN_ID_COMMITMENT="$id_commitment" \
     "$generate_proof" --signal "$signal" --out "$proof_file" >&2 || die "generate_proof failed"
 
-say "fetching the Zone's roots and verifying (adopted at least)"
+say "fetching the Zone's roots and verifying"
 ZONE_ROOTS=$(zone /roots/5) || die "cannot read the zone's roots"
 export ZONE_ROOTS
-"$verify_proof" --proof "$proof_file" --min-status adopted >&2 \
+"$verify_proof" --proof "$proof_file" >&2 \
     || die "verify_proof refused a proof over the Zone's own path (its verdict is above)"
 
 say "verifying a tampered proof (another message, same proof) must fail"
 tampered="$E2E_STATE/proof-$leaf_index-tampered.json"
 jq '.signal = "not the signal the proof binds"' "$proof_file" > "$tampered"
-if "$verify_proof" --proof "$tampered" --min-status adopted >&2; then
+if "$verify_proof" --proof "$tampered" >&2; then
     die "verify_proof accepted a proof over another message"
 fi
 

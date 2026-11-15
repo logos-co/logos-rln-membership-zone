@@ -6,8 +6,8 @@
 # Registers one membership from the payer wallet (lez-rln `register_member`), then watches
 # the Zone sequencer: the membership appears at `/merkle_proof/<id_commitment>` with the
 # leaf index the registration claimed and a proof path, and the root that includes it is
-# published in a batch (`/roots`), pending first, adopted once Bedrock holds it. The
-# membership (leaf, id_commitment, identity secret) goes on record for slash.sh and proof.sh.
+# published in a batch (`/roots`; `finalized` hours later). The membership (leaf,
+# id_commitment, identity secret) goes on record for slash.sh and proof.sh.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${1:?usage: register.sh <network.env>}"
@@ -51,8 +51,8 @@ done
 root=$(printf '%s' "$membership" | jq -r '.head.root')
 say "leaf $leaf_index active at LEZ block $(printf '%s' "$membership" | jq -r '.head.lez_block_id'), root $root"
 
-say "waiting for the batch carrying root $root to be adopted by a Bedrock block"
-status=$(root_wait_adopted '.root == $r' --arg r "$root") \
-    || die "the batch carrying root $root was not adopted within 30 minutes"
-say "registration done: leaf $leaf_index is in a root Bedrock holds, proof.sh can verify against it"
-echo "ID_COMMITMENT=$id_commitment LEAF_INDEX=$leaf_index ROOT=$root STATUS=$status"
+say "waiting for a batch carrying root $root"
+published=$(root_wait_published '.root == $r' --arg r "$root") \
+    || die "no batch carried root $root within 30 minutes"
+say "registration done: leaf $leaf_index is in a root a batch carries, proof.sh can verify against it"
+echo "ID_COMMITMENT=$id_commitment LEAF_INDEX=$leaf_index ROOT=$root BATCH=$published"

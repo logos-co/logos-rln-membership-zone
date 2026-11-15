@@ -32,14 +32,14 @@ bash e2e/scenarios/register.sh e2e/testnet.env
 credit lands once the deposit is final on Bedrock, 8 to 10 hours on the testnet, so run it,
 leave it, and re-run later (it resumes). `register.sh` sends one `Register` from the payer,
 then watches `/merkle_proof/<id_commitment>` for the leaf with the claimed index and a
-20-element path, and `/roots` for the batch carrying that root until a Bedrock block holds it
-(`pending` is published only; `adopted` is what a verifier trusts). The scripts say every
-status change and the minutes spent while they wait.
+20-element path, and `/roots` until a batch carries that root (`finalized` comes hours later;
+a verifier trusts every root a batch carries unless it asks for finalized ones only). The
+scripts say the minutes spent while they wait.
 
 ## Scenarios
 
 | Script | Checks |
 | --- | --- |
-| `scenarios/register.sh <env>` | registration -> leaf and proof at the zone -> root published and adopted on Bedrock; records the membership for `slash.sh` |
-| `scenarios/proof.sh <env>` | waits until the head root is adopted, then an RLN proof from `/merkle_proof` of the last registration (`generate_proof`) verifies against `/roots` (`verify_proof --min-status adopted`); the same proof over another message is refused |
-| `scenarios/slash.sh <env>` | slash of the last registration -> `removed: slashed`, no proof -> the root removing it published and adopted |
+| `scenarios/register.sh <env>` | registration -> leaf and proof at the zone -> root published in a batch; records the membership for `slash.sh` |
+| `scenarios/proof.sh <env>` | waits until a batch carries the head root, then an RLN proof from `/merkle_proof` of the last registration (`generate_proof`) verifies against `/roots` (`verify_proof`); the same proof over another message is refused |
+| `scenarios/slash.sh <env>` | slash of the last registration -> `removed: slashed`, no proof -> the root removing it published in a batch |

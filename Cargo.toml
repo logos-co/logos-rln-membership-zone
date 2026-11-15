@@ -20,6 +20,11 @@ lb-core = { default-features = false, package = "logos-blockchain-core", git = "
 lb-key-management-system-service = { default-features = false, package = "logos-blockchain-key-management-system-service", git = "https://github.com/logos-blockchain/logos-blockchain", tag = "0.3.2" }
 lb-zone-sdk = { default-features = false, package = "logos-blockchain-zone-sdk", git = "https://github.com/logos-blockchain/logos-blockchain", tag = "0.3.2" }
 
+# LEZ's own block and transaction types (borsh), pinned to the LEZ release the testnet runs;
+# `lee` for the account id type the transactions carry
+common = { git = "https://github.com/logos-blockchain/logos-execution-zone", tag = "v0.3.2", package = "common" }
+lee = { git = "https://github.com/logos-blockchain/logos-execution-zone", tag = "v0.3.2", package = "lee" }
+
 # the registration program's layouts (instructions, events, membership timing), from the
 # program's own repository: branch feat/rln-zone-events, the revision the testnet program
 # was deployed from (its rln-layouts sources are byte-identical to the earlier pin)
@@ -50,6 +55,7 @@ reqwest = { default-features = false, features = [
 serde = { features = ["derive"], version = "1" }
 sha2 = "0.10"
 serde_json = "1"
+thiserror = "2"
 tokio = { features = [
 	"macros",
 	"rt-multi-thread",

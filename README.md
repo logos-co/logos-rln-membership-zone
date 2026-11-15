@@ -30,10 +30,11 @@ Early design. Nothing is deployed.
 - **Zone node** (`src/`, bin `zone`), two modes on one binary, both with the HTTP registry
   API. The **sequencer** runs on the Logos testnet: it reads the registration program's
   transactions from a LEZ Sequencer, derives the tree, publishes batches on its channel
-  through the Zone SDK and follows them to finality. The **indexer** derives the same tree,
-  reads the batches from the channel's finalized history and checks each against its own
-  derivation: the watchdog of the sequencer, no key, no funds. Setup, operation and
-  troubleshooting: [`docs/setup-rln-membership-zone.md`](docs/setup-rln-membership-zone.md).
+  through the Zone SDK and follows them to finality. The **indexer** derives the same tree
+  from the LEZ blocks finalized on Bedrock only, follows the channel the same way and judges
+  each batch against its own derivation: the watchdog of the sequencer, no accredited key, no
+  funds. Setup, operation and troubleshooting:
+  [`docs/setup-rln-membership-zone.md`](docs/setup-rln-membership-zone.md).
 - **Not yet written**: the event source once LEZ serves events live, and the Module side.
 
 ## How it works
@@ -44,7 +45,7 @@ Module --Register / Extend / Erase / Slash--> LEZ registration program   (deposi
                                                    v  LEZ blocks + events, as the LEZ Sequencer closes them
                           Zone sequencer --batch--> Bedrock              (changes + root_after)
                                                    |
-                                                   v  batches: Verified or Rejected
+                                                   v  batches: applied or parked
    Module (no tree) <--roots, proof path, state-- Zone indexer           (own node, or a service)
 ```
 
@@ -55,9 +56,9 @@ Module --Register / Extend / Erase / Slash--> LEZ registration program   (deposi
    `Insert` and `Remove`, as in the lez-rln Merkle program, plus expiry by the LEZ clock.
 3. The Zone sequencer publishes the changes and the root as a
    `Batch{from_lez_block_id, to_lez_block_id, changes, root_after}` inscription.
-   Every Zone indexer recomputes each batch from LEZ and rejects any that omits, invents or misorders a change;
-   a Rejected batch's root is never a valid root.
-4. The Module reads its registry access, a Zone indexer: the valid roots (the Verified batches
+   Every Zone indexer recomputes each batch from LEZ and parks any that omits, invents or misorders a change;
+   a parked batch's root is never a valid root.
+4. The Module reads its registry access, a Zone indexer: the valid roots (the applied batches
    from the last removal on), its Merkle proof path at the newest one, its membership state and
    the LEZ clock. It proves against the newest valid root and accepts proofs against any root in
    that window, as RLN-API specifies. A node that wants to trust nobody runs its own Zone
@@ -72,12 +73,13 @@ but that only pauses the registry at the Zone indexers until a correct batch arr
 ```text
 docs/rfc-rln-membership-zone.md   the specification (raw LIP draft)
 src/                              the Zone node: sequencer and indexer (MODE), HTTP registry API; src/bin/ the proof tools
-  src/lez.rs                      LEZ blocks and the program's events, derived from its transactions (rln-layouts)
+  src/lez.rs                      LEZ blocks (LEZ's own `common` types) and the program's events, derived from its transactions (rln-layouts)
   src/reader.rs                   a reader: derivation rules over the events and the tree (sled-backed PmTree)
   src/batch.rs                    batch wire format (protobuf)
-  src/registry.rs                 published batches with their status on Bedrock, kept in the tree store
+  src/chain.rs                    the channel as a consumer keeps it, after LEZ's chain_state: final tier, view, folds
+  src/registry.rs                 one node's state: tree, channel, pending changes, checkpoint, in the tree store
   src/http.rs                     HTTP API: roots, batches, membership with its Merkle proof path, leaves
-  src/main.rs                     Zone SDK loop: publish, follow to finality, poll LEZ
+  src/main.rs                     Zone SDK loop: publish, follow the channel, poll LEZ; indexer judges instead of publishing
 lez-sequencer/                    config template to run your own LEZ sequencer as the block source
 docs/setup-rln-membership-zone.md setup, operation, monitoring, troubleshooting, cleanup
 ```
@@ -112,8 +114,8 @@ cargo run
 
 curl -s localhost:3000/ | jq                 # channel, LEZ head, event and tree counters
 curl -s localhost:3000/roots/5 | jq          # newest roots: the changes that made each, its batches on Bedrock
-MODE=indexer DATA_DIR=data-indexer HTTP_ADDR=127.0.0.1:3001 INDEXER_FROM_L1_SLOT=2734232 \
-    cargo run                # an indexer beside it: reads the channel, checks every batch
+MODE=indexer DATA_DIR=data-indexer HTTP_ADDR=127.0.0.1:3001 \
+    cargo run                # an indexer beside it: follows the channel, judges every batch
 curl -s localhost:3000/merkle_proof/0 | jq   # membership at leaf 0 (or by id_commitment) and its proof path
 curl -s localhost:3000/leaves | jq           # active and removed memberships at the LEZ head
 ```
