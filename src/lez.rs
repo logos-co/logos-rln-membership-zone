@@ -248,11 +248,11 @@ impl SequencerLez {
         })
     }
 
-    /// Decode the program's `Instruction` with the program's own layouts crate and derive
-    /// the event the program emits for it, as its `events` module defines them: `Registered`
-    /// with the expiry at the end of the grace period (`now + active + grace`), `Extended`
-    /// with the expiry the instruction claims, `Slashed` (`poseidon(identity_secret)` must be
-    /// the `id_commitment`), `Erased`; `Initialize` emits none. Every value a handler needs
+    /// Decode the program's `Instruction` with the program's own layouts crate and build
+    /// the event the program emits for it, in its `events` module's types (`RlnEvent`):
+    /// `Registered` with the expiry at the end of the grace period (`now + active + grace`),
+    /// `Extended` with the expiry the instruction claims, `Slashed` (`poseidon(identity_secret)`
+    /// must be the `id_commitment`), `Erased`; `Initialize` emits none. Every value a handler needs
     /// travels in the instruction as a claim the chain asserts. An instruction for another
     /// registry (`tree_id`) is dropped.
     fn decode_instruction(&self, data: &[u8]) -> Result<Option<RlnEvent>> {

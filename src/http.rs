@@ -133,7 +133,12 @@ async fn summary(State(state): State<AppState>) -> Json<Value> {
         "in_flight": registry.in_flight().map(hex::encode),
         "newest_published": root_ref(registry.newest(false)),
         "newest_finalized": root_ref(registry.newest(true)),
-        "endpoints": ["/roots/{window_size}", "/merkle_proof/{leaf_index or id_commitment}", "/leaves", "/health"],
+        "endpoints": [
+            "/roots/{window_size}",
+            "/merkle_proof/{leaf_index or id_commitment}",
+            "/leaves",
+            "/health"
+        ],
     });
     with_head(&registry, body)
 }
@@ -225,7 +230,9 @@ async fn leaves(State(state): State<AppState>) -> Json<Value> {
                 "id_commitment": hex::encode(id),
                 "registered_at_lez_block_id": m.registered_at_lez_block_id,
                 "expiry_timestamp_ms": m.expiry_timestamp_ms,
-                "expires_in_ms": m.expiry_timestamp_ms.saturating_sub(registry.head.lez_timestamp_ms),
+                "expires_in_ms": m
+                    .expiry_timestamp_ms
+                    .saturating_sub(registry.head.lez_timestamp_ms),
             })
         })
         .collect();

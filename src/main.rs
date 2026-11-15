@@ -37,8 +37,8 @@ use lb_zone_sdk::{
     CommonHttpClient, Slot,
     adapter::{Node as _, NodeHttpClient},
     sequencer::{
-        ChannelUpdate, Error as SeqError, Event, FinalizedOp, FundingConfig, InscriptionInfo,
-        SequencerCheckpoint, SequencerConfig, ZoneSequencer, channel_inscriptions,
+        ChannelUpdate, Error as SeqError, Event, FinalizedOp, FinalizedTx, FundingConfig,
+        InscriptionInfo, SequencerCheckpoint, SequencerConfig, ZoneSequencer, channel_inscriptions,
     },
 };
 use prost::Message as _;
@@ -47,6 +47,7 @@ use reqwest::Url;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
+    batch::Batch,
     chain::{AcceptOutcome, ChannelEntry, PublishRecord},
     http::{AppState, Shared},
     lez::{MAX_BLOCK_RANGE_LEN, SequencerLez},
@@ -270,9 +271,9 @@ async fn check_channel_on_chain(
             &tip[..8]
         ),
         Some(msg) => bail!(
-            "channel tip on chain is {}.., our newest batch is {}..: the Zone channel state does not \
-             match the channel (a batch of ours may still be in flight, or data from another run \
-             was lost); wait, or pick another CHANNEL_NAME",
+            "channel tip on chain is {}.., our newest batch is {}..: the Zone channel state does \
+             not match the channel (a batch of ours may still be in flight, or data from another \
+             run was lost); wait, or pick another CHANNEL_NAME",
             &tip[..8],
             &msg[..8]
         ),
@@ -475,6 +476,268 @@ async fn reconcile_finality(
     Ok(applied)
 }
 
+/// One `BlocksProcessed` event of the Zone SDK: the channel tip holds our batches up to `tip`,
+/// the view moved (`channel_update`: an extension, or a conflict whose dropped batches of ours
+/// are published again) and Bedrock finality reached the `finalized` entries, which go into
+/// the final tier.
+async fn on_blocks_processed(
+    sdk: &mut ZoneSequencer<NodeHttpClient>,
+    registry: &Shared,
+    tip: [u8; 32],
+    checkpoint: &SequencerCheckpoint,
+    channel_update: &ChannelUpdate,
+    finalized: &[FinalizedTx],
+) -> Result<()> {
+    save_checkpoint(registry, checkpoint)?;
+    // The channel tip is one of our batches: it and every pending publish before it are in a
+    // Bedrock block (an inscription we published is not echoed in `adopted` on a plain chain
+    // extension).
+    for msg in registry
+        .write()
+        .expect("registry lock")
+        .mark_adopted_up_to(tip)
+    {
+        println!(
+            "batch msg {} adopted in a Bedrock block (channel tip)",
+            short(&msg)
+        );
+    }
+    match channel_update {
+        ChannelUpdate::Extension { adopted } => {
+            let entries: Vec<ChannelEntry> = adopted
+                .iter()
+                .filter_map(|tx| tx.inscription())
+                .map(entry_of)
+                .collect();
+            for entry in &entries {
+                println!(
+                    "channel entry msg {} adopted in a Bedrock block",
+                    short(&entry.msg.into())
+                );
+            }
+            registry
+                .write()
+                .expect("registry lock")
+                .apply_extension(entries);
+        }
+        ChannelUpdate::Conflict { .. } => {
+            let canonical: Vec<ChannelEntry> = channel_update
+                .canonical_chain()
+                .into_iter()
+                .flatten()
+                .filter_map(|tx| tx.inscription())
+                .map(entry_of)
+                .collect();
+            let dropped = registry
+                .write()
+                .expect("registry lock")
+                .apply_conflict(canonical);
+            // A reorg dropped our batches: publish the same payloads again, in order (new
+            // messages, since their parent changed).
+            for entry in dropped {
+                let Some(batch) = entry.batch else { continue };
+                republish(sdk, registry, entry.msg.into(), &batch).await?;
+            }
+        }
+    }
+    if let Some(gap) = registry
+        .read()
+        .expect("registry lock")
+        .chain
+        .check_for_gaps_in_lineage()
+    {
+        println!(
+            "WARNING: channel entry msg {} chains on {}, which the view does not hold: the \
+             lineage has a gap",
+            short(&gap.msg.into()),
+            short(&gap.parent.into())
+        );
+    }
+    // Bedrock finality reached entries of the channel: into the final tier.
+    for tx in finalized {
+        let l1_slot = tx.l1_slot.into_inner();
+        for op in &tx.ops {
+            let FinalizedOp::Inscription(info) = op else {
+                continue;
+            };
+            let entry = entry_of(info);
+            let outcome = registry
+                .write()
+                .expect("registry lock")
+                .apply_finalized(entry.clone(), l1_slot);
+            report_finalized(&entry, l1_slot, outcome.as_ref());
+        }
+    }
+    registry.write().expect("registry lock").save()
+}
+
+/// Publish `batch` again after a reorg orphaned its message `orphaned`: a new message, since
+/// its parent changed. A refusal by the SDK is logged and left to the next conflict or poll.
+async fn republish(
+    sdk: &mut ZoneSequencer<NodeHttpClient>,
+    registry: &Shared,
+    orphaned: [u8; 32],
+    batch: &Batch,
+) -> Result<()> {
+    let inscription = Inscription::try_from(batch.encode_to_vec())
+        .map_err(|e| anyhow!("payload too large: {e:?}"))?;
+    match sdk.handle().publish(inscription).await {
+        Ok((result, checkpoint)) => {
+            let info = result.tx.inscription();
+            let record = registry.write().expect("registry lock").record_publish(
+                info.this_msg,
+                info.parent_msg,
+                batch,
+            );
+            save_checkpoint(registry, &checkpoint)?;
+            println!(
+                "batch [{}..{}] msg {} orphaned by a reorg, published again as msg {} \
+                 ({record:?})",
+                batch.from_lez_block_id,
+                batch.to_lez_block_id,
+                short(&orphaned),
+                short(&info.this_msg.into())
+            );
+        }
+        Err(e) => println!("republish after reorg failed: {e}"),
+    }
+    Ok(())
+}
+
+/// One LEZ poll. Both modes apply every LEZ block since the last poll (the finalized ones,
+/// for the indexer). The indexer then judges what it could not judge before. The sequencer
+/// checks its own statements against the tree LEZ gives now, then publishes one batch covering
+/// the LEZ blocks not covered yet when changes wait or the heartbeat is due, with at most one
+/// batch in flight. `Err` only for the tree store; an unreachable LEZ is logged and read again
+/// next poll.
+async fn on_poll(
+    source: &SequencerLez,
+    sdk: &mut ZoneSequencer<NodeHttpClient>,
+    registry: &Shared,
+    args: &Args,
+    contradicted_count: &mut usize,
+    last_publish_unix: &mut u64,
+) -> Result<()> {
+    let head = match source.last_block_id().await {
+        Ok(head) => head,
+        Err(e) => {
+            println!("LEZ unreachable: {e}");
+            return Ok(());
+        }
+    };
+    let applied_to = registry.read().expect("registry lock").head.lez_block_id;
+    if head > applied_to
+        && let Err(e) = apply_range(source, registry, applied_to + 1, head).await
+    {
+        println!("LEZ read failed: {e}");
+        return Ok(());
+    }
+    if args.mode == Mode::Indexer {
+        let decided = registry.write().expect("registry lock").retry_folds();
+        if decided > 0 {
+            println!("{decided} batch(es) judged now that LEZ is read far enough");
+            registry.write().expect("registry lock").save()?;
+        }
+        return Ok(());
+    }
+    warn_contradicted(&registry.read().expect("registry lock"), contradicted_count);
+    let batch = {
+        let registry = registry.read().expect("registry lock");
+        if registry.in_flight().is_some() {
+            return Ok(());
+        }
+        let due = registry.entries().is_empty()
+            || !registry.pending_changes.is_empty()
+            || now_unix().saturating_sub(*last_publish_unix) >= args.heartbeat_sec;
+        if due { registry.next_batch() } else { None }
+    };
+    let Some(batch) = batch else { return Ok(()) };
+    publish_batch(sdk, registry, &batch, last_publish_unix).await
+}
+
+/// The sequencer's own batches that LEZ now contradicts (the tree at `to_lez_block_id` has
+/// another root than the batch claims), warned once per change of the set.
+fn warn_contradicted(registry: &Registry, contradicted_count: &mut usize) {
+    let contradicted = registry.contradicted();
+    if contradicted.len() == *contradicted_count {
+        return;
+    }
+    *contradicted_count = contradicted.len();
+    for e in contradicted {
+        let now = e
+            .to_lez_block_id
+            .and_then(|to| registry.head.root_at(to))
+            .map(|r| hex::encode(&r[..4]))
+            .unwrap_or_default();
+        println!(
+            "WARNING: batch msg {} claims root {}.. at LEZ block {}, LEZ now gives {}..: an \
+             indexer parks on it and every later batch",
+            &e.msg_id[..8],
+            &e.root.clone().unwrap_or_default()[..8],
+            e.to_lez_block_id.unwrap_or_default(),
+            now
+        );
+    }
+}
+
+/// Publish the next batch: recorded as in flight and saved with the checkpoint on success, so
+/// a restart knows it; `last_publish_unix` restarts the heartbeat. A batch too large for one
+/// inscription or a refusal by the SDK is logged and tried again next poll.
+async fn publish_batch(
+    sdk: &mut ZoneSequencer<NodeHttpClient>,
+    registry: &Shared,
+    batch: &Batch,
+    last_publish_unix: &mut u64,
+) -> Result<()> {
+    let inscription = match Inscription::try_from(batch.encode_to_vec()) {
+        Ok(inscription) => inscription,
+        Err(e) => {
+            println!(
+                "batch [{}..{}] does not fit one inscription: {e:?}",
+                batch.from_lez_block_id, batch.to_lez_block_id
+            );
+            return Ok(());
+        }
+    };
+    match sdk.handle().publish(inscription).await {
+        Ok((result, checkpoint)) => {
+            let info = result.tx.inscription();
+            let record = {
+                let mut registry = registry.write().expect("registry lock");
+                let record = registry.record_publish(info.this_msg, info.parent_msg, batch);
+                registry.save()?;
+                record
+            };
+            save_checkpoint(registry, &checkpoint)?;
+            *last_publish_unix = now_unix();
+            let described: Vec<_> = batch.changes.iter().map(|c| c.describe()).collect();
+            println!(
+                "batch [{}..{}] published as msg {} on {}: root {}.., {}{}",
+                batch.from_lez_block_id,
+                batch.to_lez_block_id,
+                short(&info.this_msg.into()),
+                short(&info.parent_msg.into()),
+                hex::encode(&batch.root_after[..4]),
+                if described.is_empty() {
+                    "no changes".into()
+                } else {
+                    described.join("; ")
+                },
+                if record == PublishRecord::Extended {
+                    "".into()
+                } else {
+                    format!(" ({record:?})")
+                }
+            );
+        }
+        Err(SeqError::Unavailable { reason }) => {
+            println!("not ready to publish ({reason}), retry next poll")
+        }
+        Err(e) => println!("publish failed: {e}"),
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -606,8 +869,8 @@ async fn main() -> Result<()> {
         );
         if let Some(stall) = registry.chain.stall() {
             println!(
-                "  WARNING   the final tier is frozen at batch msg {} (L1 slot {}): {}; {} batch(es) \
-                 parked after it",
+                "  WARNING   the final tier is frozen at batch msg {} (L1 slot {}): {}; {} \
+                 batch(es) parked after it",
                 short(&stall.msg),
                 stall.l1_slot,
                 stall.error,
@@ -642,158 +905,41 @@ async fn main() -> Result<()> {
     finality_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        // rustfmt does not reach into `select!`: every arm is one call, the work is in the
+        // `on_*` functions above.
         tokio::select! {
             event = sdk.next_event() => match event {
                 Event::Ready => {
-                    if !ready { println!("ready\n"); }
+                    if !ready {
+                        println!("ready\n");
+                    }
                     ready = true;
                 }
                 Event::BlocksProcessed { checkpoint, channel_update, finalized, .. } => {
-                    save_checkpoint(&registry, &checkpoint)?;
-                    // The channel tip is one of our batches: it and every pending publish
-                    // before it are in a Bedrock block (an inscription we published is not
-                    // echoed in `adopted` on a plain chain extension).
                     let tip: [u8; 32] = channel_view.borrow().tip_message.into();
-                    for msg in registry.write().expect("registry lock").mark_adopted_up_to(tip) {
-                        println!("batch msg {} adopted in a Bedrock block (channel tip)", short(&msg));
-                    }
-                    match &channel_update {
-                        ChannelUpdate::Extension { adopted } => {
-                            let entries: Vec<ChannelEntry> = adopted.iter().filter_map(|tx| tx.inscription()).map(entry_of).collect();
-                            for entry in &entries {
-                                println!("channel entry msg {} adopted in a Bedrock block", short(&entry.msg.into()));
-                            }
-                            registry.write().expect("registry lock").apply_extension(entries);
-                        }
-                        ChannelUpdate::Conflict { .. } => {
-                            let canonical: Vec<ChannelEntry> = channel_update
-                                .canonical_chain()
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|tx| tx.inscription())
-                                .map(entry_of)
-                                .collect();
-                            let dropped = registry.write().expect("registry lock").apply_conflict(canonical);
-                            // A reorg dropped our batches: publish the same payloads again, in
-                            // order (new messages, since their parent changed).
-                            for entry in dropped {
-                                let Some(batch) = entry.batch else { continue };
-                                let inscription = Inscription::try_from(batch.encode_to_vec()).map_err(|e| anyhow!("payload too large: {e:?}"))?;
-                                match sdk.handle().publish(inscription).await {
-                                    Ok((result, checkpoint)) => {
-                                        let info = result.tx.inscription();
-                                        let record = registry.write().expect("registry lock").record_publish(info.this_msg, info.parent_msg, &batch);
-                                        save_checkpoint(&registry, &checkpoint)?;
-                                        println!(
-                                            "batch [{}..{}] msg {} orphaned by a reorg, published again as msg {} ({record:?})",
-                                            batch.from_lez_block_id, batch.to_lez_block_id,
-                                            short(&entry.msg.into()), short(&info.this_msg.into())
-                                        );
-                                    }
-                                    Err(e) => println!("republish after reorg failed: {e}"),
-                                }
-                            }
-                        }
-                    }
-                    if let Some(gap) = registry.read().expect("registry lock").chain.check_for_gaps_in_lineage() {
-                        println!(
-                            "WARNING: channel entry msg {} chains on {}, which the view does not hold: the lineage has a gap",
-                            short(&gap.msg.into()), short(&gap.parent.into())
-                        );
-                    }
-                    // Bedrock finality reached entries of the channel: into the final tier.
-                    for tx in &finalized {
-                        let l1_slot = tx.l1_slot.into_inner();
-                        for op in &tx.ops {
-                            let FinalizedOp::Inscription(info) = op else { continue };
-                            let entry = entry_of(info);
-                            let outcome = registry.write().expect("registry lock").apply_finalized(entry.clone(), l1_slot);
-                            report_finalized(&entry, l1_slot, outcome.as_ref());
-                        }
-                    }
-                    registry.write().expect("registry lock").save()?;
+                    on_blocks_processed(
+                        &mut sdk,
+                        &registry,
+                        tip,
+                        &checkpoint,
+                        &channel_update,
+                        &finalized,
+                    )
+                    .await?;
                 }
                 _ => {}
             },
             _ = tick.tick(), if ready => {
-                // 1. LEZ: apply every block since the last poll (the finalized ones, for the
-                //    indexer).
-                let head = match source.last_block_id().await {
-                    Ok(head) => head,
-                    Err(e) => { println!("LEZ unreachable: {e}"); continue; }
-                };
-                let applied_to = registry.read().expect("registry lock").head.lez_block_id;
-                if head > applied_to
-                    && let Err(e) = apply_range(&source, &registry, applied_to + 1, head).await
-                {
-                    println!("LEZ read failed: {e}");
-                    continue;
-                }
-                if indexer {
-                    let decided = registry.write().expect("registry lock").retry_folds();
-                    if decided > 0 {
-                        println!("{decided} batch(es) judged now that LEZ is read far enough");
-                        registry.write().expect("registry lock").save()?;
-                    }
-                    continue;
-                }
-                // 2. The sequencer checks its own statements against the tree LEZ gives now.
-                {
-                    let registry = registry.read().expect("registry lock");
-                    let contradicted = registry.contradicted();
-                    if contradicted.len() != contradicted_count {
-                        contradicted_count = contradicted.len();
-                        for e in contradicted {
-                            println!(
-                                "WARNING: batch msg {} claims root {}.. at LEZ block {}, LEZ now gives {}..: an indexer parks on it and every later batch",
-                                &e.msg_id[..8], &e.root.clone().unwrap_or_default()[..8], e.to_lez_block_id.unwrap_or_default(),
-                                e.to_lez_block_id.and_then(|to| registry.head.root_at(to)).map(|r| hex::encode(&r[..4])).unwrap_or_default()
-                            );
-                        }
-                    }
-                }
-                // 3. One batch covering the LEZ blocks not covered yet, when there are changes
-                //    or the heartbeat is due, with at most one batch in flight.
-                let batch = {
-                    let registry = registry.read().expect("registry lock");
-                    if registry.in_flight().is_some() { continue; }
-                    let due = registry.entries().is_empty()
-                        || !registry.pending_changes.is_empty()
-                        || now_unix().saturating_sub(last_publish_unix) >= args.heartbeat_sec;
-                    if due { registry.next_batch() } else { None }
-                };
-                let Some(batch) = batch else { continue };
-                let inscription = match Inscription::try_from(batch.encode_to_vec()) {
-                    Ok(inscription) => inscription,
-                    Err(e) => { println!("batch [{}..{}] does not fit one inscription: {e:?}", batch.from_lez_block_id, batch.to_lez_block_id); continue; }
-                };
-                match sdk.handle().publish(inscription).await {
-                    Ok((result, checkpoint)) => {
-                        let info = result.tx.inscription();
-                        let record = {
-                            let mut registry = registry.write().expect("registry lock");
-                            let record = registry.record_publish(info.this_msg, info.parent_msg, &batch);
-                            registry.save()?;
-                            record
-                        };
-                        save_checkpoint(&registry, &checkpoint)?;
-                        last_publish_unix = now_unix();
-                        let described: Vec<_> = batch.changes.iter().map(|c| c.describe()).collect();
-                        println!(
-                            "batch [{}..{}] published as msg {} on {}: root {}.., {}{}",
-                            batch.from_lez_block_id,
-                            batch.to_lez_block_id,
-                            short(&info.this_msg.into()),
-                            short(&info.parent_msg.into()),
-                            hex::encode(&batch.root_after[..4]),
-                            if described.is_empty() { "no changes".into() } else { described.join("; ") },
-                            if record == PublishRecord::Extended { "".into() } else { format!(" ({record:?})") }
-                        );
-                    }
-                    Err(SeqError::Unavailable { reason }) => println!("not ready to publish ({reason}), retry next poll"),
-                    Err(e) => println!("publish failed: {e}"),
-                }
-            },
+                on_poll(
+                    &source,
+                    &mut sdk,
+                    &registry,
+                    &args,
+                    &mut contradicted_count,
+                    &mut last_publish_unix,
+                )
+                .await?;
+            }
             _ = finality_tick.tick(), if ready => {
                 match reconcile_finality(&node, channel_id, &registry).await {
                     Ok(0) => {}

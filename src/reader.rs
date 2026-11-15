@@ -871,9 +871,12 @@ mod test {
 
     #[test]
     fn test_member_reads_the_previous_layout() {
-        let member: Member = serde_json::from_str(
-            r#"{"leaf_index":3,"expiry_timestamp_ms":5,"rate_commitment":"00000000000000000000000000000000000000000000000000000000000000ff","live":false,"removed":"Slashed"}"#,
-        )
+        let member: Member = serde_json::from_str(concat!(
+            r#"{"leaf_index":3,"expiry_timestamp_ms":5,"#,
+            r#""rate_commitment":"#,
+            r#""00000000000000000000000000000000000000000000000000000000000000ff","#,
+            r#""live":false,"removed":"Slashed"}"#
+        ))
         .unwrap();
         assert!(!member.active);
         assert_eq!(member.removed, Some(Removed::Slashed));

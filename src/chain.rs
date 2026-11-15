@@ -919,7 +919,8 @@ mod test {
         oracle.read_to = 4;
         assert_eq!(chain.retry_folds(Some(&oracle)), 1);
         assert_eq!(chain.head_tip().unwrap().to_lez_block_id, 4);
-        // A persisted view keeps an undecided entry's batch (it will be judged), not a parked one's.
+        // A persisted view keeps an undecided entry's batch (it will be judged), not a parked
+        // one's.
         let bytes = chain.encode_view();
         let mut restored = ChainState::new();
         restored.restore_view(&bytes, Some(&oracle)).unwrap();
