@@ -30,7 +30,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use lb_core::mantle::{
     gas::GasCost,
-    ops::channel::{ChannelId, inscribe::Inscription},
+    ops::channel::{ChannelId, MsgId, inscribe::Inscription},
 };
 use lb_key_management_system_service::keys::{ED25519_SECRET_KEY_SIZE, Ed25519Key, ZkPublicKey};
 use lb_zone_sdk::{
@@ -212,31 +212,57 @@ struct ChannelOnChain {
     tip_message: String,
 }
 
-/// Refuse to start a sequencer on a channel this data dir cannot continue. The Zone SDK learns
-/// a channel's tip from finalized history only, so without a checkpoint it chains the next
-/// batch on the root; on a channel that already has messages that batch is invalid
-/// (`InvalidParent`) and vanishes without a trace. Likewise another key cannot write at all.
-async fn check_channel_on_chain(
-    node_url: &Url,
-    channel_id: ChannelId,
-    our_key: &[u8; 32],
-    registry: &Shared,
-    resumed: bool,
-) -> Result<()> {
+/// The channel as the node knows it (`GET /channel/:id`): `None` while no message of it is on
+/// chain (the first inscription creates it).
+async fn channel_on_chain(node_url: &Url, channel_id: ChannelId) -> Result<Option<ChannelOnChain>> {
     let url = node_url.join(&format!("channel/{}", hex::encode(channel_id.as_ref())))?;
     let response = reqwest::get(url.clone())
         .await
         .with_context(|| format!("GET {url}"))?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        println!("  chain     channel not on chain yet; the first batch creates it");
-        return Ok(());
+        return Ok(None);
     }
-    let channel: ChannelOnChain = response
+    response
         .error_for_status()
         .with_context(|| format!("GET {url}"))?
         .json()
         .await
-        .with_context(|| format!("GET {url}: unexpected body"))?;
+        .map(Some)
+        .with_context(|| format!("GET {url}: unexpected body"))
+}
+
+/// The Zone SDK checkpoint for a channel with no message on chain yet: nothing to backfill, so
+/// the SDK starts at the node's LIB instead of walking finalized history from genesis (30 to
+/// 60 minutes on the testnet, hours when the node is slow). Every field is what a cold start
+/// computes for an empty channel: root tip, no pending transaction, no channel note, root
+/// config lineage.
+async fn checkpoint_at_lib(node: &NodeHttpClient) -> Result<SequencerCheckpoint> {
+    let info = node
+        .consensus_info()
+        .await
+        .map_err(|e| anyhow!("consensus info: {e}"))?
+        .cryptarchia_info;
+    Ok(SequencerCheckpoint {
+        last_msg_id: MsgId::root(),
+        pending_txs: vec![],
+        lib: info.lib,
+        lib_slot: info.lib_slot,
+        channel_notes: vec![],
+        finalized_config: MsgId::root(),
+        funding: vec![],
+    })
+}
+
+/// Refuse to start a sequencer on a channel this data dir cannot continue. The Zone SDK learns
+/// a channel's tip from finalized history only, so without a checkpoint it chains the next
+/// batch on the root; on a channel that already has messages that batch is invalid
+/// (`InvalidParent`) and vanishes without a trace. Likewise another key cannot write at all.
+fn check_channel_on_chain(
+    channel: &ChannelOnChain,
+    our_key: &[u8; 32],
+    registry: &Shared,
+    resumed: bool,
+) -> Result<()> {
     let ours = hex::encode(our_key);
     if !channel
         .accredited_keys
@@ -816,16 +842,32 @@ async fn main() -> Result<()> {
         .transpose()
         .context("Zone SDK checkpoint in the tree store")?;
     let resumed = checkpoint.is_some();
-    if !indexer {
-        check_channel_on_chain(
-            &node_url,
-            channel_id,
-            &signing_key.public_key().to_bytes(),
-            &registry,
-            resumed,
-        )
-        .await?;
-    }
+    let channel = channel_on_chain(&node_url, channel_id).await?;
+    let checkpoint = match &channel {
+        Some(channel) => {
+            if !indexer {
+                check_channel_on_chain(
+                    channel,
+                    &signing_key.public_key().to_bytes(),
+                    &registry,
+                    resumed,
+                )?;
+            }
+            checkpoint
+        }
+        // No message of the channel on chain: nothing to walk, start at the LIB. A batch of
+        // ours still in flight is the one thing a stored checkpoint knows better.
+        None if registry
+            .read()
+            .expect("registry lock")
+            .in_flight()
+            .is_none() =>
+        {
+            println!("  chain     channel not on chain yet; the first batch creates it");
+            Some(checkpoint_at_lib(&node).await?)
+        }
+        None => checkpoint,
+    };
     let sdk_config = SequencerConfig {
         stale_refund_slots: args.stale_refund_slots,
         ..SequencerConfig::new(funding)

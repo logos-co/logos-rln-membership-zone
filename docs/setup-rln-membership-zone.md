@@ -113,10 +113,11 @@ What happens, in order:
    built by reading every LEZ block from `FIRST_LEZ_BLOCK_ID` to the head, so every
    registration made before the sequencer existed is applied and the first batch covers all
    of them; later starts continue from the block the store is at.
-3. The Zone SDK backfills the channel from the node: from slot 0 the first time (30 to 60
-   minutes on the testnet), from the checkpoint kept in the tree store after that (seconds
-   to minutes).
-   Then `ready`.
+3. The Zone SDK follows the channel from the node. A channel with no message on chain yet
+   starts at the LIB (seconds: nothing to walk). A channel with history is walked from genesis
+   the first time (30 to 60 minutes on the testnet; a `408 Request Timeout` on a backfill page
+   means the node is slow, the SDK retries the page) and from the checkpoint kept in the tree
+   store after that (seconds to minutes). Then `ready`.
 4. Every `POLL_SEC` the new LEZ blocks are applied; a batch goes out when there are
    changes, when `HEARTBEAT_SEC` passed without one, or when none was ever published; at
    most one batch in flight.
@@ -170,9 +171,10 @@ store, the key stays.
 
 The same binary in `--mode indexer` trusts nobody about the batches. It follows the channel
 exactly like the sequencer (the Zone SDK with a key of its own that is not accredited, so it
-only reads; the SDK's cold start walks the channel's finalized history from the beginning, no
-start slot to give) and derives the tree from LEZ like the sequencer, but from the LEZ blocks
-final on Bedrock only (LEZ's `bedrock_status`), so its tree can never be rewritten under it.
+only reads; a channel with history is walked from genesis once, no start slot to give; started
+before the first batch it begins at the LIB like the sequencer) and derives the tree from LEZ
+like the sequencer, but from the LEZ blocks final on Bedrock only (LEZ's `bedrock_status`), so
+its tree can never be rewritten under it.
 Every batch of the channel is folded the way LEZ folds a block, with the indexer as judge: it
 must continue the tip (`from_lez_block_id`), its `changes` must replay to its `root_after`, and
 that root must be the indexer's own tree at `to_lez_block_id`. The outcome is LEZ's
