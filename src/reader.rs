@@ -710,6 +710,7 @@ mod test {
             timestamp_ms,
             events,
             private_transaction_count: 0,
+            bedrock_status: crate::lez::BedrockStatus::Finalized,
         }
     }
 

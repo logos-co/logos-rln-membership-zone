@@ -86,6 +86,7 @@ sed -i "s/^FUNDING_PK=.*/FUNDING_PK=$(yq .public_keys.PoWClaim ~/keystore.yaml)/
 | `TREE_ID` | `47b2de4f...b4cf` | Registry the program serves, first field of every event |
 | `FIRST_LEZ_BLOCK_ID` | 49431 | Block the program was deployed in; nothing before it is read |
 | `LEZ_SEQUENCER_URL` | `https://testnet.lez.logos.co` | Where the LEZ blocks come from (section 4 or 5) |
+| `LEZ_BLOCK_STATUS` | `closed` (sequencer), `finalized` (indexer) | Which LEZ blocks the tree follows: every closed block, or only the ones final on Bedrock (section 4) |
 | `REBUILD_TREE` | false | Drop the tree and read it again from LEZ, keeping the batch history and the checkpoint (after a decoder fix that had skipped transactions) |
 | `POLL_SEC` | 10 | Seconds between LEZ polls |
 | `HEARTBEAT_SEC` | 3600 | Publish an empty batch after this long without one |
@@ -164,14 +165,17 @@ rm -rf data/tree
 ### Run an indexer
 
 The same binary in `--mode indexer` trusts nobody about the batches: it derives the tree
-from LEZ like the sequencer, reads the Zone channel's inscriptions from the finalized L1
-blocks of the node (`immutable_blocks`, every 5 minutes, from `INDEXER_FROM_L1_SLOT` on the
-first start, then from where it stopped) and checks each batch three ways: it continues the
-previous one (`from_lez_block_id`), its `changes` replay to its `root_after`, and that root is
-the indexer's own tree at `to_lez_block_id`. A batch that fails is kept with its reason and
-does not move the replay tree; a batch for LEZ blocks the indexer has not read yet waits
-(`pending`) and is checked once it has. No key, no funds, no publishing: only the node's HTTP
-API and the LEZ source. Run it beside the sequencer with its own data dir and port:
+from LEZ like the sequencer, but from the LEZ blocks final on Bedrock only
+(`LEZ_BLOCK_STATUS=finalized` by default: its tree can never be rewritten under it, and a
+batch LEZ later contradicts is a true rejection), reads the Zone channel's inscriptions from the
+finalized L1 blocks of the node (`immutable_blocks`, every 5 minutes, from
+`INDEXER_FROM_L1_SLOT` on the first start, then from where it stopped) and checks each batch
+three ways: it continues the previous one (`from_lez_block_id`), its `changes` replay to its
+`root_after`, and that root is the indexer's own tree at `to_lez_block_id`. A batch that fails
+is kept with its reason and does not move the replay tree; a batch for LEZ blocks not final yet
+waits (`pending`) and is checked once they are, about when the batch itself is final on L1. No
+key, no funds, no publishing: only the node's HTTP API and the LEZ source. Run it beside the
+sequencer with its own data dir and port:
 
 ```bash
 set -a; . ./.env; set +a
@@ -260,7 +264,12 @@ Zerokit) while the membership is active, `null` otherwise.
 
 `LEZ_SEQUENCER_URL=https://testnet.lez.logos.co`. The Zone sequencer polls `getLastBlockId` and reads
 `getBlockRange` (1024 blocks per call, closed blocks within seconds of being produced, no
-finality wait). The RPC serves no events, so the program's events are derived from its
+finality wait). Each block carries LEZ's own `bedrock_status`: `Pending` until the inscription
+carrying it is final on Bedrock, `Finalized` from then on (a closed block is the LEZ Sequencer's
+word, a restart of it can produce an unanchored block again; a finalized one is immutable).
+`LEZ_BLOCK_STATUS` picks which blocks the tree follows: `closed` (every block served, the
+sequencer's default: the latest state) or `finalized` (the indexer's default: hours behind, never
+rewritten). The RPC serves no events, so the program's events are derived from its
 transactions: a block holds only transactions that succeeded, so every `Register` to the
 program is a `Registered`, every `Slash` a `Slashed` of `poseidon(identity_secret)`, and so
 on. The tree is the same as from the events; only the input differs from the RFC's.

@@ -944,6 +944,7 @@ mod test {
             timestamp_ms: 1_000,
             events,
             private_transaction_count: 0,
+            bedrock_status: crate::lez::BedrockStatus::Finalized,
         }
     }
 

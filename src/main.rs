@@ -68,6 +68,17 @@ const TREE_ID_HEX: &str = "47b2de4f08080e74e2d4beffe8e5e87e709dd598619c9b322b64f
 /// LEZ block the program was deployed in: no event comes before it.
 const DEFAULT_FIRST_LEZ_BLOCK_ID: u64 = 49_431;
 
+/// Which LEZ blocks the tree is derived from.
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+enum LezBlockStatus {
+    /// Every block the LEZ Sequencer has closed, within seconds: the latest state, on the
+    /// Sequencer's word (a restart of it can rewrite an unanchored block).
+    Closed,
+    /// Only the blocks whose inscription is final on Bedrock (`bedrock_status`): immutable,
+    /// hours behind.
+    Finalized,
+}
+
 /// What this binary is: the one sequencer of the Zone, or an indexer that trusts nobody.
 #[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
 enum Mode {
@@ -84,6 +95,10 @@ struct Args {
     /// `sequencer` publishes the batches, `indexer` reads and checks them.
     #[arg(long, value_enum, default_value_t = Mode::Sequencer, env = "MODE")]
     mode: Mode,
+    /// Which LEZ blocks the tree follows: `closed` (the sequencer's default, latest state) or
+    /// `finalized` (the indexer's default, Bedrock-final blocks only).
+    #[arg(long, value_enum, env = "LEZ_BLOCK_STATUS")]
+    lez_block_status: Option<LezBlockStatus>,
     /// Logos Blockchain node HTTP API (no auth, local).
     #[arg(long, default_value = "http://127.0.0.1:8080", env = "NODE_URL")]
     node_url: String,
@@ -302,6 +317,8 @@ async fn apply_range(
     while start <= to {
         let end = to.min(start + MAX_BLOCK_RANGE_LEN - 1);
         let blocks = source.blocks(start, end).await?;
+        // Fewer than asked: the rest is not final on Bedrock yet, read again next time.
+        let short = (blocks.len() as u64) < end - start + 1;
         // The chain check comes first: nothing of a span that does not continue the
         // reader's chain is applied or logged.
         let broken = {
@@ -353,6 +370,9 @@ async fn apply_range(
         registry.apply_blocks(&blocks)?;
         registry.save()?;
         applied += blocks.len();
+        if short {
+            break;
+        }
         start = end + 1;
     }
     Ok(applied)
@@ -406,7 +426,16 @@ async fn main() -> Result<()> {
     // LEZ source.
     let program_account_id = parse_32(&args.program_account_id, "PROGRAM_ACCOUNT_ID")?;
     let tree_id = parse_32(&args.tree_id, "TREE_ID")?;
-    let source = SequencerLez::new(args.lez_sequencer_url.clone(), program_account_id, tree_id);
+    let lez_block_status = args.lez_block_status.unwrap_or(match args.mode {
+        Mode::Sequencer => LezBlockStatus::Closed,
+        Mode::Indexer => LezBlockStatus::Finalized,
+    });
+    let source = SequencerLez::new(
+        args.lez_sequencer_url.clone(),
+        program_account_id,
+        tree_id,
+        lez_block_status == LezBlockStatus::Finalized,
+    );
 
     // Registry: the tree store under the data dir, with the batch history and the checkpoint.
     let registry: Shared = Arc::new(RwLock::new(Registry::open(

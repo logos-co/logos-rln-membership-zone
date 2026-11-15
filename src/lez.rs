@@ -52,8 +52,34 @@ impl Event {
     }
 }
 
-/// A closed LEZ block as a reader sees it: its id, its timestamp (the LEZ clock, ms) and the
-/// registration program's events in transaction order.
+/// Where a LEZ block stands on Bedrock, as the LEZ Sequencer records it: the block is its own
+/// statement until the inscription carrying it is final under Bedrock's LIB.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BedrockStatus {
+    /// Closed and served, its inscription not final yet; a restart of the LEZ Sequencer can
+    /// produce the block again with other contents.
+    Pending,
+    /// Defined by LEZ, never set by it.
+    Safe,
+    /// Its inscription is under Bedrock's LIB: immutable.
+    Finalized,
+}
+
+impl TryFrom<u8> for BedrockStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(tag: u8) -> Result<Self> {
+        Ok(match tag {
+            0 => Self::Pending,
+            1 => Self::Safe,
+            2 => Self::Finalized,
+            other => bail!("unknown BedrockStatus tag {other}"),
+        })
+    }
+}
+
+/// A closed LEZ block as a reader sees it: its id, its timestamp (the LEZ clock, ms), the
+/// registration program's events in transaction order and where it stands on Bedrock.
 #[derive(Debug, Clone)]
 pub struct Block {
     pub block_id: u64,
@@ -66,6 +92,18 @@ pub struct Block {
     /// They carry no instruction and emit no event, so each changed the registry without this
     /// reader seeing what; the ones under other programs are not counted.
     pub private_transaction_count: u32,
+    pub bedrock_status: BedrockStatus,
+}
+
+/// The leading blocks that are final on Bedrock: what a reader that trusts no closed block
+/// applies. Stops at the first other one, so the chain stays contiguous.
+pub fn finalized_prefix(mut blocks: Vec<Block>) -> Vec<Block> {
+    let end = blocks
+        .iter()
+        .position(|b| b.bedrock_status != BedrockStatus::Finalized)
+        .unwrap_or(blocks.len());
+    blocks.truncate(end);
+    blocks
 }
 
 /// One transaction of a block as the decoder classifies it.
@@ -92,16 +130,25 @@ pub struct SequencerLez {
     tree_id: [u8; 32],
     /// `Registered` seen so far, the next `leaf_index`.
     registered: AtomicU64,
+    /// Serve only the blocks final on Bedrock (`bedrock_status`): a reader that waits for
+    /// LEZ finality instead of trusting closed blocks.
+    finalized_only: bool,
 }
 
 impl SequencerLez {
-    pub fn new(url: String, program_account_id: [u8; 32], tree_id: [u8; 32]) -> Self {
+    pub fn new(
+        url: String,
+        program_account_id: [u8; 32],
+        tree_id: [u8; 32],
+        finalized_only: bool,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
             url,
             program_account_id,
             tree_id,
             registered: AtomicU64::new(0),
+            finalized_only,
         }
     }
 
@@ -130,9 +177,14 @@ impl SequencerLez {
     /// Short name for logs.
     pub fn describe(&self) -> String {
         format!(
-            "LEZ Sequencer {} (closed blocks, events derived from the program's transactions), \
+            "LEZ Sequencer {} ({} blocks, events derived from the program's transactions), \
              program {}",
             self.url,
+            if self.finalized_only {
+                "Bedrock-finalized"
+            } else {
+                "closed"
+            },
             hex::encode(self.program_account_id)
         )
     }
@@ -148,12 +200,23 @@ impl SequencerLez {
         self.rpc("getLastBlockId", json!([])).await
     }
 
-    /// The blocks `from..=to`, in order, with the program's events of each.
+    /// The blocks `from..=to`, in order, with the program's events of each; with
+    /// `finalized_only`, the leading ones final on Bedrock (fewer than asked while LEZ
+    /// finality lags).
     ///
     /// A call asks for up to `MAX_BLOCK_RANGE_LEN` blocks; when the sequencer refuses the answer
     /// as too big (its 10 MiB response cap, code `-32008`, blocks with many transactions)
     /// the range is halved and asked again, down to one block.
     pub async fn blocks(&self, from: u64, to: u64) -> Result<Vec<Block>> {
+        let blocks = self.closed_blocks(from, to).await?;
+        Ok(if self.finalized_only {
+            finalized_prefix(blocks)
+        } else {
+            blocks
+        })
+    }
+
+    async fn closed_blocks(&self, from: u64, to: u64) -> Result<Vec<Block>> {
         let mut blocks = vec![];
         let mut start = from;
         let mut range = MAX_BLOCK_RANGE_LEN;
@@ -204,6 +267,7 @@ impl SequencerLez {
                 Err(e) => bail!("LEZ block {block_id} tx {tx_index}: {e}"),
             }
         }
+        let bedrock_status = BedrockStatus::try_from(c.take(1)?[0])?;
         Ok(Block {
             block_id,
             prev_block_hash,
@@ -211,6 +275,7 @@ impl SequencerLez {
             timestamp_ms,
             events,
             private_transaction_count,
+            bedrock_status,
         })
     }
 
@@ -452,7 +517,7 @@ mod test {
     #[test]
     fn test_decode_every_instruction() {
         use rln_layouts::Instruction;
-        let lez = SequencerLez::new("http://unused".into(), [1; 32], [7; 32]);
+        let lez = SequencerLez::new("http://unused".into(), [1; 32], [7; 32], false);
         let keys = rln::prelude::IdentityKeys::generate::<PoseidonHash, rand::rngs::ThreadRng>(
             &mut rand::thread_rng(),
         );
@@ -555,7 +620,7 @@ mod test {
     #[test]
     fn test_decode_block_with_two_public_transactions() {
         let program = [1u8; 32];
-        let lez = SequencerLez::new("http://unused".into(), program, [7; 32]);
+        let lez = SequencerLez::new("http://unused".into(), program, [7; 32], false);
         let tx = |to: [u8; 32], data: &[u8]| {
             let mut b = vec![0u8];
             b.extend(to);
@@ -588,6 +653,19 @@ mod test {
         assert_eq!(decoded.timestamp_ms, 1_234);
         assert!(decoded.events.is_empty());
         assert_eq!(decoded.private_transaction_count, 0);
+        assert_eq!(decoded.bedrock_status, BedrockStatus::Pending);
+        // A reader waiting for LEZ finality takes the finalized blocks in front, no more.
+        let final_block = |id: u64| Block {
+            block_id: id,
+            bedrock_status: BedrockStatus::Finalized,
+            ..decoded.clone()
+        };
+        let prefix = finalized_prefix(vec![final_block(1), final_block(2), decoded.clone()]);
+        assert_eq!(
+            prefix.iter().map(|b| b.block_id).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(finalized_prefix(vec![decoded.clone(), final_block(1)]).is_empty());
     }
 
     /// A privacy-preserving transaction (every field populated) between two public ones: it
@@ -596,7 +674,7 @@ mod test {
     fn test_decode_block_skips_privacy_preserving_transactions_and_counts_the_programs() {
         use rln_layouts::Instruction;
         let program = [1u8; 32];
-        let lez = SequencerLez::new("http://unused".into(), program, [7; 32]);
+        let lez = SequencerLez::new("http://unused".into(), program, [7; 32], false);
         let bytes = |n: u32, fill: u8| {
             let mut b = n.to_le_bytes().to_vec();
             b.extend(vec![fill; n as usize]);
@@ -702,11 +780,12 @@ mod test {
                 .unwrap(),
         )
         .unwrap();
-        let lez = SequencerLez::new("http://unused".into(), program, tree_id);
+        let lez = SequencerLez::new("http://unused".into(), program, tree_id, false);
         let bytes = BASE64.decode(BLOCK_50056).unwrap();
         let block = lez.decode_block(&bytes).unwrap();
         assert_eq!(block.block_id, 50056);
         assert_eq!(block.timestamp_ms, 1_792_597_956_640);
+        assert_eq!(block.bedrock_status, BedrockStatus::Finalized);
         assert_eq!(block.events.len(), 1);
         let Event::Registered {
             id_commitment,
