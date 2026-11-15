@@ -190,14 +190,15 @@ wants the live tree takes that one and a consumer that wants only what the chann
 skips it (`verify_proof --min-status finalized`).
 
 A scan over a node still filling its history can miss an inscription. The indexer guards
-against it: a batch that does not continue the last batch counted first has the L1 slots
-between the two read again (the log says `reading L1 slots A..B again first`), and only a batch
-still not continuing after that is `rejected` as "covers LEZ blocks from N, the previous batch
-covered to M". Should a batch have been rejected that way all the same (the node had not got
-the block yet), start the indexer once with `RESCAN_CHANNEL_FROM=<slot>` (the slot of the
-missed batch, or any earlier one; the sequencer logs it as `FINALIZED at L1 slot`): the
-batches read from that slot on are forgotten, the channel is read again from there, the tree
-stays.
+against it twice: a batch that starts after the LEZ blocks the verified batches cover first has
+the L1 slots between the two read again (the log says `reading L1 slots A..B again first`), and
+one still not continuing after that is left `uncovered`, an open verdict checked again whenever
+a batch arrives or LEZ is read further, never a rejection (`/` counts them in
+`uncovered_batch_count`). Only a batch that overlaps the verified ones, or whose changes or
+root fail, is `rejected`. To make the indexer read a slot range again at once, start it once
+with `RESCAN_CHANNEL_FROM=<slot>` (the sequencer logs each batch's slot as `FINALIZED at L1
+slot`): the batches read from that slot on are forgotten, the channel is read again from
+there, the tree stays.
 
 ### HTTP API
 

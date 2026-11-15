@@ -72,6 +72,44 @@ wait_note() {
     return 1
 }
 
+# Has the node wallet make a note of exactly $1 for itself: a transfer to its own key, the
+# wallet picks the largest notes first. A transaction spends at most 32 notes, so when the 30
+# largest do not reach the amount plus fee the wallet first merges them into one note, as
+# often as it takes (PoW rewards come as small notes).
+make_note() {
+    local amount="$1" key largest target
+    key=$(funding_key)
+    while ! bedrock_wallet "$key" | jq -e --argjson a "$amount" \
+        '.notes | to_entries | any(.value == $a)' >/dev/null; do
+        largest=$(bedrock_wallet "$key" | jq '[.notes[]] | sort | reverse | .[:30] | add // 0')
+        if ge "$largest" "$((amount + SPLIT_FEE))"; then
+            target=$amount
+        else
+            target=$((largest - SPLIT_FEE))
+            ge "$target" 1000000 || die "the 30 largest notes hold $largest: too little to merge"
+            say "merging the largest notes into one of $target first (at most 32 per transaction)"
+        fi
+        say "making a $target note"
+        transfer_to_self "$key" "$target"
+        wait_note "$target" || die "the $target note never appeared"
+    done
+}
+
+# A transfer of $2 from key $1 to itself; the node answers {code, message} when it refuses.
+transfer_to_self() {
+    local key="$1" amount="$2" resp
+    resp=$(bedrock -X POST -H 'content-type: application/json' \
+        "http://$BEDROCK_HTTP/wallet/transactions/transfer-funds" \
+        -d "{\"tip\":null,\"change_public_key\":\"$key\",\"funding_public_keys\":[\"$key\"],\"recipient_public_key\":\"$key\",\"amount\":$amount}") \
+        || die "transfer-funds failed"
+    if printf '%s' "$resp" | jq -e 'type == "object" and has("code")' >/dev/null 2>&1; then
+        die "transfer-funds refused: $(printf '%s' "$resp" | jq -r '.message // .')"
+    fi
+}
+
+# Fee room left when a note is made from many inputs (every input adds to the fee).
+SPLIT_FEE=2000000
+
 step_fund() {
     local payer key bal state
     payer=$(state_get payer)
@@ -95,15 +133,7 @@ step_fund() {
             || die "the node wallet holds $total, below the deposit plus fee ($DEPOSIT_AMOUNT + 1e6)"
 
         # A deposit spends whole notes: make one of exactly DEPOSIT_AMOUNT.
-        if ! bedrock_wallet "$key" | jq -e --argjson a "$DEPOSIT_AMOUNT" \
-            '.notes | to_entries | any(.value == $a)' >/dev/null; then
-            say "splitting a $DEPOSIT_AMOUNT note"
-            bedrock -X POST -H 'content-type: application/json' \
-                "http://$BEDROCK_HTTP/wallet/transactions/transfer-funds" \
-                -d "{\"tip\":null,\"change_public_key\":\"$key\",\"funding_public_keys\":[\"$key\"],\"recipient_public_key\":\"$key\",\"amount\":$DEPOSIT_AMOUNT}" \
-                >/dev/null || die "transfer-funds failed"
-            wait_note "$DEPOSIT_AMOUNT" || die "the $DEPOSIT_AMOUNT note never appeared"
-        fi
+        make_note "$DEPOSIT_AMOUNT"
 
         local note body resp
         note=$(bedrock_wallet "$key" | jq -r --argjson a "$DEPOSIT_AMOUNT" \

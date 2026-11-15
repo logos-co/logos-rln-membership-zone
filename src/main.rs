@@ -808,10 +808,10 @@ async fn run_indexer(
                     continue;
                 }
                 let mut registry = registry.write().expect("registry lock");
-                match registry.recheck_pending() {
+                match registry.recheck() {
                     Ok(0) => {}
                     Ok(n) => {
-                        println!("{n} batch(es) checked now that LEZ is read far enough");
+                        println!("{n} batch(es) got their verdict on a second look");
                         registry.save()?;
                     }
                     Err(e) => println!("recheck failed: {e}"),
@@ -935,6 +935,14 @@ fn observe_found(registry: &mut Registry, found: &Found) -> Result<()> {
             entry.from_lez_block_id,
             entry.to_lez_block_id,
             hex::encode(&found.msg[..4])
+        ),
+        Some(Verification::Uncovered) => println!(
+            "batch [{}..{}] msg {} at L1 slot {l1_slot}: uncovered, no verified batch reaches \
+             block {} yet; checked again when one arrives",
+            entry.from_lez_block_id,
+            entry.to_lez_block_id,
+            hex::encode(&found.msg[..4]),
+            entry.from_lez_block_id - 1
         ),
         _ => println!(
             "batch [{}..{}] msg {} at L1 slot {l1_slot}: pending, LEZ not read that far yet",

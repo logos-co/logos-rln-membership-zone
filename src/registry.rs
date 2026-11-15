@@ -124,6 +124,16 @@ pub enum Verification {
     Rejected(String),
     /// The indexer has not read LEZ up to `to_lez_block_id` yet; checked again then.
     Pending,
+    /// Starts after LEZ blocks no verified batch covers: the batch in between may not have
+    /// been read yet (a node still filling its history); checked again when one arrives.
+    Uncovered,
+}
+
+impl Verification {
+    /// Whether the verdict can still change.
+    fn is_open(&self) -> bool {
+        matches!(self, Self::Pending | Self::Uncovered)
+    }
 }
 
 /// The published batches.
@@ -304,11 +314,9 @@ impl Registry {
     /// after the last batch counted, the L1 slot after that batch's: where to read the channel
     /// again before judging it, in case the scan missed an inscription in between.
     pub fn gap_before(&self, msg_id: &[u8; 32], payload: &[u8]) -> Option<u64> {
-        let judged = self
-            .history
-            .published
-            .iter()
-            .any(|p| p.msg_id == *msg_id && p.verification != Some(Verification::Pending));
+        let judged = self.history.published.iter().any(|p| {
+            p.msg_id == *msg_id && !p.verification.as_ref().is_some_and(Verification::is_open)
+        });
         let batch = Batch::decode(payload).ok()?;
         if judged || batch.from_lez_block_id <= self.history.covered_to() + 1 {
             return None;
@@ -351,7 +359,10 @@ impl Registry {
             .iter()
             .position(|p| p.msg_id == msg_id);
         if let Some(at) = position
-            && self.history.published[at].verification != Some(Verification::Pending)
+            && !self.history.published[at]
+                .verification
+                .as_ref()
+                .is_some_and(Verification::is_open)
         {
             return Ok(&self.history.published[at]);
         }
@@ -380,8 +391,18 @@ impl Registry {
                 Ok(&self.history.published[at])
             }
             None => {
-                self.history.published.push(entry);
-                Ok(self.history.published.last().expect("just pushed"))
+                // In channel order, whatever order the slots were read in (a look-back reads
+                // earlier slots later): the replay and the roots window follow the history.
+                let at = self
+                    .history
+                    .published
+                    .iter()
+                    .position(
+                        |p| matches!(p.status, Status::Finalized { l1_slot: s } if s > l1_slot),
+                    )
+                    .unwrap_or(self.history.published.len());
+                self.history.published.insert(at, entry);
+                Ok(&self.history.published[at])
             }
         }
     }
@@ -399,6 +420,9 @@ impl Registry {
             return Ok(Verification::Pending);
         };
         let covered_to = self.history.covered_to();
+        if batch.from_lez_block_id > covered_to + 1 {
+            return Ok(Verification::Uncovered);
+        }
         if batch.from_lez_block_id != covered_to + 1 {
             return Ok(Verification::Rejected(format!(
                 "covers LEZ blocks from {}, the previous batch covered to {covered_to}",
@@ -438,20 +462,21 @@ impl Registry {
         Ok(Verification::Verified)
     }
 
-    /// Indexer: check again, in channel order, the batches left `Pending` because LEZ had not
-    /// been read far enough; stops at the first still pending (the later ones chain on it).
-    /// Returns how many got a verdict.
-    pub fn recheck_pending(&mut self) -> Result<usize> {
+    /// Indexer: check again, in channel order, the batches whose verdict is still open:
+    /// `Pending` (LEZ not read far enough then) and `Uncovered` (the batch before it not seen
+    /// then). Stops at the first still pending (the later ones chain on it). Returns how many
+    /// got a verdict.
+    pub fn recheck(&mut self) -> Result<usize> {
         let mut decided = 0;
-        let pending: Vec<usize> = self
+        let open: Vec<usize> = self
             .history
             .published
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.verification == Some(Verification::Pending))
+            .filter(|(_, p)| p.verification.as_ref().is_some_and(Verification::is_open))
             .map(|(at, _)| at)
             .collect();
-        for at in pending {
+        for at in open {
             let p = &self.history.published[at];
             let Some(payload) = self.payload(&p.msg_id) else {
                 continue;
@@ -462,6 +487,9 @@ impl Registry {
             let verification = self.verify(&batch, &changes, root_after)?;
             if verification == Verification::Pending {
                 break;
+            }
+            if verification.is_open() {
+                continue;
             }
             self.history.published[at].verification = Some(verification);
             self.trim_pending(self.history.covered_to());
@@ -1087,7 +1115,7 @@ mod test {
         registry
             .apply_blocks(&[block(2, vec![]), block(3, vec![registered(3, 2)])])
             .unwrap();
-        assert_eq!(registry.recheck_pending().unwrap(), 1);
+        assert_eq!(registry.recheck().unwrap(), 1);
         let rejected = &registry.history.published[1];
         assert!(matches!(
             rejected.verification,
@@ -1194,41 +1222,47 @@ mod test {
         let late = registry
             .observe_batch([2; 32], [2; 32], &second_payload, 200)
             .unwrap();
-        assert!(matches!(
-            late.verification,
-            Some(Verification::Rejected(ref reason)) if reason.contains("covered to 0")
-        ));
-        // Judged: no look-back for it any more.
-        assert_eq!(registry.gap_before(&[2; 32], &second_payload), None);
-        registry.history.finality_scanned_to = Some(250);
+        // Not a rejection: an open verdict, the batch before it may still turn up.
+        assert_eq!(late.verification, Some(Verification::Uncovered));
+        assert_eq!(registry.history.covered_to(), 0);
+        assert_eq!(registry.gap_before(&[2; 32], &second_payload), Some(0));
 
-        // Rescan from the missed slot: the rejected batch is forgotten, the cursor moves back.
-        assert_eq!(registry.rescan_channel_from(100), 1);
-        assert!(registry.history.published.is_empty());
-        assert_eq!(registry.history.finality_scanned_to, Some(99));
-        registry.start_replay().unwrap();
+        // The missed batch turns up (a look-back): it goes before the later one in the
+        // history, verifies, and the second look gives the uncovered batch its verdict.
+        let first_payload = batch(1, 1, changes[..1].to_vec(), root_1);
         let first = registry
-            .observe_batch(
-                [1; 32],
-                [1; 32],
-                &batch(1, 1, changes[..1].to_vec(), root_1),
-                100,
-            )
+            .observe_batch([1; 32], [1; 32], &first_payload, 100)
             .unwrap();
         assert_eq!(first.verification, Some(Verification::Verified));
-        // Contiguous with the batch counted: no look-back; a batch from block 4 would look back
-        // from the slot after the counted batch's.
+        assert_eq!(registry.history.published[0].msg_id, [1; 32]);
+        assert_eq!(registry.recheck().unwrap(), 1);
+        assert_eq!(
+            registry.history.published[1].verification,
+            Some(Verification::Verified)
+        );
+        assert_eq!(registry.history.covered_to(), 2);
+        assert_eq!(registry.replay_root(), Some(root_2));
+        // Contiguous or judged: no look-back; a batch from block 4 would look back from the
+        // slot after the last counted batch's.
         assert_eq!(registry.gap_before(&[2; 32], &second_payload), None);
         assert_eq!(
             registry.gap_before(&[4; 32], &batch(4, 4, vec![], root_2)),
-            Some(101)
+            Some(201)
         );
+        registry.history.finality_scanned_to = Some(250);
+
+        // Rescan from the second batch's slot: it is forgotten, the cursor moves back, the
+        // replay is the first batch's again, and the batch verifies once more when read.
+        assert_eq!(registry.rescan_channel_from(200), 1);
+        assert_eq!(registry.history.published.len(), 1);
+        assert_eq!(registry.history.finality_scanned_to, Some(199));
+        registry.start_replay().unwrap();
+        assert_eq!(registry.replay_root(), Some(root_1));
         let second = registry
             .observe_batch([2; 32], [2; 32], &second_payload, 200)
             .unwrap();
         assert_eq!(second.verification, Some(Verification::Verified));
         assert_eq!(registry.history.covered_to(), 2);
-        assert_eq!(registry.replay_root(), Some(root_2));
 
         // From slot 0: nothing read yet, the first start's slot applies again.
         assert_eq!(registry.rescan_channel_from(0), 2);

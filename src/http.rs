@@ -98,6 +98,10 @@ impl BatchEntry {
                     verification: "pending",
                     rejection: None,
                 },
+                Verification::Uncovered => Verdict {
+                    verification: "uncovered",
+                    rejection: None,
+                },
                 Verification::Rejected(reason) => Verdict {
                     verification: "rejected",
                     rejection: Some(reason.clone()),
@@ -195,6 +199,11 @@ async fn summary(State(state): State<AppState>) -> Json<Value> {
         body["rejected_batch_count"] = published
             .iter()
             .filter(|p| matches!(p.verification, Some(Verification::Rejected(_))))
+            .count()
+            .into();
+        body["uncovered_batch_count"] = published
+            .iter()
+            .filter(|p| p.verification == Some(Verification::Uncovered))
             .count()
             .into();
         body["replay_root"] = registry.replay_root().map(hex::encode).into();
