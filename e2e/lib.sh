@@ -129,4 +129,6 @@ lez_rln_env() {
     export LEZ_RLN_PAYER
     export LEZ_RLN_TREE_ID_HEX="$TREE_ID"
     export LEZ_RLN_REGISTRATION_PROGRAM_ID="$PROGRAM_ACCOUNT_ID"
+    # The execution gas a membership transaction declares (the fee reserve follows it).
+    export LEZ_RLN_GAS_LIMIT="${LEZ_RLN_GAS_LIMIT:-2000000}"
 }
