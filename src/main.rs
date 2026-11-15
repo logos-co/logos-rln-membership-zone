@@ -334,7 +334,7 @@ async fn apply_range(
         let mut registry = registry.write().expect("registry lock");
         for block in &blocks {
             if !block.events.is_empty() {
-                let names: Vec<_> = block.events.iter().map(|e| e.name()).collect();
+                let names: Vec<_> = block.events.iter().map(lez::selector_name).collect();
                 println!(
                     "LEZ block {}: events {}",
                     block.block_id(),

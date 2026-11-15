@@ -523,20 +523,21 @@ impl Registry {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::lez::Event;
+    use crate::lez::{Registered, RlnEvent};
 
-    fn registered(n: u8, leaf_index: u64) -> Event {
+    fn registered(n: u8, leaf_index: u64) -> RlnEvent {
         let mut id_commitment = [0u8; 32];
         id_commitment[0] = n;
-        Event::Registered {
+        RlnEvent::Registered(Registered {
+            tree_id: [0; 32],
             id_commitment,
             rate_limit: 100,
             expiry_timestamp_ms: 9_000,
             leaf_index,
-        }
+        })
     }
 
-    fn block(block_id: u64, events: Vec<Event>) -> Block {
+    fn block(block_id: u64, events: Vec<RlnEvent>) -> Block {
         Block {
             header: crate::lez::BlockHeader {
                 block_id,

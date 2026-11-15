@@ -2,7 +2,7 @@
 //! program's chain, each with its timestamp, where it stands on Bedrock and the program's
 //! events. The source is a LEZ Sequencer's JSON-RPC, the public testnet one or one run next to
 //! it; it serves no events, so they are derived from the program's transactions in each block,
-//! decoded with LEZ's own `common` crate and the program's own `rln_layouts` crate.
+//! decoded with LEZ's own `common` crate, into the program's own `rln_layouts::events` types.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,6 +12,7 @@ pub use common::block::{BedrockStatus, BlockHeader};
 use common::{block::Block as LezBlock, transaction::LeeTransaction};
 use lee::AccountId;
 use rln::prelude::{Hasher, PoseidonHash};
+pub use rln_layouts::events::{Erased, Extended, Registered, RlnEvent, Slashed};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -20,48 +21,25 @@ use crate::reader::{fr_from_bytes_le, fr_to_bytes_le};
 /// `MAX_BLOCK_RANGE_LEN` of the LEZ Sequencer: the most blocks one `getBlockRange` returns.
 pub const MAX_BLOCK_RANGE_LEN: u64 = 1024;
 
-/// One event of the registration program (RFC "LEZ Requirements / Events") for the registry
-/// this node follows; the source drops the events of any other `tree_id` the program serves.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Event {
-    Registered {
-        id_commitment: [u8; 32],
-        rate_limit: u64,
-        /// The end of the membership's grace period, from which it is expired.
-        expiry_timestamp_ms: u64,
-        leaf_index: u64,
-    },
-    Extended {
-        id_commitment: [u8; 32],
-        /// The membership's expiry after the extension.
-        expiry_timestamp_ms: u64,
-    },
-    Erased {
-        id_commitment: [u8; 32],
-    },
-    Slashed {
-        id_commitment: [u8; 32],
-    },
-}
-
-impl Event {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Event::Registered { .. } => "Registered",
-            Event::Extended { .. } => "Extended",
-            Event::Erased { .. } => "Erased",
-            Event::Slashed { .. } => "Slashed",
-        }
+/// The program's own name of an event (`SELECTOR_NAME`, what its selector hashes).
+pub fn selector_name(event: &RlnEvent) -> &'static str {
+    match event {
+        RlnEvent::Registered(_) => Registered::SELECTOR_NAME,
+        RlnEvent::Extended(_) => Extended::SELECTOR_NAME,
+        RlnEvent::Slashed(_) => Slashed::SELECTOR_NAME,
+        RlnEvent::Erased(_) => Erased::SELECTOR_NAME,
     }
 }
 
 /// A LEZ block as a reader sees it: LEZ's own header (id, hashes, the LEZ clock in ms) and
-/// Bedrock status, with the registration program's events in transaction order.
+/// Bedrock status, with the registration program's events (its `rln_layouts::events` types,
+/// RFC "LEZ Requirements / Events") in transaction order; the events of any other `tree_id`
+/// the program serves are dropped.
 #[derive(Debug, Clone)]
 pub struct Block {
     pub header: BlockHeader,
     pub bedrock_status: BedrockStatus,
-    pub events: Vec<Event>,
+    pub events: Vec<RlnEvent>,
     /// Privacy-preserving transactions with a public effect under the registration program.
     /// They carry no instruction and emit no event, so each changed the registry without this
     /// reader seeing what; the ones under other programs are not counted.
@@ -277,7 +255,7 @@ impl SequencerLez {
     /// the `id_commitment`), `Erased`; `Initialize` emits none. Every value a handler needs
     /// travels in the instruction as a claim the chain asserts. An instruction for another
     /// registry (`tree_id`) is dropped.
-    fn decode_instruction(&self, data: &[u8]) -> Result<Option<Event>> {
+    fn decode_instruction(&self, data: &[u8]) -> Result<Option<RlnEvent>> {
         use rln_layouts::{Instruction, expiry_ms, secs_to_millis};
         let instruction: Instruction =
             borsh::from_slice(data).context("not an instruction of the program")?;
@@ -311,7 +289,8 @@ impl SequencerLez {
                     self.registered.store(leaf_index + 1, Ordering::Relaxed);
                 }
                 let grace_start_ms = now_ms.saturating_add(secs_to_millis(active_duration_sec));
-                Event::Registered {
+                RlnEvent::Registered(Registered {
+                    tree_id,
                     id_commitment,
                     rate_limit,
                     expiry_timestamp_ms: expiry_ms(
@@ -319,7 +298,7 @@ impl SequencerLez {
                         secs_to_millis(grace_period_duration_sec),
                     ),
                     leaf_index,
-                }
+                })
             }
             Instruction::Slash {
                 id_commitment,
@@ -336,17 +315,24 @@ impl SequencerLez {
                         hex::encode(id_commitment)
                     );
                 }
-                Event::Slashed { id_commitment }
+                RlnEvent::Slashed(Slashed {
+                    tree_id,
+                    id_commitment,
+                })
             }
             Instruction::Extend {
                 id_commitment,
                 expiry_timestamp_ms,
                 ..
-            } => Event::Extended {
+            } => RlnEvent::Extended(Extended {
+                tree_id,
                 id_commitment,
                 expiry_timestamp_ms,
-            },
-            Instruction::Erase { id_commitment, .. } => Event::Erased { id_commitment },
+            }),
+            Instruction::Erase { id_commitment, .. } => RlnEvent::Erased(Erased {
+                tree_id,
+                id_commitment,
+            }),
         }))
     }
 }
@@ -493,15 +479,19 @@ mod test {
         let second = lez.decode_instruction(&register(1, id)).unwrap().unwrap();
         assert!(matches!(
             first,
-            Event::Registered {
+            RlnEvent::Registered(Registered {
+                tree_id: TREE,
                 leaf_index: 0,
                 rate_limit: 100,
                 // now 5000 + active 2 s + grace 1 s
                 expiry_timestamp_ms: 8_000,
                 ..
-            }
+            })
         ));
-        assert!(matches!(second, Event::Registered { leaf_index: 1, .. }));
+        assert!(matches!(
+            second,
+            RlnEvent::Registered(Registered { leaf_index: 1, .. })
+        ));
         let init = borsh::to_vec(&Instruction::Initialize {
             tree_id: TREE,
             price_per_unit: 0,
@@ -521,7 +511,10 @@ mod test {
         .unwrap();
         assert_eq!(
             lez.decode_instruction(&slash).unwrap(),
-            Some(Event::Slashed { id_commitment: id })
+            Some(RlnEvent::Slashed(Slashed {
+                tree_id: TREE,
+                id_commitment: id
+            }))
         );
         let wrong_secret = borsh::to_vec(&Instruction::Slash {
             tree_id: TREE,
@@ -542,10 +535,11 @@ mod test {
         .unwrap();
         assert_eq!(
             lez.decode_instruction(&extend).unwrap(),
-            Some(Event::Extended {
+            Some(RlnEvent::Extended(Extended {
+                tree_id: TREE,
                 id_commitment: [8; 32],
                 expiry_timestamp_ms: 9_000,
-            })
+            }))
         );
         let erase = borsh::to_vec(&Instruction::Erase {
             tree_id: TREE,
@@ -556,9 +550,10 @@ mod test {
         .unwrap();
         assert_eq!(
             lez.decode_instruction(&erase).unwrap(),
-            Some(Event::Erased {
+            Some(RlnEvent::Erased(Erased {
+                tree_id: TREE,
                 id_commitment: [8; 32],
-            })
+            }))
         );
         // Another registry of the same program: no event.
         let other = borsh::to_vec(&Instruction::Erase {
@@ -603,11 +598,11 @@ mod test {
         assert_eq!(block.events.len(), 1);
         assert!(matches!(
             block.events[0],
-            Event::Registered {
+            RlnEvent::Registered(Registered {
                 leaf_index: 0,
                 rate_limit: 100,
                 ..
-            }
+            })
         ));
         // A block whose header hash is not its contents' is refused.
         let mut forged = bytes.clone();
@@ -644,15 +639,17 @@ mod test {
         assert_eq!(block.timestamp_ms(), 1_792_597_956_640);
         assert!(block.is_finalized());
         assert_eq!(block.events.len(), 1);
-        let Event::Registered {
+        let RlnEvent::Registered(Registered {
+            tree_id: event_tree_id,
             id_commitment,
             rate_limit,
             expiry_timestamp_ms,
             leaf_index,
-        } = &block.events[0]
+        }) = &block.events[0]
         else {
             panic!("expected Registered");
         };
+        assert_eq!(*event_tree_id, tree_id);
         assert!(hex::encode(id_commitment).starts_with("a878f8b554fabd"));
         assert_eq!(*rate_limit, 100);
         // now_ms 1792597876639 + active 30 days + grace 7 days.

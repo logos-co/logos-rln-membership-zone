@@ -36,7 +36,7 @@ use zerokit_utils::merkle_tree::{
 
 use crate::{
     batch::Change,
-    lez::{Block, Event},
+    lez::{Block, Erased, Extended, Registered, RlnEvent, Slashed},
 };
 
 pub const TREE_DEPTH: usize = 20;
@@ -475,12 +475,13 @@ impl Reader {
         self.stats.private_transaction_count += u64::from(block.private_transaction_count);
         for event in &block.events {
             match event {
-                Event::Registered {
+                RlnEvent::Registered(Registered {
+                    tree_id: _,
                     id_commitment,
                     rate_limit,
                     expiry_timestamp_ms,
                     leaf_index,
-                } => {
+                }) => {
                     self.stats.registered += 1;
                     if self.members.get(id_commitment).is_some_and(|m| !m.ended()) {
                         println!(
@@ -507,10 +508,11 @@ impl Reader {
                     );
                     changes.push(Change::insert(*leaf_index, fr_to_bytes_le(&leaf).to_vec()));
                 }
-                Event::Extended {
+                RlnEvent::Extended(Extended {
+                    tree_id: _,
                     id_commitment,
                     expiry_timestamp_ms,
-                } => {
+                }) => {
                     self.stats.extended += 1;
                     let Some(member) = self.members.get_mut(id_commitment) else {
                         println!(
@@ -542,11 +544,11 @@ impl Reader {
                         changes.push(Change::insert(leaf_index, member.rate_commitment.to_vec()));
                     }
                 }
-                Event::Erased { id_commitment } => {
+                RlnEvent::Erased(Erased { id_commitment, .. }) => {
                     self.stats.erased += 1;
                     changes.extend(self.end(id_commitment, Removed::Erased, block.block_id())?);
                 }
-                Event::Slashed { id_commitment } => {
+                RlnEvent::Slashed(Slashed { id_commitment, .. }) => {
                     self.stats.slashed += 1;
                     changes.extend(self.end(id_commitment, Removed::Slashed, block.block_id())?);
                 }
@@ -692,16 +694,17 @@ mod test {
         id_commitment
     }
 
-    fn registered(n: u8, leaf_index: u64, expiry_timestamp_ms: u64) -> Event {
-        Event::Registered {
+    fn registered(n: u8, leaf_index: u64, expiry_timestamp_ms: u64) -> RlnEvent {
+        RlnEvent::Registered(Registered {
+            tree_id: [0; 32],
             id_commitment: id(n),
             rate_limit: 100,
             expiry_timestamp_ms,
             leaf_index,
-        }
+        })
     }
 
-    fn block(block_id: u64, timestamp_ms: u64, events: Vec<Event>) -> Block {
+    fn block(block_id: u64, timestamp_ms: u64, events: Vec<RlnEvent>) -> Block {
         Block {
             header: crate::lez::BlockHeader {
                 block_id,
@@ -764,12 +767,13 @@ mod test {
         // Not across an event: block 2 registered someone.
         reader
             .apply_block(&Block {
-                events: vec![Event::Registered {
+                events: vec![RlnEvent::Registered(Registered {
+                    tree_id: [0; 32],
                     id_commitment: [7; 32],
                     rate_limit: 1,
                     expiry_timestamp_ms: u64::MAX,
                     leaf_index: 0,
-                }],
+                })],
                 ..chained(2, 1, 9)
             })
             .unwrap();
@@ -829,10 +833,11 @@ mod test {
             .apply_block(&block(
                 3,
                 6_000,
-                vec![Event::Extended {
+                vec![RlnEvent::Extended(Extended {
+                    tree_id: [0; 32],
                     id_commitment: id(1),
                     expiry_timestamp_ms: 9_000,
-                }],
+                })],
             ))
             .unwrap();
         assert_eq!(changes.len(), 1);
@@ -844,13 +849,15 @@ mod test {
                 4,
                 7_000,
                 vec![
-                    Event::Slashed {
+                    RlnEvent::Slashed(Slashed {
+                        tree_id: [0; 32],
                         id_commitment: id(1),
-                    },
-                    Event::Extended {
+                    }),
+                    RlnEvent::Extended(Extended {
+                        tree_id: [0; 32],
                         id_commitment: id(1),
                         expiry_timestamp_ms: 20_000,
-                    },
+                    }),
                 ],
             ))
             .unwrap();

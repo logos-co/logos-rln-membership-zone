@@ -291,8 +291,8 @@ so a transaction in a block carries true values, and the leaf index is the confi
 4 Erase      { tree_id, id_commitment, rate_limit u64, now_ms u64 }              Erased
 ```
 
-The events are derived as the program's own `events` module defines them: `Registered` with
-the expiry `now + active + grace` (the end of the grace period, from which the membership is
+The events are derived into the program's own `rln_layouts::events` types (`RlnEvent`), as that
+module defines them: `Registered` with the expiry `now + active + grace` (the end of the grace period, from which the membership is
 expired), `Extended` with the expiry the instruction claims, `Slashed`
 (`poseidon(identity_secret)` must be the `id_commitment`, checked), `Erased`. The reader
 applies them as the program's reference reader does: `Registered` inserts the leaf,
