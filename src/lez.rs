@@ -1,12 +1,13 @@
-//! What the Zone reads from LEZ (RFC "Derivation Rules"): the blocks of the registration
-//! program's chain, each with its timestamp, where it stands on Bedrock and the program's
-//! events. The source is a LEZ Sequencer's JSON-RPC, the public testnet one or one run next to
-//! it; it serves no events, so they are derived from the program's transactions in each block,
-//! decoded with LEZ's own `common` crate, into the program's own `rln_layouts::events` types.
+//! What the Zone reads from LEZ (RFC "Derivation Rules"): LEZ blocks, each with its timestamp
+//! and the program's events. A block is LEZ's own borsh `Block` (its `common` crate), whether
+//! it comes as the payload of a LEZ channel inscription (the Zone SDK, the source of truth) or
+//! from a LEZ Sequencer's JSON-RPC (finalized history, pinned by hash to an inscription). LEZ
+//! serves no events, so they are derived from the program's transactions in each block, into
+//! the program's own `rln_layouts::events` types.
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-pub use common::block::{BedrockStatus, BlockHeader};
+pub use common::block::BlockHeader;
 use common::{block::Block as LezBlock, transaction::LeeTransaction};
 use lee::AccountId;
 use rln::prelude::{Hasher, PoseidonHash};
@@ -36,7 +37,6 @@ pub fn selector_name(event: &RlnEvent) -> &'static str {
 #[derive(Debug, Clone)]
 pub struct Block {
     pub header: BlockHeader,
-    pub bedrock_status: BedrockStatus,
     pub events: Vec<RlnEvent>,
     /// Privacy-preserving transactions with a public effect under the registration program.
     /// They carry no instruction and emit no event, so each changed the registry without this
@@ -60,52 +60,28 @@ impl Block {
     pub fn timestamp_ms(&self) -> u64 {
         self.header.timestamp
     }
-
-    pub fn is_finalized(&self) -> bool {
-        matches!(self.bedrock_status, BedrockStatus::Finalized)
-    }
 }
 
-/// The leading blocks that are finalized on Bedrock: what a reader that trusts no closed block
-/// applies. Stops at the first other one, so the chain stays contiguous.
-pub fn finalized_prefix(mut blocks: Vec<Block>) -> Vec<Block> {
-    let end = blocks
-        .iter()
-        .position(|b| !b.is_finalized())
-        .unwrap_or(blocks.len());
-    blocks.truncate(end);
-    blocks
-}
-
-/// The LEZ Sequencer's JSON-RPC (`getLastBlockId`, `getBlockRange`, at most 1024 blocks per
-/// call, closed blocks included before finality). The RPC serves no events, so the events
-/// are derived from the program's transactions instead: a block holds the transactions it
-/// executed, so every `Register` to the program is a `Registered` whose `leaf_index` is the
-/// count of earlier ones, every `Slash` a `Slashed` of `poseidon(identity_secret)`, and so on.
+/// The LEZ Sequencer's JSON-RPC (`getBlockRange`, at most 1024 blocks per call) and the
+/// decoder of LEZ blocks wherever they come from. The RPC serves no events, so the events are
+/// derived from the program's transactions instead: a block holds the transactions it
+/// executed, so every `Register` to the program is a `Registered`, every `Slash` a `Slashed`
+/// of `poseidon(identity_secret)`, and so on.
 pub struct SequencerLez {
     client: reqwest::Client,
     url: String,
     program: AccountId,
     /// The registry followed; the program's transactions for another `tree_id` are dropped.
     tree_id: [u8; 32],
-    /// Serve only the blocks finalized on Bedrock: a reader that waits for LEZ finality instead
-    /// of trusting closed blocks (the indexer).
-    finalized_only: bool,
 }
 
 impl SequencerLez {
-    pub fn new(
-        url: String,
-        program_account_id: [u8; 32],
-        tree_id: [u8; 32],
-        finalized_only: bool,
-    ) -> Self {
+    pub fn new(url: String, program_account_id: [u8; 32], tree_id: [u8; 32]) -> Self {
         Self {
             client: reqwest::Client::new(),
             url,
             program: AccountId::new(program_account_id),
             tree_id,
-            finalized_only,
         }
     }
 
@@ -134,26 +110,13 @@ impl SequencerLez {
     /// Short name for logs.
     pub fn describe(&self) -> String {
         format!(
-            "LEZ Sequencer {} ({} blocks, events derived from the program's transactions), \
-             program {}",
+            "LEZ Sequencer {} (events derived from the program's transactions), program {}",
             self.url,
-            if self.finalized_only {
-                "Bedrock-finalized"
-            } else {
-                "closed"
-            },
             hex::encode(borsh::to_vec(&self.program).expect("an account id serializes"))
         )
     }
 
-    /// `block_id` of the latest closed block.
-    pub async fn last_block_id(&self) -> Result<u64> {
-        self.rpc("getLastBlockId", json!([])).await
-    }
-
-    /// The blocks `from..=to`, in order, with the program's events of each; with
-    /// `finalized_only`, the leading ones finalized on Bedrock (fewer than asked while LEZ
-    /// finality lags).
+    /// The blocks `from..=to`, in order, with the program's events of each.
     ///
     /// A call asks for up to `MAX_BLOCK_RANGE_LEN` blocks; when the sequencer refuses the answer
     /// as too big (its 10 MiB response cap, code `-32008`, blocks with many transactions)
@@ -184,11 +147,7 @@ impl SequencerLez {
             }
             start = end + 1;
         }
-        Ok(if self.finalized_only {
-            finalized_prefix(blocks)
-        } else {
-            blocks
-        })
+        Ok(blocks)
     }
 
     /// LEZ's borsh `Block`, its hash checked, with the program's events of its transactions.
@@ -231,7 +190,6 @@ impl SequencerLez {
         }
         Ok(Block {
             header: block.header,
-            bedrock_status: block.bedrock_status,
             events,
             private_transaction_count,
         })
@@ -322,7 +280,7 @@ impl SequencerLez {
 mod test {
     use common::{
         HashType,
-        block::{BlockBody, HashableBlockData},
+        block::{BedrockStatus, BlockBody, HashableBlockData},
     };
 
     use super::*;
@@ -331,7 +289,7 @@ mod test {
     const TREE: [u8; 32] = [7; 32];
 
     fn lez() -> SequencerLez {
-        SequencerLez::new("http://unused".into(), PROGRAM, TREE, false)
+        SequencerLez::new("http://unused".into(), PROGRAM, TREE)
     }
 
     /// A LEZ block in its own borsh, the hash computed as LEZ does; the transactions are
@@ -574,7 +532,6 @@ mod test {
         let block = lez.decode_block(&bytes).unwrap();
         assert_eq!(block.block_id(), 43);
         assert_eq!(block.timestamp_ms(), 2_345);
-        assert!(matches!(block.bedrock_status, BedrockStatus::Pending));
         assert_eq!(block.private_transaction_count, 1);
         assert_eq!(block.events.len(), 1);
         assert!(matches!(
@@ -589,14 +546,6 @@ mod test {
         let mut forged = bytes.clone();
         forged[8 + 32] ^= 1;
         assert!(lez.decode_block(&forged).is_err());
-        // A reader waiting for LEZ finality takes the finalized blocks in front, no more.
-        let final_block = |id: u64| lez.decode_block(&lez_block(id, 1, vec![], 2)).unwrap();
-        let prefix = finalized_prefix(vec![final_block(1), final_block(2), block.clone()]);
-        assert_eq!(
-            prefix.iter().map(Block::block_id).collect::<Vec<_>>(),
-            [1, 2]
-        );
-        assert!(finalized_prefix(vec![block, final_block(1)]).is_empty());
     }
 
     /// LEZ testnet block 50056 as `getBlockRange` returns it: three public transactions, the
@@ -613,12 +562,11 @@ mod test {
                 .unwrap(),
         )
         .unwrap();
-        let lez = SequencerLez::new("http://unused".into(), program, tree_id, false);
+        let lez = SequencerLez::new("http://unused".into(), program, tree_id);
         let bytes = BASE64.decode(BLOCK_50056).unwrap();
         let block = lez.decode_block(&bytes).unwrap();
         assert_eq!(block.block_id(), 50056);
         assert_eq!(block.timestamp_ms(), 1_792_597_956_640);
-        assert!(block.is_finalized());
         assert_eq!(block.events.len(), 1);
         let RlnEvent::Registered(Registered {
             tree_id: event_tree_id,

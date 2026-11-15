@@ -42,20 +42,24 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// A root of the valid-root window as the API shows it: `to_lez_block_id` of the newest batch
-/// carrying it, and `batches`, every batch of the run, the producing one first (its `changes`
-/// made the root; the ones after it carry it further with none).
+/// A root of the valid-root window as the API shows it: the LEZ blocks it stood for
+/// (`from_lez_block_id` of the batch that produced it to `to_lez_block_id` of the newest batch
+/// carrying it), and `batches`, every batch of the run, the producing one first (its `changes`
+/// made the root; the ones after it carry it further with none), each with its own span.
 #[derive(Serialize)]
 struct RootWindowEntry {
     root: String,
+    from_lez_block_id: u64,
     to_lez_block_id: u64,
     batches: Vec<EntryView>,
 }
 
 impl RootWindowEntry {
     fn new(run: RootEntry) -> Self {
+        let produced_by = run.produced_by();
         Self {
-            root: run.produced_by().root.clone().unwrap_or_default(),
+            root: produced_by.root.clone().unwrap_or_default(),
+            from_lez_block_id: produced_by.from_lez_block_id.unwrap_or_default(),
             to_lez_block_id: run.carried_to_lez_block_id(),
             batches: run.entries,
         }
@@ -66,9 +70,9 @@ impl RootWindowEntry {
 /// `lez_timestamp_ms` and the `root` there.
 fn with_head(registry: &Registry, mut body: Value) -> Json<Value> {
     body["head"] = json!({
-        "lez_block_id": registry.head.lez_block_id,
-        "lez_timestamp_ms": registry.head.lez_timestamp_ms,
-        "root": hex::encode(registry.head.root()),
+        "lez_block_id": registry.head().lez_block_id,
+        "lez_timestamp_ms": registry.head().lez_timestamp_ms,
+        "root": hex::encode(registry.head().root()),
     });
     Json(body)
 }
@@ -91,18 +95,23 @@ async fn summary(State(state): State<AppState>) -> Json<Value> {
         "zone_channel_id": state.channel_id,
         "lez_source": state.lez_source,
         "first_lez_block_id": registry.first_lez_block_id,
-        "lez_events": registry.head.stats.lez_events(),
-        "private_transaction_count": registry.head.stats.private_transaction_count,
+        "lez_events": registry.head().stats.lez_events(),
+        "private_transaction_count": registry.head().stats.private_transaction_count,
         "tree": {
-            "active_leaf_count": registry.head.active_count(),
-            "removed_leaf_count": registry.head.removed_leaves().len(),
-            "changes": registry.head.stats.tree_changes(),
+            "active_leaf_count": registry.head().active_count(),
+            "removed_leaf_count": registry.head().removed_leaves().len(),
+            "changes": registry.head().stats.tree_changes(),
         },
         "mode": state.mode,
         "pending_change_count": registry.pending_changes.len(),
         "batch_count": applied,
         "stall": registry.chain.stall(),
         "in_flight": registry.in_flight().map(hex::encode),
+        "lez": {
+            "adopted_block_id": registry.head().lez_block_id,
+            "adopted_block_count": registry.lez.view().len(),
+            "finalized_block_id": registry.lez.final_reader().lez_block_id,
+        },
         "orphaned_count": registry.orphaned_count(),
         "newest_published": root_ref(registry.newest(false)),
         "newest_finalized": root_ref(registry.newest(true)),
@@ -140,7 +149,7 @@ async fn merkle_proof(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let registry = state.registry.read().expect("registry lock");
     let found = if let Ok(leaf_index) = leaf.parse::<u64>() {
-        registry.head.member_at(leaf_index)
+        registry.head().member_at(leaf_index)
     } else {
         let bytes = hex::decode(leaf.trim_start_matches("0x"))
             .ok()
@@ -152,14 +161,14 @@ async fn merkle_proof(
             ));
         };
         registry
-            .head
+            .head()
             .member(&id_commitment)
             .map(|m| (id_commitment, m))
     };
     let Some((id_commitment, member)) = found else {
         return Err(error(StatusCode::NOT_FOUND, "no such membership"));
     };
-    let proof = registry.head.proof_path(member.leaf_index).map(|path| {
+    let proof = registry.head().proof_path(member.leaf_index).map(|path| {
         json!({
             "rate_commitment": hex::encode(path.rate_commitment),
             "path_elements": path.path_elements.iter().map(hex::encode).collect::<Vec<_>>(),
@@ -188,7 +197,7 @@ async fn merkle_proof(
 async fn leaves(State(state): State<AppState>) -> Json<Value> {
     let registry = state.registry.read().expect("registry lock");
     let active: Vec<Value> = registry
-        .head
+        .head()
         .active_leaves()
         .into_iter()
         .map(|(id, m)| {
@@ -199,12 +208,12 @@ async fn leaves(State(state): State<AppState>) -> Json<Value> {
                 "expiry_timestamp_ms": m.expiry_timestamp_ms,
                 "expires_in_ms": m
                     .expiry_timestamp_ms
-                    .saturating_sub(registry.head.lez_timestamp_ms),
+                    .saturating_sub(registry.head().lez_timestamp_ms),
             })
         })
         .collect();
     let removed: Vec<Value> = registry
-        .head
+        .head()
         .removed_leaves()
         .into_iter()
         .map(|(id, m)| {

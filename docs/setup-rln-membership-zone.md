@@ -85,12 +85,13 @@ sed -i "s/^FUNDING_PK=.*/FUNDING_PK=$(yq .public_keys.PoWClaim ~/keystore.yaml)/
 | `PROGRAM_ACCOUNT_ID` | `f048...106a` | Registration program on the testnet LEZ (`HAxY9...4bBw` in base58) |
 | `TREE_ID` | `47b2de4f...b4cf` | Registry the program serves, first field of every event |
 | `FIRST_LEZ_BLOCK_ID` | 49431 | Block the program was deployed in; nothing before it is read |
-| `LEZ_SEQUENCER_URL` | `https://testnet.lez.logos.co` | Where the LEZ blocks come from (section 4 or 5) |
-| `REBUILD_TREE` | false | Drop the tree and read it again from LEZ, keeping the Zone channel state and the checkpoint (after a decoder fix that had skipped transactions) |
-| `POLL_SEC` | 10 | Seconds between LEZ polls |
+| `LEZ_CHANNEL_ID` | `0101...01` | The LEZ channel on Bedrock: the LEZ blocks come from its inscriptions, through the Zone SDK (section 4) |
+| `LEZ_SEQUENCER_URL` | `https://testnet.lez.logos.co` | LEZ Sequencer RPC that fills the finalized LEZ history fast, pinned by hash to the blocks Bedrock finalized (section 4 or 5) |
+| `REBUILD_TREE` | false | Drop the tree and read it again from LEZ, keeping the Zone channel state and its checkpoint (after a decoder fix that had skipped transactions) |
+| `POLL_SEC` | 10 | Seconds between publish checks (the sequencer) or judgments (the indexer) |
 | `HEARTBEAT_SEC` | 3600 | Publish an empty batch after this long without one |
 | `STALE_REFUND_SLOTS` | 0 | LIB slots an unmined batch waits before the Zone SDK re-funds it under a new transaction (0 disables). Off: the mempool is FIFO, a re-funded transaction goes to the back of the queue; the SDK default, 30, re-funded at every finalized block |
-| `DATA_DIR` | `data` | `key.hex` and the tree store `tree/`. Gitignored: copy `key.hex` outside the checkout after the first start, a deleted or re-cloned checkout takes the channel key with it |
+| `DATA_DIR` | `data` | `key.hex` (the channel key), `lez-key.hex` (the read-only key on the LEZ channel) and the tree store `tree/`. Gitignored: copy `key.hex` outside the checkout after the first start, a deleted or re-cloned checkout takes the channel key with it |
 | `HTTP_ADDR` | `127.0.0.1:3000` | HTTP API bind address |
 
 ### Run
@@ -109,18 +110,23 @@ What happens, in order:
    only be written by this key. The channel id is `sha256(CHANNEL_NAME)`; there is no
    create step, the first inscription to an unused id creates the channel with the signing
    key as its only accredited key (`posting_timeframe` and `posting_timeout` 0: one writer).
-2. The tree store `data/tree/` (sled) is opened: on a fresh start the tree is
-   built by reading every LEZ block from `FIRST_LEZ_BLOCK_ID` to the head, so every
-   registration made before the sequencer existed is applied and the first batch covers all
-   of them; later starts continue from the block the store is at.
-3. The Zone SDK follows the channel from the node. A channel with no message on chain yet
-   starts at the LIB (seconds: nothing to walk). A channel with history is walked from genesis
-   the first time (30 to 60 minutes on the testnet; a `408 Request Timeout` on a backfill page
-   means the node is slow, the SDK retries the page) and from the checkpoint kept in the tree
-   store after that (seconds to minutes). Then `ready`.
-4. Every `POLL_SEC` the new LEZ blocks are applied; a batch goes out when there are
-   changes, when `HEARTBEAT_SEC` passed without one, or when none was ever published; at
-   most one batch in flight.
+2. The tree store `data/tree/` (sled) is opened. It holds the tree of the LEZ blocks
+   **finalized** on Bedrock. On a fresh start the node finds the newest LEZ inscription at or
+   below the node's LIB (reading the finalized L1 blocks backwards from it) and builds that tree
+   from `FIRST_LEZ_BLOCK_ID` up to that block with the LEZ Sequencer's `getBlockRange`, pinned
+   by the hash chain to the block Bedrock finalized (a minute); later starts continue from the
+   block the store is at.
+3. Two Zone SDK readers follow Bedrock from the node. One follows the LEZ channel (section 4),
+   from the LIB on a fresh store: the LEZ blocks adopted since are folded over the finalized
+   tree (the head), the finalized ones move into the store. The other follows the Zone channel:
+   one with no message on chain yet starts at the LIB (seconds); one with history is walked
+   from genesis the first time (30 to 60 minutes on the testnet; a `408 Request Timeout` on a
+   backfill page means the node is slow, the SDK retries the page) and from the checkpoint kept
+   in the tree store after that (seconds to minutes). Then `ready` and `LEZ channel ready`.
+4. Every `POLL_SEC` the sequencer checks whether a batch is due: changes from LEZ blocks
+   adopted on Bedrock and not covered yet, `HEARTBEAT_SEC` passed without a batch, or none ever
+   published; at most one batch in flight. A batch is folded on the sequencer's own head before
+   it is published, so nothing it would park itself reaches Bedrock.
 5. The channel is kept the way LEZ's own `chain_state` keeps it: a final tier (the
    inscriptions Bedrock finalized, irreversible) and a view (the unfinalized lineage the Zone
    SDK reports, chained on the last final entry), the head being the final state folded over
@@ -133,9 +139,9 @@ What happens, in order:
    anchor (the slot of the newest final entry) up to the LIB applies what the stream may have
    missed (a restart in between).
 
-Ctrl-C stops it. The next start opens the tree store and continues: the Zone SDK from its
-checkpoint, the channel from its final tier and view, the tree from where it was, and only the
-LEZ blocks closed since are read.
+Ctrl-C stops it. The next start opens the tree store and continues: both Zone SDK readers from
+their checkpoints, the channel from its final tier and view, the finalized tree from where it
+was with the adopted LEZ blocks folded over it again.
 A batch still in flight from the previous run stays so, no second batch is published over it. Events that happened while the sequencer was down are picked up the same way: the
 next batch spans the whole gap.
 
@@ -144,7 +150,8 @@ next batch spans the whole gap.
 | File | Content | Lose it and |
 | --- | --- | --- |
 | `data/key.hex` | accredited key | the channel is lost; start a new one with a new `CHANNEL_NAME` |
-| `data/tree/` | sled store: the tree, the reader's state, the Zone channel state (final tier, view, anchor), the Zone SDK checkpoint | the sequencer starts fresh: backfill from slot 0, tree rebuilt from LEZ, and on a channel that already has batches the next batch chains on the root and is refused (below) |
+| `data/lez-key.hex` | the read-only key on the LEZ channel | nothing: a new one is made |
+| `data/tree/` | sled store: the tree of the finalized LEZ blocks, the reader's state, the Zone channel state (final tier, view, anchor), both Zone SDK checkpoints | the sequencer starts fresh: backfill from slot 0, tree rebuilt from LEZ, and on a channel that already has batches the next batch chains on the root and is refused (below) |
 
 Rule: never delete the tree store on a channel that has batches. The Zone SDK learns the
 channel tip from finalized history only (8 to 10 hours behind on the testnet), so without
@@ -173,9 +180,9 @@ store, the key stays.
 The same binary in `--mode indexer` trusts nobody about the batches. It follows the channel
 exactly like the sequencer (the Zone SDK with a key of its own that is not accredited, so it
 only reads; a channel with history is walked from genesis once, no start slot to give; started
-before the first batch it begins at the LIB like the sequencer) and derives the tree from LEZ
-like the sequencer, but from the LEZ blocks final on Bedrock only (LEZ's `bedrock_status`), so
-its tree can never be rewritten under it.
+before the first batch it begins at the LIB like the sequencer) and reads LEZ exactly like the
+sequencer, but judges the batches against the tree of the LEZ blocks **finalized** on Bedrock
+only, so what it judges with can never be rewritten under it.
 Every batch of the channel is folded the way LEZ folds a block, with the indexer as judge: it
 must continue the tip (`from_lez_block_id`), its `changes` must replay to its `root_after`, and
 that root must be the indexer's own tree at `to_lez_block_id`. The outcome is LEZ's
@@ -262,22 +269,30 @@ expiry that removed it, `expiry_timestamp_ms`; `/leaves` carries the same per me
 `proof` (`rate_commitment`, `path_elements`, `identity_path_index`, the `RLNMerkleProof` of
 Zerokit) while the membership is active, `null` otherwise.
 
-## 4. LEZ source: the public LEZ Sequencer (default)
+## 4. LEZ source: the LEZ channel on Bedrock, and the public LEZ Sequencer for history
 
-`LEZ_SEQUENCER_URL=https://testnet.lez.logos.co`. The Zone sequencer polls `getLastBlockId` and reads
-`getBlockRange` (1024 blocks per call, closed blocks within seconds of being produced, no
-finality wait). Each block carries LEZ's own `bedrock_status`: `Pending` until the inscription
-carrying it is final on Bedrock, `Finalized` from then on (a closed block is the LEZ Sequencer's
-word, a restart of it can produce an unanchored block again; a finalized one is immutable).
-The mode picks which blocks the tree follows: the sequencer every closed block (the latest
-state), the indexer only the finalized ones (hours behind, never rewritten). The blocks are
-decoded with LEZ's own `common` crate (the header hash is checked against the contents, as
-the LEZ indexer does). The RPC serves no events, so the program's events are derived from its
-transactions: every `Register` to the program is a `Registered`, every `Slash` a `Slashed` of
-`poseidon(identity_secret)`, and so on. The tree is the same as from the events; only the
-input differs from the RFC's. Known gap: a transaction the program reverted stays in the block
-(charged, nonce advanced) and reads like a successful one; the fix is events from the LEZ
-Sequencer, asked for.
+The LEZ Sequencer inscribes every LEZ block it produces in the LEZ channel on Bedrock
+(`LEZ_CHANNEL_ID`, `0101...01` on the testnet; payload = LEZ's own borsh `Block`). The node
+reads that channel through the Zone SDK, as it reads its own: a LEZ block **adopted** (its
+inscription in a Bedrock block on the current branch, minutes after the LEZ Sequencer produced
+it) is folded over the finalized tree into the head, a **finalized** one moves into the tree
+store, a Bedrock reorg (`Conflict`) refolds the head from the finalized tree. A LEZ block the
+LEZ Sequencer has only closed is never used: a LEZ Sequencer restart produces such blocks
+again, possibly with other contents (seen on the testnet, about once every twenty blocks), and
+a batch about one of them would be a statement on Bedrock that LEZ itself no longer makes.
+The sequencer batches the adopted blocks, the indexer judges with the finalized ones.
+
+`LEZ_SEQUENCER_URL=https://testnet.lez.logos.co` serves `getBlockRange` (1024 blocks per call)
+for one job: the finalized history up to the LIB on a fresh store, and the blocks a finalized
+inscription skipped over after a long stop. Those blocks are trusted only through the hash
+chain: each must chain on the one before, and the block Bedrock finalized must chain on the
+last of them, or the node refuses them. The blocks are decoded with LEZ's own `common` crate
+(the header hash is checked against the contents, as the LEZ indexer does). Neither source
+serves events, so the program's events are derived from its transactions: every `Register` to
+the program is a `Registered`, every `Slash` a `Slashed` of `poseidon(identity_secret)`, and
+so on. The tree is the same as from the events; only the input differs from the RFC's. Known
+gap: a transaction the program reverted stays in the block (charged, nonce advanced) and
+reads like a successful one; the fix is events from the LEZ Sequencer, asked for.
 
 The instructions are decoded with the registration program's own layouts crate
 (`rln-layouts`: the `Instruction` enum, the membership timing helpers), so the sequencer never
@@ -319,20 +334,21 @@ change in a block already covered is in no batch's change list, so the next batc
 corrected root whose `changes` do not account for it (a Zone indexer replaying
 the batches would park it; the rebuild is an operator's repair, not a protocol path).
 
-Check the source by hand:
+Check the sources by hand:
 
 ```bash
 curl -s -X POST https://testnet.lez.logos.co -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"getLastBlockId","params":[]}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"getLastBlockId","params":[]}'   # the LEZ Sequencer's latest closed block
 curl -s -X POST https://testnet.lez.logos.co -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"getChannelId","params":[]}'    # 0101...01, the LEZ channel
+  -d '{"jsonrpc":"2.0","id":1,"method":"getChannelId","params":[]}'     # 0101...01, the LEZ channel
+curl -s localhost:3000/ | jq .lez     # adopted_block_id (the head), finalized_block_id, adopted_block_count
 ```
 
 ## 5. LEZ source: your own LEZ sequencer (follower)
 
-Why: no dependency on the public endpoint, and the blocks come from your own re-execution of
-the LEZ channel on Bedrock (the RFC's "trusts nobody" source) at L1 adoption latency, not
-finality. A LEZ sequencer whose key holds no stake does not produce blocks (log: `no stake
+Why: no dependency on the public endpoint for the finalized history, and a `getEvents` of your
+own once that RPC exists; the live blocks already come from the LEZ channel on Bedrock, so
+this buys trust in the history fill only. A LEZ sequencer whose key holds no stake does not produce blocks (log: `no stake
 entry for our own sequencer key; aborting block production`) but follows the channel and
 serves the same JSON-RPC. It is a full LEZ node: RISC Zero execution, RocksDB, a few GB.
 
@@ -424,11 +440,15 @@ batch stays `in_flight` (block production and mempool propagation).
 - `unzip: not found` while building: `sudo apt-get install -y unzip`.
 - `missing manifest in toolchain '1.98.1-...'`: a half-installed toolchain;
   `rustup toolchain uninstall 1.98.1 && rustup toolchain install 1.98.1`.
-- `batch msg M does not apply on our own head (...); stopping instead of publishing it again`:
-  the sequencer's own batch failed its own replay (the error says which check), a bug or a
-  store from another configuration (`FIRST_LEZ_BLOCK_ID`, `TREE_ID`); the process stops so the
-  same batch is not published every poll. The batches already on the channel stay: a batch
-  that does not continue the tip parks every indexer, so continue on a new `CHANNEL_NAME`.
+- `batch [A..B] would not apply on our own head (...); stopping before publishing it`: the
+  sequencer's next batch failed its own replay (the error says which check), a bug or a store
+  from another configuration (`FIRST_LEZ_BLOCK_ID`, `TREE_ID`); the process stops and nothing
+  reaches Bedrock. Fix the cause, start again.
+- `no LEZ inscription in the N finalized L1 slots below the LIB`: `LEZ_CHANNEL_ID` is not the
+  LEZ channel, or LEZ stopped inscribing; check with `getChannelId` (section 4).
+- `LEZ blocks A..B read from the LEZ Sequencer under the block Bedrock finalized` then an
+  error: the LEZ Sequencer is unreachable or its history does not chain on the finalized
+  block; the finalized block is applied again at the next one, so a short outage heals itself.
 - A batch stays `in_flight` and `curl localhost:8080/mempool/view` does not list its tx hash:
   the node dropped it as invalid at block building (no log at the default level). Check
   `curl localhost:8080/channel/<channel id hex>`: a `tip_message` that is not your newest
@@ -454,22 +474,15 @@ batch stays `in_flight` (block production and mempool propagation).
   view); if seen, start a new channel (section 3).
 - `LEZ read failed: getBlockRange: {"code":-32008,... "Response is too big"}` repeating:
   fixed (the span is halved down to one block); an older build needs the fix, not a restart.
-- `LEZ FORK: LEZ block N does not chain on block N-1 ...` then `LEZ FORK: at block F; blocks
-  F+1..N-1 forgotten ... reading again`: the LEZ Sequencer
-  re-produced closed blocks it had not anchored on Bedrock yet (it does after a restart;
-  seen twice on 2026-11-10). The reader keeps the hashes of the last 4096 blocks, finds the
-  newest one LEZ still agrees on and reads from there; harmless while none of the rewritten
-  blocks changed the tree. `WARNING: batch msg M claims root R.. at LEZ block N, LEZ now
-  gives S..` (checked after every LEZ read) means a batch already on Bedrock states a root
-  the rewritten history contradicts: an indexer parks on it and every later one, only a new
-  channel mends that.
-- `LEZ read failed: LEZ FORK at block F but block E after it changed the tree or carried an
-  event ...` (or `LEZ FORK older than the last 4096 blocks kept`)
-  every poll: the rewrite crossed a tree change and the tree may hold what LEZ no longer says;
-  stop, start once with `REBUILD_TREE=true` (Zone channel state and checkpoint kept), then as
-  usual.
-  `LEZ block N where M was expected` is a `getBlockRange` answer out of order; nothing is
-  applied until it comes back right.
+- `LEZ channel reorg on Bedrock: the head is the finalized tree folded over N adopted
+  block(s) again`: a Bedrock reorg moved or dropped LEZ inscriptions; the head follows the new
+  branch. `WARNING: batch msg M claims root R.. at LEZ block N, LEZ now gives S..` after it
+  means a batch already on Bedrock states a root the new branch contradicts (LEZ produced an
+  orphaned block again with other contents): an indexer parks on it and every later one, only
+  a new channel mends that.
+- `adopted LEZ block N does not chain on the head` or `LEZ block N finalized with hash H.., the
+  view held G..`: the SDK's view and this node's disagree; the head is rebuilt from the
+  finalized tree and refilled by the SDK, nothing to do.
 - The first batch of a channel carries a root but `no changes` in the log (empty
   `changes` in `/roots`): fixed (the pending changes are persisted with the tree; before, a
   restart between reading LEZ and publishing lost them). A channel whose first batch is
@@ -482,8 +495,8 @@ batch stays `in_flight` (block production and mempool propagation).
   which check), every later one parks after it; `/` shows it as `stall`. On the indexer that
   is what it holds against the channel; on the sequencer it means its own batch was malformed. Only a
   new channel mends it.
-- `LEZ unreachable: getLastBlockId` once in a while: network; the next poll retries, nothing
-  to do unless it repeats for long.
+- `LEZ unreachable` while filling history: network; the fill is tried again at the next
+  finalized LEZ block, nothing to do unless it repeats for long.
 - WSL2: `ngrok http 3000` inside WSL; from a Windows browser `http://localhost:3000` works
   with the default localhost forwarding.
 
@@ -524,6 +537,10 @@ rm -rf ~/logos-rln-membership-zone/poc
 - On restart the Zone sequencer continues from its persisted view (the unfinalized lineage)
   plus the channel's finalized history, as LEZ's own sequencer does; the channel alone would
   not show the recent batches with the testnet's finality.
+- The sequencer batches LEZ blocks adopted on Bedrock, minutes after LEZ closes them; a block
+  LEZ only closed is not used, since a LEZ Sequencer restart produces it again (RFC Q6). A
+  Bedrock reorg that orphans a LEZ inscription already batched stays open; LEZ setting
+  `bedrock_status` to `Safe` on adoption would let a reader take this from the RPC.
 - A transaction the program reverted stays in a LEZ block and reads like a successful one
   (section 4); events from the LEZ Sequencer would settle it.
 - Testnet finality (8 to 10 hours) rules out "final" as the only valid-root reference; the

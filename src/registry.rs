@@ -1,6 +1,7 @@
-//! One node's state: the tree derived from LEZ (`Reader`), the Zone channel as the Zone SDK
-//! reports it (`ChainState`), the changes no batch carries yet, and the SDK checkpoint. All of
-//! it lives in the tree store's metadata, so a restart opens the store and continues.
+//! One node's state: the LEZ chain as the Zone SDK reports it (`LezChain`: the finalized tree
+//! on disk, the adopted blocks folded over it), the Zone channel as the SDK reports it
+//! (`ChainState`), the changes no batch carries yet, and the two SDK checkpoints. All of it
+//! lives in the tree store's metadata, so a restart opens the store and continues.
 
 use std::path::Path;
 
@@ -17,12 +18,14 @@ use crate::{
         PublishRecord, StallReason, Tip,
     },
     lez::Block,
+    lez_chain::{Adopted, Finalized, LezChain},
     reader::{EMPTY_ROOT, Reader},
 };
 
-impl Judge for Reader {
+/// The indexer judges a batch against the tree of the finalized LEZ blocks only.
+impl Judge for LezChain {
     fn root_at(&self, to_lez_block_id: u64) -> Option<[u8; 32]> {
-        Reader::root_at(self, to_lez_block_id)
+        self.final_reader().root_at(to_lez_block_id)
     }
 }
 
@@ -158,8 +161,8 @@ struct PendingChangeRecord {
 }
 
 pub struct Registry {
-    /// The tree at the latest LEZ block applied.
-    pub head: Reader,
+    /// The LEZ chain: the finalized tree on disk, the adopted blocks folded over it.
+    pub lez: LezChain,
     /// The channel: final tier and view.
     pub chain: ChainState,
     pub first_lez_block_id: u64,
@@ -172,8 +175,10 @@ pub struct Registry {
     /// Publishes of ours a Bedrock reorg dropped (the SDK's `orphaned`), published again.
     orphaned: u64,
     anchor: Option<ZoneAnchorRecord>,
-    /// The Zone SDK checkpoint, as JSON.
+    /// The Zone SDK checkpoint on the Zone channel, as JSON.
     checkpoint: Option<Value>,
+    /// The Zone SDK checkpoint on the LEZ channel, as JSON.
+    lez_checkpoint: Option<Value>,
     /// The indexer judges every batch against its tree; the sequencer trusts its own.
     indexer: bool,
 }
@@ -181,7 +186,8 @@ pub struct Registry {
 impl Registry {
     /// Open the tree store under `data_dir` and the Zone channel state kept with it; a fresh store
     /// starts at `first_lez_block_id`. With `rebuild`, the tree and the reader's state are
-    /// dropped and read again from LEZ while the Zone channel state and the checkpoint are kept.
+    /// dropped and read again from LEZ (the LEZ channel checkpoint with them) while the Zone
+    /// channel state and its checkpoint are kept.
     pub fn open(
         data_dir: &Path,
         tree_id: [u8; 32],
@@ -197,26 +203,28 @@ impl Registry {
             kept = Some(extra);
             println!("tree store dropped; the tree is read again from LEZ");
         }
-        let (mut head, extra) = Reader::open(&dir, tree_id, first_lez_block_id.saturating_sub(1))?;
+        let (mut final_reader, extra) =
+            Reader::open(&dir, tree_id, first_lez_block_id.saturating_sub(1))?;
         let extra = match kept {
             Some(kept) => {
-                head.persist(kept.clone())?;
+                final_reader.persist(kept.clone())?;
                 kept
             }
             None => extra,
         };
-        Self::from_parts(head, &extra, first_lez_block_id, rebuild, indexer)
+        Self::from_parts(final_reader, &extra, first_lez_block_id, rebuild, indexer)
     }
 
     /// A throwaway store, for tests.
     #[cfg(test)]
     pub fn open_temporary(first_lez_block_id: u64, indexer: bool) -> Result<Self> {
-        let (head, extra) = Reader::open_temporary([0; 32], first_lez_block_id.saturating_sub(1))?;
-        Self::from_parts(head, &extra, first_lez_block_id, false, indexer)
+        let (final_reader, extra) =
+            Reader::open_temporary([0; 32], first_lez_block_id.saturating_sub(1))?;
+        Self::from_parts(final_reader, &extra, first_lez_block_id, false, indexer)
     }
 
     fn from_parts(
-        head: Reader,
+        final_reader: Reader,
         extra: &Value,
         first_lez_block_id: u64,
         rebuild: bool,
@@ -240,7 +248,8 @@ impl Registry {
         let first_lez_block_id = get("first_lez_block_id")
             .and_then(|v| v.as_u64())
             .unwrap_or(first_lez_block_id);
-        let judge = indexer.then_some(&head as &dyn Judge);
+        let lez = LezChain::new(final_reader)?;
+        let judge = indexer.then_some(&lez as &dyn Judge);
         let chain = ChainState::restore(first_lez_block_id, final_entries, stall, &view, judge)?;
         let own_pending: Vec<String> = get("own_pending")
             .map(serde_json::from_value)
@@ -257,8 +266,13 @@ impl Registry {
             .transpose()
             .context("anchor in the tree store")?;
         let checkpoint = get("checkpoint");
+        // A rebuild reads the finalized LEZ blocks again from the start: the LEZ channel is
+        // read again from the LIB too.
+        let lez_checkpoint = if rebuild { None } else { get("lez_checkpoint") };
         // The changes applied but not yet in a batch survive a restart with the tree they
-        // changed; a rebuild derives them again from LEZ.
+        // changed, as far as the final tier goes (the adopted blocks come back from the SDK and
+        // bring theirs again); a rebuild derives them again from LEZ.
+        let final_block_id = lez.final_reader().lez_block_id;
         let pending_changes = match get("pending_changes") {
             Some(encoded) if !rebuild => {
                 let encoded: Vec<PendingChangeRecord> =
@@ -271,12 +285,13 @@ impl Registry {
                         let change = Change::decode(bytes.as_slice()).context("pending change")?;
                         Ok((record.block, change))
                     })
+                    .filter(|r| !r.as_ref().is_ok_and(|(block, _)| *block > final_block_id))
                     .collect::<Result<_>>()?
             }
             _ => vec![],
         };
         Ok(Self {
-            head,
+            lez,
             chain,
             first_lez_block_id,
             pending_changes,
@@ -284,6 +299,7 @@ impl Registry {
             orphaned,
             anchor,
             checkpoint,
+            lez_checkpoint,
             indexer,
         })
     }
@@ -308,12 +324,13 @@ impl Registry {
             "orphaned": self.orphaned,
             "pending_changes": pending_changes,
             "checkpoint": self.checkpoint,
+            "lez_checkpoint": self.lez_checkpoint,
         });
-        self.head.persist(extra)
+        self.lez.persist(extra)
     }
 
     pub fn close(&mut self) -> Result<()> {
-        self.head.close()
+        self.lez.close()
     }
 
     pub fn checkpoint(&self) -> Option<&Value> {
@@ -322,6 +339,19 @@ impl Registry {
 
     pub fn set_checkpoint(&mut self, checkpoint: Value) {
         self.checkpoint = Some(checkpoint);
+    }
+
+    pub fn lez_checkpoint(&self) -> Option<&Value> {
+        self.lez_checkpoint.as_ref()
+    }
+
+    pub fn set_lez_checkpoint(&mut self, checkpoint: Value) {
+        self.lez_checkpoint = Some(checkpoint);
+    }
+
+    /// The tree at the newest adopted LEZ block: what the API serves and the sequencer batches.
+    pub fn head(&self) -> &Reader {
+        self.lez.head()
     }
 
     pub fn anchor(&self) -> Option<ZoneAnchorRecord> {
@@ -337,27 +367,61 @@ impl Registry {
             })
     }
 
-    /// Apply LEZ blocks in order (`Reader::apply_block`); the changes of the blocks after the
-    /// head tip become pending.
-    pub fn apply_blocks(&mut self, blocks: &[Block]) -> Result<()> {
-        self.head.check_chain(blocks)?;
-        let covered_to = self.covered_to();
-        for block in blocks {
-            let changes = self.head.apply_block(block)?;
-            if block.block_id() > covered_to {
-                self.pending_changes
-                    .extend(changes.into_iter().map(|change| (block.block_id(), change)));
-            }
+    fn add_pending(&mut self, block_id: u64, changes: Vec<Change>) {
+        if block_id > self.covered_to() {
+            self.pending_changes
+                .extend(changes.into_iter().map(|change| (block_id, change)));
         }
-        Ok(())
     }
 
-    /// LEZ rewrote its blocks after `block_id` (`BrokenChainLink`): forget them and the
-    /// pending changes they made so they are read again.
-    pub fn rewind_to(&mut self, block_id: u64) -> Result<()> {
-        self.head.rewind_to(block_id)?;
-        self.pending_changes.retain(|(block, _)| *block <= block_id);
-        Ok(())
+    /// A LEZ block adopted on Bedrock (the SDK's `Extension` on the LEZ channel): onto the
+    /// head; its changes after the head tip become pending. `Err` when it does not chain.
+    pub fn apply_adopted(&mut self, block: &Block) -> Result<()> {
+        match self.lez.apply_adopted(block)? {
+            Adopted::Applied(changes) => {
+                self.add_pending(block.block_id(), changes);
+                Ok(())
+            }
+            Adopted::AlreadyApplied => Ok(()),
+            Adopted::DoesNotChain(e) => Err(anyhow::anyhow!(
+                "adopted LEZ block {} does not chain on the head: {e}",
+                block.block_id()
+            )),
+        }
+    }
+
+    /// The adopted LEZ lineage after a Bedrock reorg (the SDK's `Conflict`): the head is
+    /// rebuilt from the finalized tree, the pending changes of the adopted blocks with it.
+    /// Returns how many blocks the new head holds over the final tier.
+    pub fn apply_lez_conflict(&mut self, canonical: &[Block]) -> Result<usize> {
+        let final_block_id = self.lez.final_reader().lez_block_id;
+        self.pending_changes
+            .retain(|(block, _)| *block <= final_block_id);
+        let applied = self.lez.apply_conflict(canonical)?;
+        let count = applied.len();
+        for (block_id, changes) in applied {
+            self.add_pending(block_id, changes);
+        }
+        Ok(count)
+    }
+
+    /// A LEZ block Bedrock finalized (the SDK's `finalized` on the LEZ channel, or the RPC
+    /// filling a gap under a finalized block): onto the finalized tree. `Ok(Some(expected))`
+    /// when blocks are missing before it (`expected..block_id`), to be filled first.
+    pub fn apply_lez_finalized(&mut self, block: &Block) -> Result<Option<u64>> {
+        match self.lez.apply_finalized(block)? {
+            Finalized::Applied {
+                changes,
+                new_to_head,
+            } => {
+                if new_to_head {
+                    self.add_pending(block.block_id(), changes);
+                }
+                Ok(None)
+            }
+            Finalized::AlreadyApplied => Ok(None),
+            Finalized::Gap { expected } => Ok(Some(expected)),
+        }
     }
 
     /// The batches whose root is not what the tree derived from LEZ says at their
@@ -367,7 +431,7 @@ impl Registry {
             .into_iter()
             .filter(|e| match (e.to_lez_block_id, &e.root) {
                 (Some(to), Some(root)) => self
-                    .head
+                    .head()
                     .root_at(to)
                     .is_some_and(|derived| hex::encode(derived) != *root),
                 _ => false,
@@ -379,19 +443,27 @@ impl Registry {
     /// changes and the root after them; `None` when the head is already covered.
     pub fn next_batch(&self) -> Option<Batch> {
         let covered_to = self.covered_to();
-        if self.head.lez_block_id <= covered_to {
+        let head = self.head();
+        if head.lez_block_id <= covered_to {
             return None;
         }
         Some(Batch {
             from_lez_block_id: covered_to + 1,
-            to_lez_block_id: self.head.lez_block_id,
+            to_lez_block_id: head.lez_block_id,
             changes: self
                 .pending_changes
                 .iter()
                 .map(|(_, change)| change.clone())
                 .collect(),
-            root_after: self.head.root().to_vec(),
+            root_after: head.root().to_vec(),
         })
+    }
+
+    /// Whether `batch` would apply on the head of the channel: checked before publishing, so
+    /// a batch this node would park never reaches Bedrock.
+    pub fn would_apply(&self, batch: &Batch) -> Result<(), BatchIngestError> {
+        let judge = self.indexer.then_some(&self.lez as &dyn Judge);
+        self.chain.would_apply(batch, judge)
     }
 
     /// A batch of ours handed to the SDK: into the view on the pin it was built on.
@@ -401,7 +473,7 @@ impl Registry {
             parent,
             batch: Some(batch.clone()),
         };
-        let judge = self.indexer.then_some(&self.head as &dyn Judge);
+        let judge = self.indexer.then_some(&self.lez as &dyn Judge);
         let record = self.chain.record_publish(entry, judge);
         if record != PublishRecord::AlreadyInView {
             self.own_pending.push(msg.into());
@@ -412,7 +484,7 @@ impl Registry {
 
     /// Entries that entered the view (`ChannelUpdate::Extension`).
     pub fn apply_extension(&mut self, adopted: Vec<ChannelEntry>) {
-        let judge = self.indexer.then_some(&self.head as &dyn Judge);
+        let judge = self.indexer.then_some(&self.lez as &dyn Judge);
         self.chain.apply_extension(adopted, judge);
         self.trim_pending();
     }
@@ -420,7 +492,7 @@ impl Registry {
     /// The whole view at the new tip (`ChannelUpdate::Conflict`); returns the entries of ours
     /// that left it, to publish again.
     pub fn apply_conflict(&mut self, canonical: Vec<ChannelEntry>) -> Vec<ChannelEntry> {
-        let judge = self.indexer.then_some(&self.head as &dyn Judge);
+        let judge = self.indexer.then_some(&self.lez as &dyn Judge);
         let dropped = self.chain.apply_conflict(canonical, judge);
         self.orphaned += dropped.len() as u64;
         for entry in &dropped {
@@ -434,7 +506,7 @@ impl Registry {
     /// A finalized inscription of the channel (the SDK stream or the finality scan).
     pub fn apply_finalized(&mut self, entry: ChannelEntry, l1_slot: u64) -> Option<AcceptOutcome> {
         let msg: [u8; 32] = entry.msg.into();
-        let judge = self.indexer.then_some(&self.head as &dyn Judge);
+        let judge = self.indexer.then_some(&self.lez as &dyn Judge);
         let outcome = self.chain.apply_finalized(entry, l1_slot, judge);
         self.own_pending.retain(|m| *m != msg);
         let tip = self.chain.final_tip();
@@ -470,7 +542,7 @@ impl Registry {
 
     /// The indexer folds again what the judge could not decide: LEZ read further.
     pub fn retry_folds(&mut self) -> usize {
-        let decided = self.chain.retry_folds(Some(&self.head));
+        let decided = self.chain.retry_folds(Some(&self.lez));
         self.trim_pending();
         decided
     }
@@ -566,7 +638,6 @@ mod test {
                 hash: common::HashType([0; 32]),
                 timestamp: 1_000,
             },
-            bedrock_status: crate::lez::BedrockStatus::Finalized,
             events,
             private_transaction_count: 0,
         }
@@ -580,8 +651,9 @@ mod test {
     fn test_sequencer_builds_publishes_and_sees_its_batches_land() {
         let mut registry = Registry::open_temporary(1, false).unwrap();
         registry
-            .apply_blocks(&[block(1, vec![registered(1, 0)]), block(2, vec![])])
+            .apply_adopted(&block(1, vec![registered(1, 0)]))
             .unwrap();
+        registry.apply_adopted(&block(2, vec![])).unwrap();
         assert_eq!(registry.pending_changes.len(), 1);
         let batch = registry.next_batch().unwrap();
         assert_eq!((batch.from_lez_block_id, batch.to_lez_block_id), (1, 2));
@@ -617,7 +689,7 @@ mod test {
         assert_eq!(registry.roots(5).len(), 1);
         assert_eq!(registry.newest(true).unwrap().msg_id, hex::encode([1; 32]));
         // A heartbeat carries the root on: same run.
-        registry.apply_blocks(&[block(3, vec![])]).unwrap();
+        registry.apply_adopted(&block(3, vec![])).unwrap();
         let heartbeat = registry.next_batch().unwrap();
         assert!(heartbeat.changes.is_empty());
         registry.record_publish(msg(2), msg(1), &heartbeat);
@@ -635,16 +707,24 @@ mod test {
         let batch;
         {
             let mut registry = Registry::open(&dir, [0; 32], 1, false, false).unwrap();
-            registry
-                .apply_blocks(&[block(1, vec![registered(1, 0)])])
-                .unwrap();
+            // Finalized blocks persist with the store; adopted ones come back from the SDK.
+            assert_eq!(
+                registry
+                    .apply_lez_finalized(&block(1, vec![registered(1, 0)]))
+                    .unwrap(),
+                None
+            );
             batch = registry.next_batch().unwrap();
             registry.record_publish(msg(1), MsgId::root(), &batch);
-            registry
-                .apply_blocks(&[block(2, vec![registered(2, 1)])])
-                .unwrap();
+            assert_eq!(
+                registry
+                    .apply_lez_finalized(&block(2, vec![registered(2, 1)]))
+                    .unwrap(),
+                None
+            );
             assert_eq!(registry.pending_changes.len(), 1);
             registry.set_checkpoint(json!({"lib": 7}));
+            registry.set_lez_checkpoint(json!({"lib": 8}));
             registry.save().unwrap();
             registry.close().unwrap();
         }
@@ -654,7 +734,10 @@ mod test {
             assert_eq!(registry.in_flight(), Some([1; 32]));
             assert_eq!(registry.covered_to(), 1);
             assert_eq!(registry.pending_changes.len(), 1);
+            assert_eq!(registry.head().lez_block_id, 2);
+            assert_eq!(registry.lez.final_reader().lez_block_id, 2);
             assert_eq!(registry.checkpoint(), Some(&json!({"lib": 7})));
+            assert_eq!(registry.lez_checkpoint(), Some(&json!({"lib": 8})));
             // The next batch continues from the view's tip.
             let next = registry.next_batch().unwrap();
             assert_eq!((next.from_lez_block_id, next.to_lez_block_id), (2, 2));
@@ -683,10 +766,11 @@ mod test {
     #[test]
     fn test_indexer_judges_batches_against_its_own_tree() {
         let mut registry = Registry::open_temporary(1, true).unwrap();
+        // The indexer judges over the finalized tree: the blocks arrive finalized here.
         registry
-            .apply_blocks(&[block(1, vec![registered(1, 0), registered(2, 1)])])
+            .apply_lez_finalized(&block(1, vec![registered(1, 0), registered(2, 1)]))
             .unwrap();
-        let root_1 = registry.head.root();
+        let root_1 = registry.head().root();
         let changes: Vec<Change> = registry
             .pending_changes
             .iter()
@@ -721,8 +805,15 @@ mod test {
             batch: Some(early),
         }]);
         assert_eq!(registry.entries()[1].outcome, "retryable_failure");
+        // Adopted, not finalized: the judge waits.
+        registry.apply_adopted(&block(2, vec![])).unwrap();
         registry
-            .apply_blocks(&[block(2, vec![]), block(3, vec![registered(3, 2)])])
+            .apply_adopted(&block(3, vec![registered(3, 2)]))
+            .unwrap();
+        assert_eq!(registry.retry_folds(), 0);
+        registry.apply_lez_finalized(&block(2, vec![])).unwrap();
+        registry
+            .apply_lez_finalized(&block(3, vec![registered(3, 2)]))
             .unwrap();
         assert_eq!(registry.retry_folds(), 1);
         // Decided: block 3 registered someone, the tree derived from LEZ moved on.
@@ -734,7 +825,7 @@ mod test {
         // The head tip stays at the last applied batch.
         assert_eq!(registry.covered_to(), 1);
         // A conflict replaces the parked entry by an honest one for the same blocks.
-        let root_3 = registry.head.root();
+        let root_3 = registry.head().root();
         let changes_3: Vec<Change> = registry
             .pending_changes
             .iter()

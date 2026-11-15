@@ -28,12 +28,12 @@ Early design. Nothing is deployed.
 - **Specification**: [`docs/rfc-rln-membership-zone.md`](docs/rfc-rln-membership-zone.md),
   a raw LIP draft that ends with the open design questions.
 - **Zone node** (`src/`, bin `zone`), two modes on one binary, both with the HTTP registry
-  API. The **sequencer** runs on the Logos testnet: it reads the registration program's
-  transactions from a LEZ Sequencer, derives the tree, publishes batches on its channel
-  through the Zone SDK and follows them to finality. The **indexer** derives the same tree
-  from the LEZ blocks finalized on Bedrock only, follows the channel the same way and judges
-  each batch against its own derivation: the watchdog of the sequencer, no accredited key, no
-  funds. Setup, operation and troubleshooting:
+  API. Both read the LEZ blocks from the LEZ channel on Bedrock through the Zone SDK, never
+  from a LEZ Sequencer's word alone. The **sequencer** runs on the Logos testnet: it derives
+  the tree from the LEZ blocks adopted on Bedrock, publishes batches on its channel through
+  the Zone SDK and follows them to finality. The **indexer** judges each batch against the
+  tree of the LEZ blocks finalized on Bedrock: the watchdog of the sequencer, no accredited
+  key, no funds. Setup, operation and troubleshooting:
   [`docs/setup-rln-membership-zone.md`](docs/setup-rln-membership-zone.md).
 - **Not yet written**: the event source once LEZ serves events live, and the Module side.
 
@@ -42,7 +42,7 @@ Early design. Nothing is deployed.
 ```text
 Module --Register / Extend / Erase / Slash--> LEZ registration program   (deposit, leaf index, events)
                                                    |
-                                                   v  LEZ blocks + events, as the LEZ Sequencer closes them
+                                                   v  LEZ blocks, from the LEZ channel on Bedrock (adopted / finalized)
                           Zone sequencer --batch--> Bedrock              (changes + root_after)
                                                    |
                                                    v  batches: applied or parked
@@ -75,12 +75,13 @@ docs/rfc-rln-membership-zone.md   the specification (raw LIP draft)
 src/                              the Zone node: sequencer and indexer (MODE), HTTP registry API; src/bin/ the proof tools
   src/lez.rs                      LEZ blocks (LEZ's own `common` types) and the program's events, derived from its transactions (rln-layouts)
   src/reader.rs                   a reader: derivation rules over the events and the tree (sled-backed PmTree)
+  src/lez_chain.rs                the LEZ chain as the node keeps it: the finalized tree on disk, the adopted blocks folded over it
   src/batch.rs                    batch wire format (protobuf)
-  src/chain.rs                    the channel as a consumer keeps it, after LEZ's chain_state: final tier, view, folds
-  src/registry.rs                 one node's state: tree, channel, pending changes, checkpoint, in the tree store
+  src/chain.rs                    the Zone channel as a consumer keeps it, after LEZ's chain_state: final tier, view, folds
+  src/registry.rs                 one node's state: LEZ chain, Zone channel, pending changes, checkpoints, in the tree store
   src/http.rs                     HTTP API: roots, batches, membership with its Merkle proof path, leaves
-  src/main.rs                     Zone SDK loop: publish, follow the channel, poll LEZ; indexer judges instead of publishing
-lez-sequencer/                    config template to run your own LEZ sequencer as the block source
+  src/main.rs                     two Zone SDK readers (LEZ channel, Zone channel); the sequencer publishes, the indexer judges
+lez-sequencer/                    config template to run your own LEZ sequencer for the finalized history
 docs/setup-rln-membership-zone.md setup, operation, monitoring, troubleshooting, cleanup
 ```
 
@@ -121,9 +122,9 @@ curl -s localhost:3000/leaves | jq           # active and removed memberships at
 ```
 
 The first start creates the channel (the key in `data/key.hex`, the id
-`sha256(CHANNEL_NAME)`), reads every LEZ block since the program was deployed, backfills the
-channel from the node and publishes the first batch; later starts resume from the data dir.
-Everything else, including running your own LEZ sequencer as the block source, is in
+`sha256(CHANNEL_NAME)`), builds the tree of the finalized LEZ blocks up to the node's LIB,
+follows the LEZ channel from there and publishes the first batch; later starts resume from the
+data dir. Everything else, including running your own LEZ sequencer for the history, is in
 [`docs/setup-rln-membership-zone.md`](docs/setup-rln-membership-zone.md).
 
 ### Tests
@@ -134,9 +135,11 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 The unit tests cover the derivation rules (a `Registered` event sets the leaf and the proof
-path, expiry removes it at the LEZ timestamp), the tree store surviving a reopen, and the
-decoding of LEZ blocks and the program's instructions (another registry's are dropped, a
-privacy-preserving transaction is skipped and counted), including a real testnet block.
+path, expiry removes it at the LEZ timestamp), the tree store surviving a reopen, the LEZ chain
+(adopted blocks folded over the finalized tree, a reorg refolding them, finality moving them),
+the Zone channel (final tier, view, parked and waiting batches) and the decoding of LEZ blocks
+and the program's instructions (another registry's are dropped, a privacy-preserving
+transaction is skipped and counted), including a real testnet block.
 
 ## References
 

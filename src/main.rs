@@ -16,6 +16,7 @@ mod batch;
 mod chain;
 mod http;
 mod lez;
+mod lez_chain;
 mod reader;
 mod registry;
 
@@ -50,8 +51,7 @@ use crate::{
     batch::Batch,
     chain::{AcceptOutcome, ChannelEntry, PublishRecord},
     http::{AppState, Shared},
-    lez::{MAX_BLOCK_RANGE_LEN, SequencerLez},
-    reader::{BlockIngestError, HASH_HISTORY},
+    lez::{Block, SequencerLez},
     registry::Registry,
 };
 
@@ -68,14 +68,19 @@ const PROGRAM_ACCOUNT_ID_HEX: &str =
 const TREE_ID_HEX: &str = "47b2de4f08080e74e2d4beffe8e5e87e709dd598619c9b322b64f2756979b4cf";
 /// LEZ block the program was deployed in: no event comes before it.
 const DEFAULT_FIRST_LEZ_BLOCK_ID: u64 = 49_431;
+/// The LEZ channel on Bedrock (one inscription per LEZ block) on the testnet.
+const LEZ_CHANNEL_ID_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+/// Pages of `FINALITY_SCAN_PAGE` finalized L1 slots read backwards from the LIB to find the
+/// newest LEZ inscription (LEZ inscribes a block every minute or two).
+const LEZ_INSCRIPTION_SCAN_PAGES: u64 = 60;
 
 /// What this binary is: the one sequencer of the Zone, or an indexer that trusts nobody.
 #[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
 enum Mode {
-    /// Follow the closed LEZ blocks, publish batches on the Zone channel, serve the API.
+    /// Publish batches over the LEZ blocks adopted on Bedrock, serve the API.
     Sequencer,
-    /// Follow the LEZ blocks final on Bedrock, judge every batch of the channel against the
-    /// tree, serve the API. No accredited key, no funds, no publishing.
+    /// Judge every batch of the channel against the tree of the LEZ blocks finalized on
+    /// Bedrock, serve the API. No accredited key, no funds, no publishing.
     Indexer,
 }
 
@@ -120,8 +125,13 @@ struct Args {
     /// Registration program account id (64 hex) whose events build the tree.
     #[arg(long, default_value = PROGRAM_ACCOUNT_ID_HEX, env = "PROGRAM_ACCOUNT_ID")]
     program_account_id: String,
-    /// LEZ Sequencer JSON-RPC the blocks come from: the public testnet one, or
-    /// `http://127.0.0.1:3040` for a LEZ sequencer run next to it (`lez-sequencer/`).
+    /// The LEZ channel on Bedrock (64 hex): the LEZ blocks come from its inscriptions, through
+    /// the Zone SDK.
+    #[arg(long, default_value = LEZ_CHANNEL_ID_HEX, env = "LEZ_CHANNEL_ID")]
+    lez_channel_id: String,
+    /// LEZ Sequencer JSON-RPC that fills the finalized LEZ history fast (pinned by hash to the
+    /// blocks Bedrock finalized): the public testnet one, or `http://127.0.0.1:3040` for a LEZ
+    /// sequencer run next to it (`lez-sequencer/`).
     #[arg(
         long,
         default_value = "https://testnet.lez.logos.co",
@@ -131,11 +141,11 @@ struct Args {
     /// First LEZ block the registry covers: the block the program was deployed in.
     #[arg(long, default_value_t = DEFAULT_FIRST_LEZ_BLOCK_ID, env = "FIRST_LEZ_BLOCK_ID")]
     first_lez_block_id: u64,
-    /// Drop the tree and read it again from LEZ, keeping the Zone channel state and the Zone SDK
-    /// checkpoint: after a decoder change that skipped transactions.
+    /// Drop the tree and read it again from LEZ, keeping the Zone channel state and its Zone
+    /// SDK checkpoint: after a decoder change that skipped transactions.
     #[arg(long, env = "REBUILD_TREE")]
     rebuild_tree: bool,
-    /// Seconds between LEZ polls.
+    /// Seconds between publish checks (the sequencer) or judgments (the indexer).
     #[arg(long, default_value_t = 10, env = "POLL_SEC")]
     poll_sec: u64,
     /// Publish an empty batch after this long without one.
@@ -311,116 +321,199 @@ fn check_channel_on_chain(
     }
 }
 
-/// Apply the LEZ blocks `from..=to` to the tree in spans of at most `MAX_BLOCK_RANGE_LEN`,
-/// each checked to continue the chain first; a rewritten history is rewound to the last block
-/// both agree on and read again. Returns how many blocks were applied.
-async fn apply_range(
+/// Keep the Zone SDK checkpoint on the LEZ channel with the tree store.
+fn save_lez_checkpoint(registry: &Shared, checkpoint: &SequencerCheckpoint) -> Result<()> {
+    let mut registry = registry.write().expect("registry lock");
+    registry.set_lez_checkpoint(serde_json::to_value(checkpoint)?);
+    registry.save()
+}
+
+/// The checkpoint the LEZ channel's reader starts from on a fresh store: at the node's LIB,
+/// on the newest LEZ inscription at or below it (found by reading the finalized L1 blocks
+/// backwards from the LIB, a page at a time), so the SDK walks nothing before. Returns that
+/// inscription's LEZ block too: the finalized tree is built up to it.
+async fn lez_checkpoint_at_lib(
+    node: &NodeHttpClient,
+    lez_channel_id: ChannelId,
+    source: &SequencerLez,
+) -> Result<(SequencerCheckpoint, Block)> {
+    let info = node
+        .consensus_info()
+        .await
+        .map_err(|e| anyhow!("consensus info: {e}"))?
+        .cryptarchia_info;
+    let lib_slot = u64::from(info.lib_slot);
+    let mut page_to = lib_slot;
+    for _ in 0..LEZ_INSCRIPTION_SCAN_PAGES {
+        let page_from = page_to.saturating_sub(FINALITY_SCAN_PAGE - 1);
+        let blocks = node
+            .immutable_blocks(Slot::from(page_from), Slot::from(page_to))
+            .await
+            .map_err(|e| anyhow!("immutable blocks {page_from}..{page_to}: {e}"))?;
+        let newest = blocks
+            .iter()
+            .rev()
+            .flat_map(|block| block.transactions.iter().rev())
+            .flat_map(|tx| channel_inscriptions(tx, lez_channel_id).into_iter().rev())
+            .next();
+        if let Some(inscription) = newest {
+            let block = source
+                .decode_block(&inscription.payload)
+                .context("the newest finalized LEZ inscription is not a LEZ block")?;
+            return Ok((
+                SequencerCheckpoint {
+                    last_msg_id: inscription.this_msg,
+                    pending_txs: vec![],
+                    lib: info.lib,
+                    lib_slot: info.lib_slot,
+                    channel_notes: vec![],
+                    finalized_config: MsgId::root(),
+                    funding: vec![],
+                },
+                block,
+            ));
+        }
+        if page_from == 0 {
+            break;
+        }
+        page_to = page_from - 1;
+    }
+    bail!(
+        "no LEZ inscription in the {} finalized L1 slots below the LIB ({lib_slot}): is \
+         LEZ_CHANNEL_ID the LEZ channel?",
+        LEZ_INSCRIPTION_SCAN_PAGES * FINALITY_SCAN_PAGE
+    )
+}
+
+/// Finalized LEZ blocks `from..=to` read from the LEZ Sequencer, applied to the finalized
+/// tree. They are trusted only through the hash chain: the caller applies the Bedrock-finalized
+/// block after them next, which chains on the last one or is refused.
+async fn fill_final_from_rpc(
     source: &SequencerLez,
     registry: &Shared,
     from: u64,
     to: u64,
-) -> Result<usize> {
-    let mut applied = 0;
-    let mut start = from;
-    while start <= to {
-        let end = to.min(start + MAX_BLOCK_RANGE_LEN - 1);
-        let blocks = source.blocks(start, end).await?;
-        // Fewer than asked: the rest is not final on Bedrock yet, read again next time.
-        let short_answer = (blocks.len() as u64) < end - start + 1;
-        // The chain check comes first: nothing of a span that does not continue the
-        // reader's chain is applied or logged.
-        let broken = {
-            let registry = registry.read().expect("registry lock");
-            match registry.head.check_chain(&blocks) {
-                Ok(()) => false,
-                Err(e @ BlockIngestError::BrokenChainLink { .. }) => {
-                    println!("LEZ FORK: {e}; looking for the last block LEZ still agrees on");
-                    true
-                }
-                Err(e) => return Err(e.into()),
-            }
-        };
-        if broken {
-            let fork = find_fork(source, registry).await?;
-            let mut registry = registry.write().expect("registry lock");
-            let was_at = registry.head.lez_block_id;
-            let pending_before = registry.pending_changes.len();
-            registry.rewind_to(fork)?;
-            registry.save()?;
-            println!(
-                "LEZ FORK: at block {fork}; blocks {}..{was_at} ({} block(s), no tree change) \
-                 forgotten, {} pending change(s) dropped; reading again from {}",
-                fork + 1,
-                was_at - fork,
-                pending_before - registry.pending_changes.len(),
-                fork + 1
-            );
-            start = fork + 1;
-            continue;
-        }
-        let mut registry = registry.write().expect("registry lock");
-        for block in &blocks {
-            if !block.events.is_empty() {
-                let names: Vec<_> = block.events.iter().map(lez::selector_name).collect();
-                println!(
-                    "LEZ block {}: events {}",
-                    block.block_id(),
-                    names.join(", ")
-                );
-            }
-            if block.private_transaction_count > 0 {
-                println!(
-                    "WARNING: LEZ block {}: {} privacy-preserving transaction(s) under the \
-                     registration program skipped; the registry changed in a way this tree does \
-                     not have",
-                    block.block_id(),
-                    block.private_transaction_count
-                );
-            }
-        }
-        registry.apply_blocks(&blocks)?;
-        registry.save()?;
-        applied += blocks.len();
-        if short_answer {
-            break;
-        }
-        start = end + 1;
+) -> Result<()> {
+    if from > to {
+        return Ok(());
     }
-    Ok(applied)
+    println!(
+        "LEZ blocks {from}..{to} read from the LEZ Sequencer under the block Bedrock finalized"
+    );
+    let blocks = source.blocks(from, to).await?;
+    let mut registry = registry.write().expect("registry lock");
+    for block in &blocks {
+        if let Some(expected) = registry.apply_lez_finalized(block)? {
+            bail!(
+                "the LEZ Sequencer skipped blocks: expected {expected}, got {}",
+                block.block_id()
+            );
+        }
+    }
+    registry.save()
 }
 
-/// The newest LEZ block the reader applied whose hash LEZ still serves: where a rewritten
-/// history forks off. Walks back from the reader's head through the hashes it kept.
-async fn find_fork(source: &SequencerLez, registry: &Shared) -> Result<u64> {
-    let (mut high, oldest) = {
-        let registry = registry.read().expect("registry lock");
-        let oldest = registry
-            .head
-            .oldest_hashed_block_id()
-            .context("no block hash kept, cannot find where LEZ forked")?;
-        (registry.head.lez_block_id, oldest)
-    };
-    loop {
-        let low = high.saturating_sub(63).max(oldest);
-        println!("LEZ FORK: comparing blocks {low}..{high} with the hashes kept");
-        let blocks = source.blocks(low, high).await?;
+/// A LEZ block Bedrock finalized: onto the finalized tree, the blocks it skipped filled from
+/// the LEZ Sequencer first (pinned by this block's `prev_block_hash`).
+async fn apply_lez_finalized(
+    source: &SequencerLez,
+    registry: &Shared,
+    block: &Block,
+) -> Result<()> {
+    let gap = registry
+        .write()
+        .expect("registry lock")
+        .apply_lez_finalized(block)?;
+    if let Some(expected) = gap {
+        fill_final_from_rpc(source, registry, expected, block.block_id() - 1).await?;
+        if let Some(expected) = registry
+            .write()
+            .expect("registry lock")
+            .apply_lez_finalized(block)?
         {
-            let registry = registry.read().expect("registry lock");
-            for block in blocks.iter().rev() {
-                if registry.head.block_hash(block.block_id()) == Some(block.hash()) {
-                    return Ok(block.block_id());
+            bail!(
+                "LEZ block {} still does not follow the finalized tree (at {})",
+                block.block_id(),
+                expected - 1
+            );
+        }
+    }
+    Ok(())
+}
+
+/// One `BlocksProcessed` event of the Zone SDK on the LEZ channel: adopted LEZ blocks onto the
+/// head, a Bedrock reorg refolds the head, finalized LEZ blocks onto the finalized tree. The
+/// events of a block are logged when the head first sees it.
+async fn on_lez_blocks_processed(
+    source: &SequencerLez,
+    registry: &Shared,
+    checkpoint: &SequencerCheckpoint,
+    channel_update: &ChannelUpdate,
+    finalized: &[FinalizedTx],
+) -> Result<()> {
+    save_lez_checkpoint(registry, checkpoint)?;
+    let decode = |info: &InscriptionInfo| match source.decode_block(&info.payload) {
+        Ok(block) => Some(block),
+        Err(e) => {
+            println!(
+                "LEZ channel entry msg {} is not a LEZ block: {e}",
+                short(&info.this_msg.into())
+            );
+            None
+        }
+    };
+    match channel_update {
+        ChannelUpdate::Extension { adopted } => {
+            for block in adopted
+                .iter()
+                .filter_map(|tx| tx.inscription())
+                .filter_map(decode)
+            {
+                if !block.events.is_empty() {
+                    let names: Vec<_> = block.events.iter().map(lez::selector_name).collect();
+                    println!(
+                        "LEZ block {} adopted: events {}",
+                        block.block_id(),
+                        names.join(", ")
+                    );
+                }
+                if let Err(e) = registry
+                    .write()
+                    .expect("registry lock")
+                    .apply_adopted(&block)
+                {
+                    println!("{e}");
                 }
             }
         }
-        if low == oldest {
-            bail!(
-                "LEZ FORK older than the last {} blocks kept: the tree must be read again \
-                 (REBUILD_TREE=true)",
-                HASH_HISTORY
+        ChannelUpdate::Conflict { .. } => {
+            let canonical: Vec<Block> = channel_update
+                .canonical_chain()
+                .into_iter()
+                .flatten()
+                .filter_map(|tx| tx.inscription())
+                .filter_map(decode)
+                .collect();
+            let held = registry
+                .write()
+                .expect("registry lock")
+                .apply_lez_conflict(&canonical)?;
+            println!(
+                "LEZ channel reorg on Bedrock: the head is the finalized tree folded over {held} \
+                 adopted block(s) again"
             );
         }
-        high = low - 1;
     }
+    for tx in finalized {
+        for op in &tx.ops {
+            let FinalizedOp::Inscription(info) = op else {
+                continue;
+            };
+            let Some(block) = decode(info) else { continue };
+            apply_lez_finalized(source, registry, &block).await?;
+        }
+    }
+    registry.write().expect("registry lock").save()
 }
 
 /// Say what the final tier made of a finalized entry.
@@ -630,38 +723,21 @@ async fn republish(
     Ok(())
 }
 
-/// One LEZ poll. Both modes apply every LEZ block since the last poll (the finalized ones,
-/// for the indexer). The indexer then judges what it could not judge before. The sequencer
-/// checks its own statements against the tree LEZ gives now, then publishes one batch covering
-/// the LEZ blocks not covered yet when changes wait or the heartbeat is due, with at most one
-/// batch in flight. `Err` only for the tree store; an unreachable LEZ is logged and read again
-/// next poll.
-async fn on_poll(
-    source: &SequencerLez,
+/// One tick. The indexer judges what it could not judge before (the finalized tree moved).
+/// The sequencer checks its own statements against the tree, then publishes one batch
+/// covering the adopted LEZ blocks not covered yet when changes wait or the heartbeat is due,
+/// with at most one batch in flight. `Err` only for the tree store.
+async fn on_tick(
     sdk: &mut ZoneSequencer<NodeHttpClient>,
     registry: &Shared,
     args: &Args,
     contradicted_count: &mut usize,
     last_publish_unix: &mut u64,
 ) -> Result<()> {
-    let head = match source.last_block_id().await {
-        Ok(head) => head,
-        Err(e) => {
-            println!("LEZ unreachable: {e}");
-            return Ok(());
-        }
-    };
-    let applied_to = registry.read().expect("registry lock").head.lez_block_id;
-    if head > applied_to
-        && let Err(e) = apply_range(source, registry, applied_to + 1, head).await
-    {
-        println!("LEZ read failed: {e}");
-        return Ok(());
-    }
     if args.mode == Mode::Indexer {
         let decided = registry.write().expect("registry lock").retry_folds();
         if decided > 0 {
-            println!("{decided} batch(es) judged now that LEZ is read far enough");
+            println!("{decided} batch(es) judged now that LEZ finality reached them");
             registry.write().expect("registry lock").save()?;
         }
         return Ok(());
@@ -692,7 +768,7 @@ fn warn_contradicted(registry: &Registry, contradicted_count: &mut usize) {
     for e in contradicted {
         let now = e
             .to_lez_block_id
-            .and_then(|to| registry.head.root_at(to))
+            .and_then(|to| registry.head().root_at(to))
             .map(|r| hex::encode(&r[..4]))
             .unwrap_or_default();
         println!(
@@ -708,13 +784,22 @@ fn warn_contradicted(registry: &Registry, contradicted_count: &mut usize) {
 
 /// Publish the next batch: recorded as in flight and saved with the checkpoint on success, so
 /// a restart knows it; `last_publish_unix` restarts the heartbeat. A batch too large for one
-/// inscription or a refusal by the SDK is logged and tried again next poll.
+/// inscription or a refusal by the SDK is logged and tried again next poll. A batch that
+/// would not apply on our own head is a bug: fatal before anything reaches Bedrock.
 async fn publish_batch(
     sdk: &mut ZoneSequencer<NodeHttpClient>,
     registry: &Shared,
     batch: &Batch,
     last_publish_unix: &mut u64,
 ) -> Result<()> {
+    if let Err(e) = registry.read().expect("registry lock").would_apply(batch) {
+        bail!(
+            "batch [{}..{}] would not apply on our own head ({e}); stopping before publishing \
+             it",
+            batch.from_lez_block_id,
+            batch.to_lez_block_id
+        );
+    }
     let inscription = match Inscription::try_from(batch.encode_to_vec()) {
         Ok(inscription) => inscription,
         Err(e) => {
@@ -755,8 +840,7 @@ async fn publish_batch(
                     format!(" ({record:?})")
                 }
             );
-            // Our own batch not applying on our own head is a bug, not a condition to retry:
-            // the next poll would publish the same batch again, forever.
+            // Checked above; a disagreement here means the head moved under the publish.
             if record == PublishRecord::Skipped {
                 let error = registry
                     .read()
@@ -791,14 +875,16 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&args.data_dir)?;
     let indexer = args.mode == Mode::Indexer;
 
-    // LEZ source: closed blocks for the sequencer, Bedrock-finalized ones for the indexer.
+    // The LEZ Sequencer RPC: decodes the LEZ blocks and fills finalized history.
     let program_account_id = parse_32(&args.program_account_id, "PROGRAM_ACCOUNT_ID")?;
     let tree_id = parse_32(&args.tree_id, "TREE_ID")?;
-    let source = SequencerLez::new(
-        args.lez_sequencer_url.clone(),
-        program_account_id,
-        tree_id,
-        indexer,
+    let source = SequencerLez::new(args.lez_sequencer_url.clone(), program_account_id, tree_id);
+    let lez_channel_id = ChannelId::from(parse_32(&args.lez_channel_id, "LEZ_CHANNEL_ID")?);
+    let lez_source = format!(
+        "LEZ channel {} on Bedrock through the Zone SDK (adopted blocks at the head, finalized \
+         ones judged); finalized history from {}",
+        hex::encode(lez_channel_id.as_ref()),
+        source.describe()
     );
 
     // The tree store under the data dir, with the Zone channel state and the checkpoint.
@@ -823,7 +909,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         registry: registry.clone(),
         channel_id: hex::encode(channel_id.as_ref()),
-        lez_source: source.describe(),
+        lez_source: lez_source.clone(),
         mode: format!("{:?}", args.mode).to_lowercase(),
     };
     let listener = tokio::net::TcpListener::bind(&args.http_addr)
@@ -896,6 +982,77 @@ async fn main() -> Result<()> {
         checkpoint,
     );
 
+    // The Zone SDK on the LEZ channel, read-only: a key of its own, nothing to fund. A fresh
+    // store starts at the LIB, on the newest finalized LEZ inscription, with the finalized tree
+    // built up to that block from the LEZ Sequencer (pinned by the block's hash).
+    let lez_checkpoint: Option<SequencerCheckpoint> = registry
+        .read()
+        .expect("registry lock")
+        .lez_checkpoint()
+        .map(|c| serde_json::from_value(c.clone()))
+        .transpose()
+        .context("LEZ channel checkpoint in the tree store")?;
+    let lez_checkpoint = match lez_checkpoint {
+        Some(checkpoint) => checkpoint,
+        None => {
+            let (checkpoint, anchor) =
+                lez_checkpoint_at_lib(&node, lez_channel_id, &source).await?;
+            let final_block_id = registry
+                .read()
+                .expect("registry lock")
+                .lez
+                .final_reader()
+                .lez_block_id;
+            if final_block_id >= args.first_lez_block_id {
+                bail!(
+                    "the finalized tree is at LEZ block {final_block_id} but the LEZ channel has \
+                     no checkpoint: start once with REBUILD_TREE=true"
+                );
+            }
+            println!(
+                "  lez       finalized LEZ block {} at the LIB (slot {}); reading the finalized \
+                 history up to it from the LEZ Sequencer...",
+                anchor.block_id(),
+                u64::from(checkpoint.lib_slot)
+            );
+            if anchor.block_id() >= args.first_lez_block_id {
+                fill_final_from_rpc(
+                    &source,
+                    &registry,
+                    args.first_lez_block_id,
+                    anchor.block_id() - 1,
+                )
+                .await?;
+                if registry
+                    .write()
+                    .expect("registry lock")
+                    .apply_lez_finalized(&anchor)?
+                    .is_some()
+                {
+                    bail!(
+                        "the LEZ Sequencer's history does not reach LEZ block {}",
+                        anchor.block_id()
+                    );
+                }
+            }
+            save_lez_checkpoint(&registry, &checkpoint)?;
+            checkpoint
+        }
+    };
+    let lez_key = load_or_create_key(&args.data_dir.join("lez-key.hex"))?;
+    let mut lez_sdk = ZoneSequencer::init_with_config(
+        lez_channel_id,
+        lez_key,
+        node.clone(),
+        SequencerConfig::new(FundingConfig {
+            funding_pk: parse_funding_pk(&"00".repeat(32))?,
+            change_pk: None,
+            max_tx_fee: GasCost::new(0),
+            priority_fee_percent: 0,
+        }),
+        Some(lez_checkpoint),
+    );
+
     {
         let registry = registry.read().expect("registry lock");
         println!(
@@ -912,7 +1069,12 @@ async fn main() -> Result<()> {
             )
         );
         println!("  tree_id   {}", hex::encode(tree_id));
-        println!("  lez       {}", source.describe());
+        println!("  lez       {lez_source}");
+        println!(
+            "  lez       finalized tree at LEZ block {}, head at {}",
+            registry.lez.final_reader().lez_block_id,
+            registry.head().lez_block_id
+        );
         println!("  http      http://{}", args.http_addr);
         println!("  data      {}", args.data_dir.display());
         println!(
@@ -945,6 +1107,7 @@ async fn main() -> Result<()> {
     println!("waiting for the Zone SDK to be ready...");
 
     let mut ready = false;
+    let mut lez_ready = false;
     // Batches LEZ has contradicted, as last reported (warned once per change).
     let mut contradicted_count = 0;
     let channel_view = sdk.subscribe_channel_view();
@@ -979,9 +1142,27 @@ async fn main() -> Result<()> {
                 }
                 _ => {}
             },
-            _ = tick.tick(), if ready => {
-                on_poll(
-                    &source,
+            lez_event = lez_sdk.next_event() => match lez_event {
+                Event::Ready => {
+                    if !lez_ready {
+                        println!("LEZ channel ready");
+                    }
+                    lez_ready = true;
+                }
+                Event::BlocksProcessed { checkpoint, channel_update, finalized, .. } => {
+                    on_lez_blocks_processed(
+                        &source,
+                        &registry,
+                        &checkpoint,
+                        &channel_update,
+                        &finalized,
+                    )
+                    .await?;
+                }
+                _ => {}
+            },
+            _ = tick.tick(), if ready && lez_ready => {
+                on_tick(
                     &mut sdk,
                     &registry,
                     &args,

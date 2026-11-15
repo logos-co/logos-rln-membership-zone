@@ -503,6 +503,22 @@ impl ChainState {
         dropped
     }
 
+    /// Whether a batch of ours would apply on the head, before it is published: the fold's
+    /// error otherwise.
+    pub fn would_apply(
+        &self,
+        batch: &Batch,
+        judge: Option<&dyn Judge>,
+    ) -> Result<(), BatchIngestError> {
+        let (state, tip) = self
+            .folds
+            .last()
+            .map_or((&self.final_state, self.final_tip.as_ref()), |fold| {
+                (&fold.state, fold.tip.as_ref())
+            });
+        apply_batch(self.first_lez_block_id, tip, batch, state, judge).map(|_| ())
+    }
+
     /// Records an inscription of ours, which chains on the pin it was built on.
     pub fn record_publish(
         &mut self,

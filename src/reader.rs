@@ -41,18 +41,13 @@ use crate::{
 
 pub const TREE_DEPTH: usize = 20;
 
-/// How many LEZ block hashes the reader keeps: how far back a rewritten history can be
-/// recognised (LEZ closes a block every one to two minutes, so several days).
-pub const HASH_HISTORY: usize = 4096;
-
 /// Why a span of LEZ blocks does not continue the reader's chain (the two chain checks of
 /// LEZ's `BlockIngestError`, same names).
 #[derive(Debug)]
 pub enum BlockIngestError {
     /// A block id out of sequence: the answer is out of order or has a gap.
     UnexpectedBlockId { expected: u64, got: u64 },
-    /// The block does not chain on the block the reader applied before it: LEZ rewrote its
-    /// history, the reader must find the last block both agree on.
+    /// The block does not chain on the block the reader applied before it: another lineage.
     BrokenChainLink {
         block_id: u64,
         expected_prev: [u8; 32],
@@ -205,12 +200,9 @@ struct Meta {
     tree_id: String,
     #[serde(alias = "applied_block_id")]
     lez_block_id: u64,
-    /// Hashes of the last LEZ blocks applied, by block id (as a string, JSON keys), hex.
+    /// Hash of the last LEZ block applied, hex; the next block must chain on it.
     #[serde(default)]
-    block_hashes: BTreeMap<String, String>,
-    /// The newest LEZ block that carried an event of the program.
-    #[serde(default)]
-    last_event_block_id: u64,
+    last_block_hash: Option<String>,
     #[serde(alias = "applied_timestamp_ms")]
     lez_timestamp_ms: u64,
     stats: Stats,
@@ -234,12 +226,8 @@ pub struct Reader {
     pub stats: Stats,
     /// Last LEZ `block_id` applied.
     pub lez_block_id: u64,
-    /// Hashes of the last `HASH_HISTORY` blocks applied: the next block must chain on the
-    /// newest, and a block LEZ rewrote is found by the newest one still agreeing
-    /// (`rewind_to`). Empty before any (a fresh or upgraded store).
-    block_hashes: BTreeMap<u64, [u8; 32]>,
-    /// The newest LEZ block that carried an event of the program: a rewind must not cross it.
-    last_event_block_id: u64,
+    /// Hash of the last block applied: the next block must chain on it. `None` before any.
+    last_block_hash: Option<[u8; 32]>,
     /// `timestamp_ms` of the last LEZ block applied: the clock this reader's tree is at.
     pub lez_timestamp_ms: u64,
     /// The root after every LEZ block that changed the tree: what the tree was at any block
@@ -283,11 +271,37 @@ impl Reader {
         Ok(meta.get("extra").cloned().unwrap_or(Value::Null))
     }
 
-    /// A throwaway store, for tests.
-    #[cfg(test)]
+    /// A throwaway store (in a temporary directory sled removes when closed).
     pub fn open_temporary(tree_id: [u8; 32], lez_block_id: u64) -> Result<(Self, Value)> {
         let config = PmTreeSledConfig::new().temporary(true).build()?;
         Self::open_with(config, tree_id, lez_block_id)
+    }
+
+    /// A temporary reader with this reader's state: the same tree (every active leaf set),
+    /// memberships, counters, block, hash and root history. The head of a `LezChain` starts
+    /// from this and folds the adopted blocks over it.
+    pub fn fork_temporary(&self) -> Result<Self> {
+        let (mut fork, _) = Self::open_temporary(self.tree_id, self.lez_block_id)?;
+        for (id, member) in self.active_leaves() {
+            let leaf = fr_from_bytes_le(&member.rate_commitment)
+                .map_err(|e| anyhow!("stored leaf of {}: {e}", hex::encode(id)))?;
+            fork.tree
+                .set(member.leaf_index as usize, leaf)
+                .with_context(|| format!("set leaf {}", member.leaf_index))?;
+        }
+        fork.members = self.members.clone();
+        fork.stats = self.stats;
+        fork.last_block_hash = self.last_block_hash;
+        fork.lez_timestamp_ms = self.lez_timestamp_ms;
+        fork.roots_by_block = self.roots_by_block.clone();
+        if fork.root() != self.root() {
+            bail!(
+                "the forked tree's root {} is not the store's {}",
+                hex::encode(fork.root()),
+                hex::encode(self.root())
+            );
+        }
+        Ok(fork)
     }
 
     fn open_with(
@@ -307,8 +321,7 @@ impl Reader {
             members: HashMap::new(),
             stats: Stats::default(),
             lez_block_id,
-            block_hashes: BTreeMap::new(),
-            last_event_block_id: 0,
+            last_block_hash: None,
             lez_timestamp_ms: 0,
             roots_by_block: BTreeMap::new(),
         };
@@ -329,12 +342,8 @@ impl Reader {
         }
         reader.stats = meta.stats;
         reader.lez_block_id = meta.lez_block_id;
-        reader.last_event_block_id = meta.last_event_block_id;
+        reader.last_block_hash = meta.last_block_hash.as_deref().map(parse_32).transpose()?;
         reader.lez_timestamp_ms = meta.lez_timestamp_ms;
-        for (block_id, hash) in &meta.block_hashes {
-            let block_id: u64 = block_id.parse().context("block hash history block id")?;
-            reader.block_hashes.insert(block_id, parse_32(hash)?);
-        }
         for (block_id, root) in &meta.roots_by_block {
             let block_id: u64 = block_id.parse().context("root history block id")?;
             reader.roots_by_block.insert(block_id, parse_32(root)?);
@@ -347,12 +356,7 @@ impl Reader {
         let meta = Meta {
             tree_id: hex::encode(self.tree_id),
             lez_block_id: self.lez_block_id,
-            block_hashes: self
-                .block_hashes
-                .iter()
-                .map(|(block_id, hash)| (block_id.to_string(), hex::encode(hash)))
-                .collect(),
-            last_event_block_id: self.last_event_block_id,
+            last_block_hash: self.last_block_hash.map(hex::encode),
             lez_timestamp_ms: self.lez_timestamp_ms,
             stats: self.stats,
             members: self
@@ -408,9 +412,9 @@ impl Reader {
 
     /// Check that `blocks` continue this reader's chain: ids consecutive from the last block
     /// applied and each `prev_block_hash` the hash of the block before. A gap, a block out of
-    /// order or a history that changed under the reader fails here, before anything is applied.
+    /// order or another lineage fails here, before anything is applied.
     pub fn check_chain(&self, blocks: &[Block]) -> Result<(), BlockIngestError> {
-        let mut expected_prev = self.block_hashes.last_key_value().map(|(_, h)| *h);
+        let mut expected_prev = self.last_block_hash;
         for (expected, block) in (self.lez_block_id + 1..).zip(blocks) {
             if block.block_id() != expected {
                 return Err(BlockIngestError::UnexpectedBlockId {
@@ -432,40 +436,9 @@ impl Reader {
         Ok(())
     }
 
-    /// The hash this reader applied for LEZ block `block_id`, while it is in the history.
-    pub fn block_hash(&self, block_id: u64) -> Option<[u8; 32]> {
-        self.block_hashes.get(&block_id).copied()
-    }
-
-    /// The oldest block whose hash is still kept.
-    pub fn oldest_hashed_block_id(&self) -> Option<u64> {
-        self.block_hashes.first_key_value().map(|(id, _)| *id)
-    }
-
-    /// LEZ rewrote its blocks after `block_id`: forget them so they are read again. Only when
-    /// none of them carried an event or changed the tree (an expiry at the block's timestamp
-    /// removes a leaf without any event); a rewind across one needs the tree read again from
-    /// scratch (`REBUILD_TREE`).
-    pub fn rewind_to(&mut self, block_id: u64) -> Result<()> {
-        if block_id >= self.lez_block_id {
-            bail!("rewind to {block_id} while at block {}", self.lez_block_id);
-        }
-        let changed = self
-            .roots_by_block
-            .range(block_id + 1..)
-            .next()
-            .map(|(b, _)| *b);
-        let event = (self.last_event_block_id > block_id).then_some(self.last_event_block_id);
-        if let Some(block) = changed.or(event) {
-            bail!(
-                "LEZ FORK at block {block_id} but block {block} after it changed the tree or \
-                 carried an event: the tree may hold what LEZ no longer says; stop and start \
-                 once with REBUILD_TREE=true"
-            );
-        }
-        self.block_hashes.split_off(&(block_id + 1));
-        self.lez_block_id = block_id;
-        Ok(())
+    /// The hash of the last block applied, `None` before any.
+    pub fn last_block_hash(&self) -> Option<[u8; 32]> {
+        self.last_block_hash
     }
 
     /// Apply the derivation rules to the events of one LEZ block and return the changes, in
@@ -585,13 +558,7 @@ impl Reader {
             changes.push(Change::remove(leaf_index));
         }
         self.lez_block_id = block.block_id();
-        self.block_hashes.insert(block.block_id(), block.hash());
-        while self.block_hashes.len() > HASH_HISTORY {
-            self.block_hashes.pop_first();
-        }
-        if !block.events.is_empty() {
-            self.last_event_block_id = block.block_id();
-        }
+        self.last_block_hash = Some(block.hash());
         self.lez_timestamp_ms = block.timestamp_ms();
         if !changes.is_empty() {
             self.roots_by_block.insert(block.block_id(), self.root());
@@ -722,7 +689,6 @@ mod test {
                 hash: common::HashType([0; 32]),
                 timestamp: timestamp_ms,
             },
-            bedrock_status: crate::lez::BedrockStatus::Finalized,
             events,
             private_transaction_count: 0,
         }
@@ -768,42 +734,32 @@ mod test {
             reader.check_chain(&[chained(2, 1, 2)]),
             Err(BlockIngestError::UnexpectedBlockId { got: 2, .. })
         ));
-        // LEZ rewrote block 2: back to block 1 (its hash is kept), block 2 is read again.
-        assert_eq!(reader.block_hash(2), Some([2; 32]));
-        reader.rewind_to(1).unwrap();
-        assert_eq!(reader.lez_block_id, 1);
-        assert_eq!(reader.block_hash(2), None);
-        reader.check_chain(&[chained(2, 1, 9)]).unwrap();
-        // Not across an event: block 2 registered someone.
-        reader
-            .apply_block(&Block {
-                events: vec![RlnEvent::Registered(Registered {
-                    tree_id: [0; 32],
-                    id_commitment: [7; 32],
-                    rate_limit: 1,
-                    expiry_timestamp_ms: u64::MAX,
-                    leaf_index: 0,
-                })],
-                ..chained(2, 1, 9)
-            })
-            .unwrap();
-        assert!(reader.rewind_to(1).is_err());
+        assert_eq!(reader.last_block_hash(), Some([2; 32]));
     }
 
-    /// An expiry changes the tree without an event: a rewind across it would leave the leaf
-    /// removed while the block that removed it is read again, and its `Remove` lost.
+    /// A forked reader is the store's tree in a temporary store: same root, memberships,
+    /// history; applying to it leaves the store alone.
     #[test]
-    fn test_rewind_refuses_across_an_expiry_without_events() {
+    fn test_fork_temporary_matches_the_store() {
         let (mut reader, _) = Reader::open_temporary([0; 32], 0).unwrap();
         reader
             .apply_block(&block(1, 1_000, vec![registered(1, 0, 5_000)]))
             .unwrap();
-        reader.apply_block(&block(2, 2_000, vec![])).unwrap();
-        reader.apply_block(&block(3, 5_000, vec![])).unwrap();
-        reader.apply_block(&block(4, 6_000, vec![])).unwrap();
-        // Block 3 expired leaf 0 (a change, no event): back to 3 is fine, back to 2 is not.
-        reader.rewind_to(3).unwrap();
-        assert!(reader.rewind_to(2).is_err());
+        reader
+            .apply_block(&block(2, 2_000, vec![registered(2, 1, u64::MAX)]))
+            .unwrap();
+        let mut fork = reader.fork_temporary().unwrap();
+        assert_eq!(fork.root(), reader.root());
+        assert_eq!(fork.lez_block_id, 2);
+        assert_eq!(fork.active_count(), 2);
+        assert_eq!(fork.root_at(1), reader.root_at(1));
+        assert_eq!(fork.last_block_hash(), reader.last_block_hash());
+        // Block 5 expires leaf 0 on the fork only.
+        fork.apply_block(&block(5, 5_000, vec![])).unwrap();
+        assert_eq!(fork.active_count(), 1);
+        assert_eq!(reader.active_count(), 2);
+        assert_ne!(fork.root(), reader.root());
+        assert!(fork.proof_path(1).is_some());
     }
 
     #[test]

@@ -1,0 +1,317 @@
+//! The LEZ chain as the zone keeps it, after LEZ's `chain_state` applied to LEZ's own channel
+//! on Bedrock: a final tier (the LEZ blocks whose inscription Bedrock finalized, in the
+//! persisted `Reader`) and a view (the adopted ones, chained on the final block), the head
+//! being the final reader folded over the view. The blocks come from the LEZ channel through
+//! the Zone SDK (`adopted`, `finalized`, `Conflict`), so the zone never commits on Bedrock to
+//! a LEZ block that is not on Bedrock; the LEZ Sequencer's RPC only fills finalized history,
+//! pinned by the hash chain to a block Bedrock finalized.
+
+use anyhow::{Result, bail};
+use serde_json::Value;
+
+use crate::{
+    batch::Change,
+    lez::Block,
+    reader::{BlockIngestError, Reader},
+};
+
+/// What an adopted block did to the head.
+#[derive(Debug)]
+pub enum Adopted {
+    /// Chained on the head and applied; its changes, in derivation-rule order.
+    Applied(Vec<Change>),
+    /// The head already holds it (a re-delivery).
+    AlreadyApplied,
+    /// Did not chain on the head: a block the SDK reports out of order, or a lineage this head
+    /// does not follow (a `Conflict` is due).
+    DoesNotChain(BlockIngestError),
+}
+
+/// What a finalized block did to the final tier.
+#[derive(Debug)]
+pub enum Finalized {
+    /// Chained on the final block and applied; `new_to_head` when the head had not seen it as
+    /// an adopted block (the stream ran ahead of the view, or a restart), with its changes.
+    Applied {
+        changes: Vec<Change>,
+        new_to_head: bool,
+    },
+    /// The final tier already holds it.
+    AlreadyApplied,
+    /// Blocks are missing before it: the caller fills `expected..block_id` from the LEZ
+    /// Sequencer, pinned by the hash chain, then applies it again.
+    Gap { expected: u64 },
+}
+
+pub struct LezChain {
+    /// Finalized LEZ blocks only; the store on disk.
+    final_reader: Reader,
+    /// Adopted blocks not finalized yet, chained on the final block, lineage order.
+    view: Vec<Block>,
+    /// The final reader folded over the view: a temporary store, rebuilt from the final
+    /// reader on start and on every `Conflict`.
+    head: Reader,
+}
+
+impl LezChain {
+    pub fn new(final_reader: Reader) -> Result<Self> {
+        let head = final_reader.fork_temporary()?;
+        Ok(Self {
+            final_reader,
+            view: vec![],
+            head,
+        })
+    }
+
+    pub fn final_reader(&self) -> &Reader {
+        &self.final_reader
+    }
+
+    pub fn head(&self) -> &Reader {
+        &self.head
+    }
+
+    pub fn view(&self) -> &[Block] {
+        &self.view
+    }
+
+    pub fn persist(&mut self, extra: Value) -> Result<()> {
+        self.final_reader.persist(extra)
+    }
+
+    pub fn close(&mut self) -> Result<()> {
+        self.final_reader.close()?;
+        self.head.close()
+    }
+
+    /// An adopted LEZ block (the SDK's `Extension`): onto the head and into the view.
+    pub fn apply_adopted(&mut self, block: &Block) -> Result<Adopted> {
+        if block.block_id() <= self.head.lez_block_id {
+            let known = self
+                .view
+                .iter()
+                .any(|held| held.block_id() == block.block_id() && held.hash() == block.hash())
+                || (block.block_id() <= self.final_reader.lez_block_id
+                    && self.final_reader.last_block_hash().is_some_and(|h| {
+                        block.block_id() != self.final_reader.lez_block_id || h == block.hash()
+                    }));
+            return Ok(if known {
+                Adopted::AlreadyApplied
+            } else {
+                Adopted::DoesNotChain(BlockIngestError::UnexpectedBlockId {
+                    expected: self.head.lez_block_id + 1,
+                    got: block.block_id(),
+                })
+            });
+        }
+        if let Err(e) = self.head.check_chain(std::slice::from_ref(block)) {
+            return Ok(Adopted::DoesNotChain(e));
+        }
+        let changes = self.head.apply_block(block)?;
+        self.view.push(block.clone());
+        Ok(Adopted::Applied(changes))
+    }
+
+    /// The whole adopted lineage after the final block (the SDK's `Conflict`): the head is
+    /// rebuilt from the final reader over it. Returns the changes of every block applied, in
+    /// order; stops at the first block that does not chain (logged by the caller).
+    pub fn apply_conflict(&mut self, canonical: &[Block]) -> Result<Vec<(u64, Vec<Change>)>> {
+        self.head = self.final_reader.fork_temporary()?;
+        self.view.clear();
+        let mut applied = vec![];
+        for block in canonical {
+            if block.block_id() <= self.final_reader.lez_block_id {
+                continue;
+            }
+            match self.apply_adopted(block)? {
+                Adopted::Applied(changes) => applied.push((block.block_id(), changes)),
+                Adopted::AlreadyApplied => {}
+                Adopted::DoesNotChain(e) => {
+                    println!(
+                        "LEZ block {} of the canonical lineage does not chain: {e}; the head stops \
+                         before it",
+                        block.block_id()
+                    );
+                    break;
+                }
+            }
+        }
+        Ok(applied)
+    }
+
+    /// A LEZ block Bedrock finalized (the SDK's `finalized`, or the RPC filling a gap): onto
+    /// the final reader, out of the view.
+    pub fn apply_finalized(&mut self, block: &Block) -> Result<Finalized> {
+        if block.block_id() <= self.final_reader.lez_block_id {
+            return Ok(Finalized::AlreadyApplied);
+        }
+        match self.final_reader.check_chain(std::slice::from_ref(block)) {
+            Ok(()) => {}
+            Err(BlockIngestError::UnexpectedBlockId { expected, .. }) => {
+                return Ok(Finalized::Gap { expected });
+            }
+            Err(e @ BlockIngestError::BrokenChainLink { .. }) => bail!(
+                "finalized LEZ block {} does not chain on the final tier ({e}): the final tier \
+                 holds a history Bedrock did not finalize; start once with REBUILD_TREE=true",
+                block.block_id()
+            ),
+        }
+        let changes = self.final_reader.apply_block(block)?;
+        let new_to_head = match self.view.first() {
+            Some(held) if held.hash() == block.hash() => {
+                self.view.remove(0);
+                false
+            }
+            Some(held) => {
+                // The view sits on a branch Bedrock did not finalize and no `Conflict` said
+                // so: the head follows the final tier again, the SDK refills the view.
+                println!(
+                    "LEZ block {} finalized with hash {}.., the view held {}..: {} adopted \
+                     block(s) dropped, the head is the final tier again",
+                    block.block_id(),
+                    hex::encode(&block.hash()[..4]),
+                    hex::encode(&held.hash()[..4]),
+                    self.view.len()
+                );
+                self.view.clear();
+                self.head = self.final_reader.fork_temporary()?;
+                true
+            }
+            None => {
+                // Nothing adopted ahead of the final tier: the head is at the final block and
+                // takes this one too.
+                self.head.apply_block(block)?;
+                true
+            }
+        };
+        Ok(Finalized::Applied {
+            changes,
+            new_to_head,
+        })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::lez::{Registered, RlnEvent};
+
+    fn id(n: u8) -> [u8; 32] {
+        let mut id = [0u8; 32];
+        id[0] = n;
+        id
+    }
+
+    fn registered(n: u8, leaf_index: u64) -> RlnEvent {
+        RlnEvent::Registered(Registered {
+            tree_id: [0; 32],
+            id_commitment: id(n),
+            rate_limit: 100,
+            expiry_timestamp_ms: u64::MAX,
+            leaf_index,
+        })
+    }
+
+    /// Block `block_id` with hash `hash` chaining on hash `prev`.
+    fn block(block_id: u64, prev: u8, hash: u8, events: Vec<RlnEvent>) -> Block {
+        Block {
+            header: crate::lez::BlockHeader {
+                block_id,
+                prev_block_hash: common::HashType([prev; 32]),
+                hash: common::HashType([hash; 32]),
+                timestamp: 1_000 * block_id,
+            },
+            events,
+            private_transaction_count: 0,
+        }
+    }
+
+    fn chain() -> LezChain {
+        let (reader, _) = Reader::open_temporary([0; 32], 0).unwrap();
+        LezChain::new(reader).unwrap()
+    }
+
+    #[test]
+    fn test_adopted_blocks_fold_on_the_head_and_finality_moves_them_to_the_final_tier() {
+        let mut chain = chain();
+        let b1 = block(1, 0, 1, vec![registered(1, 0)]);
+        let b2 = block(2, 1, 2, vec![]);
+        assert!(matches!(chain.apply_adopted(&b1).unwrap(), Adopted::Applied(c) if c.len() == 1));
+        assert!(matches!(chain.apply_adopted(&b2).unwrap(), Adopted::Applied(c) if c.is_empty()));
+        assert!(matches!(
+            chain.apply_adopted(&b1).unwrap(),
+            Adopted::AlreadyApplied
+        ));
+        assert_eq!(chain.head().lez_block_id, 2);
+        assert_eq!(chain.final_reader().lez_block_id, 0);
+        assert_eq!(chain.view().len(), 2);
+        assert_eq!(chain.head().active_count(), 1);
+        // A block that does not chain is refused, the head untouched.
+        assert!(matches!(
+            chain.apply_adopted(&block(3, 9, 3, vec![])).unwrap(),
+            Adopted::DoesNotChain(BlockIngestError::BrokenChainLink { block_id: 3, .. })
+        ));
+        // Finality reaches block 1: into the final tier, out of the view, nothing new to the
+        // head.
+        assert!(matches!(
+            chain.apply_finalized(&b1).unwrap(),
+            Finalized::Applied {
+                new_to_head: false,
+                ..
+            }
+        ));
+        assert_eq!(chain.final_reader().lez_block_id, 1);
+        assert_eq!(chain.view().len(), 1);
+        assert_eq!(chain.final_reader().root(), chain.head().root());
+        assert!(matches!(
+            chain.apply_finalized(&b1).unwrap(),
+            Finalized::AlreadyApplied
+        ));
+        // A gap: block 4 before block 2 and 3 are final.
+        assert!(matches!(
+            chain.apply_finalized(&block(4, 3, 4, vec![])).unwrap(),
+            Finalized::Gap { expected: 2 }
+        ));
+    }
+
+    #[test]
+    fn test_a_conflict_rebuilds_the_head_from_the_final_tier() {
+        let mut chain = chain();
+        let b1 = block(1, 0, 1, vec![registered(1, 0)]);
+        chain.apply_adopted(&b1).unwrap();
+        chain.apply_finalized(&b1).unwrap();
+        let root_1 = chain.head().root();
+        // Adopted: block 2 registers leaf 1. A reorg replaces it by a block 2 without events.
+        chain
+            .apply_adopted(&block(2, 1, 2, vec![registered(2, 1)]))
+            .unwrap();
+        assert_eq!(chain.head().active_count(), 2);
+        let other_2 = block(2, 1, 7, vec![]);
+        let other_3 = block(3, 7, 8, vec![registered(3, 1)]);
+        let applied = chain
+            .apply_conflict(&[b1.clone(), other_2.clone(), other_3.clone()])
+            .unwrap();
+        assert_eq!(applied.len(), 2);
+        assert_eq!(applied[1].1.len(), 1);
+        assert_eq!(chain.view().len(), 2);
+        assert_eq!(chain.head().lez_block_id, 3);
+        assert_eq!(chain.head().active_count(), 2);
+        assert_ne!(chain.head().root(), root_1);
+        assert_eq!(chain.head().root_at(1), Some(root_1));
+        // Finality on another hash than the view's first: the view is dropped, the head is
+        // the final tier again, and the block counts as new to the head.
+        let finalized_2 = block(2, 1, 9, vec![]);
+        assert!(matches!(
+            chain.apply_finalized(&finalized_2).unwrap(),
+            Finalized::Applied {
+                new_to_head: true,
+                ..
+            }
+        ));
+        assert!(chain.view().is_empty());
+        assert_eq!(chain.head().lez_block_id, 2);
+        assert_eq!(chain.head().root(), root_1);
+        // A finalized block that does not chain on the final tier is fatal.
+        assert!(chain.apply_finalized(&block(3, 5, 6, vec![])).is_err());
+    }
+}
