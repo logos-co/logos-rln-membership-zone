@@ -444,17 +444,24 @@ impl Reader {
     }
 
     /// LEZ rewrote its blocks after `block_id`: forget them so they are read again. Only when
-    /// none of them carried an event (the tree and the memberships are then untouched); a
-    /// rewind across an event needs the tree read again from scratch (`REBUILD_TREE`).
+    /// none of them carried an event or changed the tree (an expiry at the block's timestamp
+    /// removes a leaf without any event); a rewind across one needs the tree read again from
+    /// scratch (`REBUILD_TREE`).
     pub fn rewind_to(&mut self, block_id: u64) -> Result<()> {
         if block_id >= self.lez_block_id {
             bail!("rewind to {block_id} while at block {}", self.lez_block_id);
         }
-        if self.last_event_block_id > block_id {
+        let changed = self
+            .roots_by_block
+            .range(block_id + 1..)
+            .next()
+            .map(|(b, _)| *b);
+        let event = (self.last_event_block_id > block_id).then_some(self.last_event_block_id);
+        if let Some(block) = changed.or(event) {
             bail!(
-                "LEZ FORK at block {block_id} but block {} after it carried an event: the tree may \
-                 hold what LEZ no longer says; stop and start once with REBUILD_TREE=true",
-                self.last_event_block_id
+                "LEZ FORK at block {block_id} but block {block} after it changed the tree or \
+                 carried an event: the tree may hold what LEZ no longer says; stop and start \
+                 once with REBUILD_TREE=true"
             );
         }
         self.block_hashes.split_off(&(block_id + 1));
@@ -764,6 +771,22 @@ mod test {
             })
             .unwrap();
         assert!(reader.rewind_to(1).is_err());
+    }
+
+    /// An expiry changes the tree without an event: a rewind across it would leave the leaf
+    /// removed while the block that removed it is read again, and its `Remove` lost.
+    #[test]
+    fn test_rewind_refuses_across_an_expiry_without_events() {
+        let (mut reader, _) = Reader::open_temporary([0; 32], 0).unwrap();
+        reader
+            .apply_block(&block(1, 1_000, vec![registered(1, 0, 5_000)]))
+            .unwrap();
+        reader.apply_block(&block(2, 2_000, vec![])).unwrap();
+        reader.apply_block(&block(3, 5_000, vec![])).unwrap();
+        reader.apply_block(&block(4, 6_000, vec![])).unwrap();
+        // Block 3 expired leaf 0 (a change, no event): back to 3 is fine, back to 2 is not.
+        reader.rewind_to(3).unwrap();
+        assert!(reader.rewind_to(2).is_err());
     }
 
     #[test]

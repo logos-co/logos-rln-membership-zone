@@ -330,7 +330,12 @@ impl Registry {
         payload: &[u8],
         l1_slot: u64,
     ) -> Result<&Published> {
-        let batch = Batch::decode(payload).context("the inscription is not a batch")?;
+        // An inscription that is no batch is kept as a rejected one, not an error: the scan
+        // goes on and the history still says what the channel holds.
+        let (batch, not_a_batch) = match Batch::decode(payload) {
+            Ok(batch) => (batch, None),
+            Err(e) => (Batch::default(), Some(e)),
+        };
         let changes: Vec<ChangeRecord> = batch
             .changes
             .iter()
@@ -350,7 +355,10 @@ impl Registry {
         {
             return Ok(&self.history.published[at]);
         }
-        let verification = self.verify(&batch, &changes, root_after)?;
+        let verification = match not_a_batch {
+            Some(e) => Verification::Rejected(format!("the inscription is not a batch: {e}")),
+            None => self.verify(&batch, &changes, root_after)?,
+        };
         if verification == Verification::Verified {
             self.trim_pending(batch.to_lez_block_id);
         }
@@ -405,7 +413,11 @@ impl Registry {
             .as_mut()
             .context("indexer replay tree not started")?;
         let mut trial = replay.clone();
-        apply_changes(&mut trial, changes)?;
+        if let Err(e) = apply_changes(&mut trial, changes) {
+            return Ok(Verification::Rejected(format!(
+                "the changes do not apply: {e:#}"
+            )));
+        }
         let replayed = fr_to_bytes_le(&trial.root());
         if replayed != root_after {
             return Ok(Verification::Rejected(format!(
@@ -1101,6 +1113,45 @@ mod test {
             .observe_batch([3; 32], [3; 32], &batch(2, 3, vec![], [9; 32]), 300)
             .unwrap();
         assert_eq!(again.verification, Some(Verification::Verified));
+        registry.close().unwrap();
+        drop(registry);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An inscription that is no batch, or a batch whose changes cannot apply, is a rejected
+    /// entry: the scan goes on, nothing moves.
+    #[test]
+    fn test_a_malformed_inscription_is_rejected_not_fatal() {
+        let dir = std::env::temp_dir().join(format!("zone-malformed-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
+        registry.start_replay().unwrap();
+        registry
+            .apply_blocks(&[block(1, vec![registered(1, 0)])])
+            .unwrap();
+        let garbage = registry
+            .observe_batch([1; 32], [1; 32], &[0xff, 0xff, 0xff], 100)
+            .unwrap();
+        assert!(matches!(
+            garbage.verification,
+            Some(Verification::Rejected(ref reason)) if reason.contains("not a batch")
+        ));
+        let short_leaf = Batch {
+            from_lez_block_id: 1,
+            to_lez_block_id: 1,
+            changes: vec![Change::insert(0, vec![1, 2, 3])],
+            root_after: registry.head.root().to_vec(),
+        }
+        .encode_to_vec();
+        let bad = registry
+            .observe_batch([2; 32], [2; 32], &short_leaf, 200)
+            .unwrap();
+        assert!(matches!(
+            bad.verification,
+            Some(Verification::Rejected(ref reason)) if reason.contains("do not apply")
+        ));
+        assert_eq!(registry.history.covered_to(), 0);
+        assert_eq!(registry.history.published.len(), 2);
         registry.close().unwrap();
         drop(registry);
         let _ = std::fs::remove_dir_all(&dir);

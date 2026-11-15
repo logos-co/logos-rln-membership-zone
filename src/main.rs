@@ -325,7 +325,7 @@ async fn apply_range(
             registry.rewind_to(fork)?;
             registry.save()?;
             println!(
-                "LEZ FORK: at block {fork}; blocks {}..{was_at} ({} block(s), no events) \
+                "LEZ FORK: at block {fork}; blocks {}..{was_at} ({} block(s), no tree change) \
                  forgotten, {} pending change(s) dropped; reading again from {}",
                 fork + 1,
                 was_at - fork,
