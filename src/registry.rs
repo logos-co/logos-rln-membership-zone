@@ -9,10 +9,9 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result};
 use prost::Message as _;
+use rln::prelude::{Fr, PoseidonHash};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-
-use rln::prelude::{Fr, PoseidonHash};
 use zerokit_utils::merkle_tree::{OptimalMerkleConfig, OptimalMerkleTree, ZerokitMerkleTree};
 
 use crate::{
@@ -286,6 +285,39 @@ impl Registry {
         }
         self.replay = Some(tree);
         Ok(())
+    }
+
+    /// Indexer: forget the batches read from L1 slot `from_slot` on and move the scan cursor
+    /// back there, so the channel is read again: after a scan that missed an inscription (a
+    /// node still filling its history), which rejects every batch after it as not
+    /// contiguous. Call before `start_replay`. Returns how many batches were forgotten.
+    pub fn rescan_channel_from(&mut self, from_slot: u64) -> usize {
+        let before = self.history.published.len();
+        self.history
+            .published
+            .retain(|p| !matches!(p.status, Status::Finalized { l1_slot } if l1_slot >= from_slot));
+        self.history.finality_scanned_to = from_slot.checked_sub(1);
+        before - self.history.published.len()
+    }
+
+    /// Indexer: when `payload` is a batch not judged yet that would leave LEZ blocks uncovered
+    /// after the last batch counted, the L1 slot after that batch's: where to read the channel
+    /// again before judging it, in case the scan missed an inscription in between.
+    pub fn gap_before(&self, msg_id: &[u8; 32], payload: &[u8]) -> Option<u64> {
+        let judged = self
+            .history
+            .published
+            .iter()
+            .any(|p| p.msg_id == *msg_id && p.verification != Some(Verification::Pending));
+        let batch = Batch::decode(payload).ok()?;
+        if judged || batch.from_lez_block_id <= self.history.covered_to() + 1 {
+            return None;
+        }
+        let last = self.history.published.iter().rev().find(|p| p.counts());
+        Some(match last.map(|p| &p.status) {
+            Some(Status::Finalized { l1_slot }) => l1_slot + 1,
+            _ => 0,
+        })
     }
 
     /// Indexer: a batch read from the channel (`payload` its inscription, finalized at
@@ -1069,6 +1101,87 @@ mod test {
             .observe_batch([3; 32], [3; 32], &batch(2, 3, vec![], [9; 32]), 300)
             .unwrap();
         assert_eq!(again.verification, Some(Verification::Verified));
+        registry.close().unwrap();
+        drop(registry);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scan that missed an inscription rejects the batches after it; a rescan from the
+    /// missed slot forgets them and the channel is read again from there.
+    #[test]
+    fn test_rescan_forgets_the_batches_from_a_slot_on_and_checks_them_again() {
+        let dir = std::env::temp_dir().join(format!("zone-rescan-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut registry = Registry::open(&dir, [0; 32], 1, false).unwrap();
+        registry.start_replay().unwrap();
+        registry
+            .apply_blocks(&[
+                block(1, vec![registered(1, 0)]),
+                block(2, vec![registered(2, 1)]),
+            ])
+            .unwrap();
+        let batch = |from: u64, to: u64, changes: Vec<Change>, root: [u8; 32]| {
+            Batch {
+                from_lez_block_id: from,
+                to_lez_block_id: to,
+                changes,
+                root_after: root.to_vec(),
+            }
+            .encode_to_vec()
+        };
+        let changes: Vec<Change> = registry
+            .pending_changes
+            .iter()
+            .map(|(_, c)| c.clone())
+            .collect();
+        let root_1 = registry.head.root_at(1).unwrap();
+        let root_2 = registry.head.root();
+        // The batch for block 1 sits at slot 100; the scan missed it and read block 2's at 200.
+        let second_payload = batch(2, 2, changes[1..].to_vec(), root_2);
+        // Before judging it: a gap, nothing counted yet, so the channel is read again from 0.
+        assert_eq!(registry.gap_before(&[2; 32], &second_payload), Some(0));
+        let late = registry
+            .observe_batch([2; 32], [2; 32], &second_payload, 200)
+            .unwrap();
+        assert!(matches!(
+            late.verification,
+            Some(Verification::Rejected(ref reason)) if reason.contains("covered to 0")
+        ));
+        // Judged: no look-back for it any more.
+        assert_eq!(registry.gap_before(&[2; 32], &second_payload), None);
+        registry.history.finality_scanned_to = Some(250);
+
+        // Rescan from the missed slot: the rejected batch is forgotten, the cursor moves back.
+        assert_eq!(registry.rescan_channel_from(100), 1);
+        assert!(registry.history.published.is_empty());
+        assert_eq!(registry.history.finality_scanned_to, Some(99));
+        registry.start_replay().unwrap();
+        let first = registry
+            .observe_batch(
+                [1; 32],
+                [1; 32],
+                &batch(1, 1, changes[..1].to_vec(), root_1),
+                100,
+            )
+            .unwrap();
+        assert_eq!(first.verification, Some(Verification::Verified));
+        // Contiguous with the batch counted: no look-back; a batch from block 4 would look back
+        // from the slot after the counted batch's.
+        assert_eq!(registry.gap_before(&[2; 32], &second_payload), None);
+        assert_eq!(
+            registry.gap_before(&[4; 32], &batch(4, 4, vec![], root_2)),
+            Some(101)
+        );
+        let second = registry
+            .observe_batch([2; 32], [2; 32], &second_payload, 200)
+            .unwrap();
+        assert_eq!(second.verification, Some(Verification::Verified));
+        assert_eq!(registry.history.covered_to(), 2);
+        assert_eq!(registry.replay_root(), Some(root_2));
+
+        // From slot 0: nothing read yet, the first start's slot applies again.
+        assert_eq!(registry.rescan_channel_from(0), 2);
+        assert_eq!(registry.history.finality_scanned_to, None);
         registry.close().unwrap();
         drop(registry);
         let _ = std::fs::remove_dir_all(&dir);

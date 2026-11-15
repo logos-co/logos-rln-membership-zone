@@ -26,6 +26,7 @@ use std::{
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
+use lb_common_http_client::ApiBlock;
 use lb_core::mantle::{
     gas::GasCost,
     ops::channel::{ChannelId, MsgId, inscribe::Inscription},
@@ -93,6 +94,11 @@ struct Args {
     /// (the sequencer's first batch shows it as `published_at_slot`).
     #[arg(long, env = "INDEXER_FROM_L1_SLOT")]
     indexer_from_l1_slot: Option<u64>,
+    /// Indexer: forget the batches read from this L1 slot on and read the channel again from
+    /// there, after a scan that missed an inscription (every batch after it rejected as not
+    /// contiguous). One start; the history and the tree stay.
+    #[arg(long, env = "RESCAN_CHANNEL_FROM")]
+    rescan_channel_from: Option<u64>,
     /// Hard cap per publish, in atomic units.
     #[arg(long, default_value_t = 1_000_000, env = "MAX_TX_FEE")]
     max_tx_fee: u64,
@@ -728,6 +734,15 @@ async fn run_indexer(
     source: SequencerLez,
     registry: Shared,
 ) -> Result<()> {
+    if let Some(slot) = args.rescan_channel_from {
+        let mut registry = registry.write().expect("registry lock");
+        let forgotten = registry.rescan_channel_from(slot);
+        registry.save()?;
+        println!(
+            "rescan: {forgotten} batch(es) read from L1 slot {slot} on forgotten, the channel is \
+             read again from there"
+        );
+    }
     let from_slot = {
         let registry = registry.read().expect("registry lock");
         match (
@@ -803,7 +818,7 @@ async fn run_indexer(
                 }
             }
             _ = channel_tick.tick() => {
-                match read_channel(&node, channel_id, &registry, next_slot).await {
+                match read_channel(&node, channel_id, &registry, next_slot, from_slot).await {
                     Ok(scanned_to) => next_slot = scanned_to + 1,
                     Err(e) => println!("channel read failed: {e}"),
                 }
@@ -817,12 +832,17 @@ async fn run_indexer(
 }
 
 /// Indexer: read the channel's inscriptions in the finalized L1 blocks from `from_slot` up to
-/// the LIB, page by page, and check each as a batch. Returns the slot read up to.
+/// the LIB, page by page, and check each as a batch. A batch that would leave LEZ blocks
+/// uncovered after the last one counted first has the L1 slots between the two read again
+/// (`look_back`, not before `first_slot`): a node still filling its history answers a page
+/// without the block that held the batch in between, and nothing else tells that apart from a
+/// sequencer that skipped blocks. Returns the slot read up to.
 async fn read_channel(
     node: &NodeHttpClient,
     channel_id: ChannelId,
     registry: &Shared,
     from_slot: u64,
+    first_slot: u64,
 ) -> Result<u64> {
     let lib = u64::from(
         node.consensus_info()
@@ -841,47 +861,119 @@ async fn read_channel(
             .immutable_blocks(Slot::from(page_from), Slot::from(page_to))
             .await
             .map_err(|e| anyhow!("immutable blocks {page_from}..{page_to}: {e}"))?;
-        let mut registry = registry.write().expect("registry lock");
-        for block in &blocks {
-            let l1_slot = u64::from(block.header.slot);
-            for tx in &block.transactions {
-                for info in channel_inscriptions(tx, channel_id) {
-                    let msg = msg_bytes(&info.this_msg);
-                    let entry = registry.observe_batch(
-                        msg,
-                        tx_bytes(&info.tx_hash),
-                        &info.payload,
-                        l1_slot,
-                    )?;
-                    match &entry.verification {
-                        Some(Verification::Verified) => println!(
-                            "batch [{}..{}] msg {} at L1 slot {l1_slot}: VERIFIED, root {}..",
-                            entry.from_lez_block_id,
-                            entry.to_lez_block_id,
-                            hex::encode(&msg[..4]),
-                            hex::encode(&entry.root_after[..4])
-                        ),
-                        Some(Verification::Rejected(reason)) => println!(
-                            "batch [{}..{}] msg {} at L1 slot {l1_slot}: REJECTED, {reason}",
-                            entry.from_lez_block_id,
-                            entry.to_lez_block_id,
-                            hex::encode(&msg[..4])
-                        ),
-                        _ => println!(
-                            "batch [{}..{}] msg {} at L1 slot {l1_slot}: pending, LEZ not read that far yet",
-                            entry.from_lez_block_id,
-                            entry.to_lez_block_id,
-                            hex::encode(&msg[..4])
-                        ),
-                    }
-                }
+        for found in page_inscriptions(&blocks, channel_id) {
+            let gap = registry
+                .read()
+                .expect("registry lock")
+                .gap_before(&found.msg, &found.payload)
+                .map(|slot| slot.max(first_slot));
+            if let Some(from) = gap
+                && from < found.l1_slot
+            {
+                let to = found.l1_slot - 1;
+                println!(
+                    "batch msg {} at L1 slot {} does not continue the last batch counted: reading \
+                     L1 slots {from}..{to} again first",
+                    hex::encode(&found.msg[..4]),
+                    found.l1_slot
+                );
+                let seen = look_back(node, channel_id, registry, from, to).await?;
+                println!("L1 slots {from}..{to} read again: {seen} inscription(s)");
             }
+            observe_found(&mut registry.write().expect("registry lock"), &found)?;
         }
+        let mut registry = registry.write().expect("registry lock");
         registry.history.finality_scanned_to = Some(page_to);
         registry.save()?;
         page_from = page_to + 1;
     }
     Ok(lib)
+}
+
+/// One inscription of the channel found in a finalized L1 block.
+struct Found {
+    l1_slot: u64,
+    msg: [u8; 32],
+    tx_hash: [u8; 32],
+    payload: Vec<u8>,
+}
+
+/// The channel's inscriptions in `blocks`, in block and transaction order.
+fn page_inscriptions(blocks: &[ApiBlock], channel_id: ChannelId) -> Vec<Found> {
+    blocks
+        .iter()
+        .flat_map(|block| {
+            let l1_slot = u64::from(block.header.slot);
+            block.transactions.iter().flat_map(move |tx| {
+                channel_inscriptions(tx, channel_id)
+                    .into_iter()
+                    .map(move |info| Found {
+                        l1_slot,
+                        msg: msg_bytes(&info.this_msg),
+                        tx_hash: tx_bytes(&info.tx_hash),
+                        payload: info.payload.to_vec(),
+                    })
+            })
+        })
+        .collect()
+}
+
+/// Indexer: check one inscription as a batch and say the verdict.
+fn observe_found(registry: &mut Registry, found: &Found) -> Result<()> {
+    let l1_slot = found.l1_slot;
+    let entry = registry.observe_batch(found.msg, found.tx_hash, &found.payload, l1_slot)?;
+    match &entry.verification {
+        Some(Verification::Verified) => println!(
+            "batch [{}..{}] msg {} at L1 slot {l1_slot}: VERIFIED, root {}..",
+            entry.from_lez_block_id,
+            entry.to_lez_block_id,
+            hex::encode(&found.msg[..4]),
+            hex::encode(&entry.root_after[..4])
+        ),
+        Some(Verification::Rejected(reason)) => println!(
+            "batch [{}..{}] msg {} at L1 slot {l1_slot}: REJECTED, {reason}",
+            entry.from_lez_block_id,
+            entry.to_lez_block_id,
+            hex::encode(&found.msg[..4])
+        ),
+        _ => println!(
+            "batch [{}..{}] msg {} at L1 slot {l1_slot}: pending, LEZ not read that far yet",
+            entry.from_lez_block_id,
+            entry.to_lez_block_id,
+            hex::encode(&found.msg[..4])
+        ),
+    }
+    Ok(())
+}
+
+/// Indexer: read the finalized L1 blocks `from..=to` again and check every inscription found
+/// as a batch (the ones already judged are left as they are). The scan cursor does not move.
+/// Returns how many inscriptions the slots held.
+async fn look_back(
+    node: &NodeHttpClient,
+    channel_id: ChannelId,
+    registry: &Shared,
+    from: u64,
+    to: u64,
+) -> Result<usize> {
+    let mut seen = 0;
+    let mut page_from = from;
+    while page_from <= to {
+        let page_to = to.min(page_from + FINALITY_SCAN_PAGE - 1);
+        let blocks = node
+            .immutable_blocks(Slot::from(page_from), Slot::from(page_to))
+            .await
+            .map_err(|e| anyhow!("immutable blocks {page_from}..{page_to}: {e}"))?;
+        let found = page_inscriptions(&blocks, channel_id);
+        seen += found.len();
+        let mut registry = registry.write().expect("registry lock");
+        for found in &found {
+            observe_found(&mut registry, found)?;
+        }
+        registry.save()?;
+        page_from = page_to + 1;
+    }
+    Ok(seen)
 }
 
 /// Mark our batches Finalized as Bedrock finality reaches them (the Zone SDK stream), with
