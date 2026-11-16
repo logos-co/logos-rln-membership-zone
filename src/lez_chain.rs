@@ -112,31 +112,34 @@ impl LezChain {
         Ok(Adopted::Applied(changes))
     }
 
-    /// The whole adopted lineage after the final block (the SDK's `Conflict`): the head is
-    /// rebuilt from the final reader over it. Returns the changes of every block applied, in
-    /// order; stops at the first block that does not chain (logged by the caller).
-    pub fn apply_conflict(&mut self, canonical: &[Block]) -> Result<Vec<(u64, Vec<Change>)>> {
+    /// Back to the final tier: the head is the final reader again and the view is empty (a
+    /// Bedrock reorg, the SDK's `Conflict`; the caller adopts the canonical lineage again).
+    pub fn reset_to_final(&mut self) -> Result<()> {
         self.head = self.final_reader.clone_temporary()?;
         self.view.clear();
-        let mut applied = vec![];
-        for block in canonical {
-            if block.block_id() <= self.final_reader.lez_block_id {
-                continue;
-            }
+        Ok(())
+    }
+
+    /// The view persisted by the last run, adopted again onto a head at the final tier; the
+    /// changes of every block applied, in order. Stops at the first block that does not chain
+    /// (the SDK refills what is missing).
+    pub fn restore_view(&mut self, blocks: &[Block]) -> Result<Vec<(u64, Vec<Change>)>> {
+        let mut restored = vec![];
+        for block in blocks {
             match self.apply_adopted(block)? {
-                Adopted::Applied(changes) => applied.push((block.block_id(), changes)),
+                Adopted::Applied(changes) => restored.push((block.block_id(), changes)),
                 Adopted::AlreadyApplied => {}
                 Adopted::DoesNotChain(e) => {
                     println!(
-                        "LEZ block {} of the canonical lineage does not chain: {e}; the head stops \
-                         before it",
+                        "persisted LEZ block {} does not chain on the finalized tree: {e}; the \
+                         view restarts there",
                         block.block_id()
                     );
                     break;
                 }
             }
         }
-        Ok(applied)
+        Ok(restored)
     }
 
     /// A LEZ block Bedrock finalized (the SDK's `finalized`, or the RPC filling a gap): onto
@@ -288,11 +291,15 @@ mod test {
         assert_eq!(chain.head().active_count(), 2);
         let other_2 = block(2, 1, 7, vec![]);
         let other_3 = block(3, 7, 8, vec![registered(3, 1)]);
-        let applied = chain
-            .apply_conflict(&[b1.clone(), other_2.clone(), other_3.clone()])
-            .unwrap();
-        assert_eq!(applied.len(), 2);
-        assert_eq!(applied[1].1.len(), 1);
+        chain.reset_to_final().unwrap();
+        assert_eq!(chain.head().lez_block_id, 1);
+        assert_eq!(
+            chain
+                .restore_view(&[b1.clone(), other_2, other_3])
+                .unwrap()
+                .len(),
+            2
+        );
         assert_eq!(chain.view().len(), 2);
         assert_eq!(chain.head().lez_block_id, 3);
         assert_eq!(chain.head().active_count(), 2);

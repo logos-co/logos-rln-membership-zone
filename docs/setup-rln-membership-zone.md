@@ -118,7 +118,10 @@ What happens, in order:
    block the store is at.
 3. Two Zone SDK readers follow Bedrock from the node. One follows the LEZ channel (section 4),
    from the LIB on a fresh store: the LEZ blocks adopted since are folded over the finalized
-   tree (the head), the finalized ones move into the store. The other follows the Zone channel:
+   tree (the head) and kept with the store, the finalized ones move into the tree. Blocks the
+   SDK skips (a stream it dropped and reopened, entries it does not echo after a restart) are
+   read from the LEZ Sequencer and taken only when they chain on the head and the adopted
+   block chains on them. The other follows the Zone channel:
    one with no message on chain yet starts at the LIB (seconds); one with history is walked
    from genesis the first time (30 to 60 minutes on the testnet; a `408 Request Timeout` on a
    backfill page means the node is slow, the SDK retries the page) and from the checkpoint kept
@@ -150,7 +153,7 @@ next batch spans the whole gap.
 | File | Content | Lose it and |
 | --- | --- | --- |
 | `data/key.hex` | accredited key (the sequencer; an indexer writes none, it signs nothing) | the channel is lost; start a new one with a new `CHANNEL_NAME` |
-| `data/tree/` | sled store: the tree of the finalized LEZ blocks, the reader's state, the Zone channel state (final tier, view, anchor), both Zone SDK checkpoints | the sequencer starts fresh: backfill from slot 0, tree rebuilt from LEZ, and on a channel that already has batches the next batch chains on the root and is refused (below) |
+| `data/tree/` | sled store: the tree of the finalized LEZ blocks, the adopted LEZ blocks over it, the reader's state, the Zone channel state (final tier, view, anchor), both Zone SDK checkpoints | the sequencer starts fresh: backfill from slot 0, tree rebuilt from LEZ, and on a channel that already has batches the next batch chains on the root and is refused (below) |
 
 Rule: never delete the tree store on a channel that has batches. The Zone SDK learns the
 channel tip from finalized history only (8 to 10 hours behind on the testnet), so without
@@ -479,9 +482,20 @@ batch stays `in_flight` (block production and mempool propagation).
   means a batch already on Bedrock states a root the new branch contradicts (LEZ produced an
   orphaned block again with other contents): an indexer parks on it and every later one, only
   a new channel mends that.
-- `adopted LEZ block N does not chain on the head` or `LEZ block N finalized with hash H.., the
-  view held G..`: the SDK's view and this node's disagree; the head is rebuilt from the
-  finalized tree and refilled by the SDK, nothing to do.
+- `LEZ blocks A..B read from the LEZ Sequencer under adopted block N`: the SDK skipped blocks
+  (a `408 Request Timeout` on a large fetch after a long stop, or entries it holds but does
+  not echo); they are filled from the LEZ Sequencer, pinned by the hash chain to block N.
+  `adopted LEZ block N does not chain on the head` after it means the LEZ Sequencer's blocks did
+  not lead to N: nothing applied, the next event tries again.
+- `Pending tx ... expired unmined; orphaned` in a burst from the Zone SDK, then `the SDK reports
+  a conflict on the channel, but the node's channel tip is still our newest entry`: the SDK
+  could not see its restored entries mined (the node answered slowly) and declared them
+  orphaned; the node's channel tip says otherwise, so nothing is published again. On the LEZ
+  channel the same burst ends in `LEZ channel reorg on Bedrock ...` and the head is rebuilt
+  from the finalized tree over what the SDK still holds, the gaps filled from the LEZ
+  Sequencer.
+- `LEZ block N finalized with hash H.., the view held G..`: the SDK's view and this node's
+  disagree; the head is rebuilt from the finalized tree and refilled, nothing to do.
 - The first batch of a channel carries a root but `no changes` in the log (empty
   `changes` in `/roots`): fixed (the pending changes are persisted with the tree; before, a
   restart between reading LEZ and publishing lost them). A channel whose first batch is

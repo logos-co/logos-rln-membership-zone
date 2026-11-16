@@ -13,9 +13,9 @@ use serde_json::{Value, json};
 
 use crate::{
     batch::{Batch, Change, Kind},
-    lez::Block,
+    lez::{Block, StoredBlock},
     lez_chain::{Adopted, Finalized, LezChain},
-    reader::{EMPTY_ROOT, Reader},
+    reader::{BlockIngestError, EMPTY_ROOT, Reader},
     zone_chain::{
         AcceptOutcome, BatchIngestError, ChannelEntry, FinalEntry, Judge, PublishRecord,
         StallReason, Tip, ZoneChain,
@@ -248,7 +248,19 @@ impl Registry {
         let first_lez_block_id = get("first_lez_block_id")
             .and_then(|v| v.as_u64())
             .unwrap_or(first_lez_block_id);
-        let lez = LezChain::new(final_reader)?;
+        let mut lez = LezChain::new(final_reader)?;
+        // The adopted LEZ blocks of the last run: the SDK does not echo the entries it already
+        // holds, so the view comes back from the store, its changes pending again below.
+        let mut restored_view = vec![];
+        if !rebuild && let Some(stored) = get("lez_view") {
+            let stored: Vec<StoredBlock> =
+                serde_json::from_value(stored).context("adopted LEZ blocks in the tree store")?;
+            let blocks = stored
+                .iter()
+                .map(Block::from_stored)
+                .collect::<Result<Vec<_>>>()?;
+            restored_view = lez.restore_view(&blocks)?;
+        }
         let judge = indexer.then_some(&lez as &dyn Judge);
         let zone = ZoneChain::restore(first_lez_block_id, final_entries, stall, &view, judge)?;
         let own_pending: Vec<String> = get("own_pending")
@@ -290,7 +302,7 @@ impl Registry {
             }
             _ => vec![],
         };
-        Ok(Self {
+        let mut registry = Self {
             lez,
             zone,
             first_lez_block_id,
@@ -301,7 +313,11 @@ impl Registry {
             checkpoint,
             lez_checkpoint,
             indexer,
-        })
+        };
+        for (block_id, changes) in restored_view {
+            registry.add_pending(block_id, changes);
+        }
+        Ok(registry)
     }
 
     /// Write everything into the tree store.
@@ -317,6 +333,7 @@ impl Registry {
         let extra = json!({
             "first_lez_block_id": self.first_lez_block_id,
             "view": hex::encode(self.zone.encode_view()),
+            "lez_view": self.lez.view().iter().map(Block::to_stored).collect::<Vec<_>>(),
             "final": self.zone.final_entries(),
             "stall": self.zone.stall(),
             "anchor": self.anchor,
@@ -375,14 +392,21 @@ impl Registry {
     }
 
     /// A LEZ block adopted on Bedrock (the SDK's `Extension` on the LEZ channel): onto the
-    /// head; its changes after the head tip become pending. `Err` when it does not chain.
-    pub fn apply_adopted(&mut self, block: &Block) -> Result<()> {
+    /// head; its changes after the head tip become pending. `Ok(Some(expected))` when blocks
+    /// are missing before it (`expected..block_id`), to be filled first; `Err` when it does
+    /// not chain for another reason.
+    pub fn apply_lez_adopted(&mut self, block: &Block) -> Result<Option<u64>> {
         match self.lez.apply_adopted(block)? {
             Adopted::Applied(changes) => {
                 self.add_pending(block.block_id(), changes);
-                Ok(())
+                Ok(None)
             }
-            Adopted::AlreadyApplied => Ok(()),
+            Adopted::AlreadyApplied => Ok(None),
+            Adopted::DoesNotChain(BlockIngestError::UnexpectedBlockId { expected, got })
+                if got > expected =>
+            {
+                Ok(Some(expected))
+            }
             Adopted::DoesNotChain(e) => Err(anyhow::anyhow!(
                 "adopted LEZ block {} does not chain on the head: {e}",
                 block.block_id()
@@ -390,19 +414,14 @@ impl Registry {
         }
     }
 
-    /// The adopted LEZ lineage after a Bedrock reorg (the SDK's `Conflict`): the head is
-    /// rebuilt from the finalized tree, the pending changes of the adopted blocks with it.
-    /// Returns how many blocks the new head holds over the final tier.
-    pub fn apply_lez_conflict(&mut self, canonical: &[Block]) -> Result<usize> {
+    /// A Bedrock reorg on the LEZ channel (the SDK's `Conflict`): the head is the finalized
+    /// tree again, the pending changes of the adopted blocks go with it; the caller adopts the
+    /// canonical lineage again.
+    pub fn apply_lez_conflict(&mut self) -> Result<()> {
         let final_block_id = self.lez.final_reader().lez_block_id;
         self.pending_changes
             .retain(|(block, _)| *block <= final_block_id);
-        let applied = self.lez.apply_conflict(canonical)?;
-        let count = applied.len();
-        for (block_id, changes) in applied {
-            self.add_pending(block_id, changes);
-        }
-        Ok(count)
+        self.lez.reset_to_final()
     }
 
     /// A LEZ block Bedrock finalized (the SDK's `finalized` on the LEZ channel, or the RPC
@@ -483,7 +502,7 @@ impl Registry {
     }
 
     /// Entries that entered the view (`ChannelUpdate::Extension`).
-    pub fn apply_extension(&mut self, adopted: Vec<ChannelEntry>) {
+    pub fn apply_zone_extension(&mut self, adopted: Vec<ChannelEntry>) {
         let judge = self.indexer.then_some(&self.lez as &dyn Judge);
         self.zone.apply_extension(adopted, judge);
         self.trim_pending();
@@ -491,7 +510,7 @@ impl Registry {
 
     /// The whole view at the new tip (`ChannelUpdate::Conflict`); returns the entries of ours
     /// that left it, to publish again.
-    pub fn apply_conflict(&mut self, canonical: Vec<ChannelEntry>) -> Vec<ChannelEntry> {
+    pub fn apply_zone_conflict(&mut self, canonical: Vec<ChannelEntry>) -> Vec<ChannelEntry> {
         let judge = self.indexer.then_some(&self.lez as &dyn Judge);
         let dropped = self.zone.apply_conflict(canonical, judge);
         self.orphaned += dropped.len() as u64;
@@ -504,7 +523,11 @@ impl Registry {
     }
 
     /// A finalized inscription of the channel (the SDK stream or the finality scan).
-    pub fn apply_finalized(&mut self, entry: ChannelEntry, l1_slot: u64) -> Option<AcceptOutcome> {
+    pub fn apply_zone_finalized(
+        &mut self,
+        entry: ChannelEntry,
+        l1_slot: u64,
+    ) -> Option<AcceptOutcome> {
         let msg: [u8; 32] = entry.msg.into();
         let judge = self.indexer.then_some(&self.lez as &dyn Judge);
         let outcome = self.zone.apply_finalized(entry, l1_slot, judge);
@@ -651,9 +674,9 @@ mod test {
     fn test_sequencer_builds_publishes_and_sees_its_batches_land() {
         let mut registry = Registry::open_temporary(1, false).unwrap();
         registry
-            .apply_adopted(&block(1, vec![registered(1, 0)]))
+            .apply_lez_adopted(&block(1, vec![registered(1, 0)]))
             .unwrap();
-        registry.apply_adopted(&block(2, vec![])).unwrap();
+        registry.apply_lez_adopted(&block(2, vec![])).unwrap();
         assert_eq!(registry.pending_changes.len(), 1);
         let batch = registry.next_batch().unwrap();
         assert_eq!((batch.from_lez_block_id, batch.to_lez_block_id), (1, 2));
@@ -679,7 +702,7 @@ mod test {
             batch: Some(batch.clone()),
         };
         assert!(matches!(
-            registry.apply_finalized(entry, 500),
+            registry.apply_zone_finalized(entry, 500),
             Some(AcceptOutcome::Applied(_))
         ));
         assert_eq!(registry.entries()[0].bedrock_status, "finalized");
@@ -689,7 +712,7 @@ mod test {
         assert_eq!(registry.roots(5).len(), 1);
         assert_eq!(registry.newest(true).unwrap().msg_id, hex::encode([1; 32]));
         // A heartbeat carries the root on: same run.
-        registry.apply_adopted(&block(3, vec![])).unwrap();
+        registry.apply_lez_adopted(&block(3, vec![])).unwrap();
         let heartbeat = registry.next_batch().unwrap();
         assert!(heartbeat.changes.is_empty());
         registry.record_publish(msg(2), msg(1), &heartbeat);
@@ -707,7 +730,8 @@ mod test {
         let batch;
         {
             let mut registry = Registry::open(&dir, [0; 32], 1, false, false).unwrap();
-            // Finalized blocks persist with the store; adopted ones come back from the SDK.
+            // Finalized blocks persist with the store; adopted ones persist as the view and
+            // are folded again on the next start (the SDK does not echo them).
             assert_eq!(
                 registry
                     .apply_lez_finalized(&block(1, vec![registered(1, 0)]))
@@ -723,6 +747,19 @@ mod test {
                 None
             );
             assert_eq!(registry.pending_changes.len(), 1);
+            assert_eq!(
+                registry
+                    .apply_lez_adopted(&block(3, vec![registered(3, 2)]))
+                    .unwrap(),
+                None
+            );
+            // Adopted block 5 with 4 missing: the caller fills the gap first.
+            assert_eq!(
+                registry.apply_lez_adopted(&block(5, vec![])).unwrap(),
+                Some(4)
+            );
+            assert_eq!(registry.head().lez_block_id, 3);
+            assert_eq!(registry.pending_changes.len(), 2);
             registry.set_checkpoint(json!({"lib": 7}));
             registry.set_lez_checkpoint(json!({"lib": 8}));
             registry.save().unwrap();
@@ -733,16 +770,27 @@ mod test {
             assert_eq!(registry.zone.view().len(), 1);
             assert_eq!(registry.in_flight(), Some([1; 32]));
             assert_eq!(registry.covered_to(), 1);
-            assert_eq!(registry.pending_changes.len(), 1);
-            assert_eq!(registry.head().lez_block_id, 2);
+            // The finalized tree and the adopted block 3 over it, with the changes of both.
             assert_eq!(registry.lez.final_reader().lez_block_id, 2);
+            assert_eq!(registry.head().lez_block_id, 3);
+            assert_eq!(registry.lez.view().len(), 1);
+            assert_eq!(registry.pending_changes.len(), 2);
             assert_eq!(registry.checkpoint(), Some(&json!({"lib": 7})));
             assert_eq!(registry.lez_checkpoint(), Some(&json!({"lib": 8})));
-            // The next batch continues from the view's tip.
+            // The next batch continues from the view's tip up to the head.
             let next = registry.next_batch().unwrap();
-            assert_eq!((next.from_lez_block_id, next.to_lez_block_id), (2, 2));
+            assert_eq!((next.from_lez_block_id, next.to_lez_block_id), (2, 3));
+            // A Bedrock reorg on the LEZ channel: back to the finalized tree, the adopted
+            // block's changes leave the pending ones until it is adopted again.
+            registry.apply_lez_conflict().unwrap();
+            assert_eq!(registry.head().lez_block_id, 2);
+            assert_eq!(registry.pending_changes.len(), 1);
+            registry
+                .apply_lez_adopted(&block(3, vec![registered(3, 2)]))
+                .unwrap();
+            assert_eq!(registry.pending_changes.len(), 2);
             // Finalize the first: reopen keeps the final tier.
-            registry.apply_finalized(
+            registry.apply_zone_finalized(
                 ChannelEntry {
                     msg: msg(1),
                     parent: MsgId::root(),
@@ -783,7 +831,7 @@ mod test {
             root_after: root_1.to_vec(),
         };
         // Adopted on the channel: applied, the pending changes are the head's lead no more.
-        registry.apply_extension(vec![ChannelEntry {
+        registry.apply_zone_extension(vec![ChannelEntry {
             msg: msg(1),
             parent: MsgId::root(),
             batch: Some(honest.clone()),
@@ -799,16 +847,16 @@ mod test {
             changes: vec![],
             root_after: root_1.to_vec(),
         };
-        registry.apply_extension(vec![ChannelEntry {
+        registry.apply_zone_extension(vec![ChannelEntry {
             msg: msg(2),
             parent: msg(1),
             batch: Some(early),
         }]);
         assert_eq!(registry.entries()[1].outcome, "retryable_failure");
         // Adopted, not finalized: the judge waits.
-        registry.apply_adopted(&block(2, vec![])).unwrap();
+        registry.apply_lez_adopted(&block(2, vec![])).unwrap();
         registry
-            .apply_adopted(&block(3, vec![registered(3, 2)]))
+            .apply_lez_adopted(&block(3, vec![registered(3, 2)]))
             .unwrap();
         assert_eq!(registry.retry_folds(), 0);
         registry.apply_lez_finalized(&block(2, vec![])).unwrap();
@@ -837,7 +885,7 @@ mod test {
             changes: changes_3,
             root_after: root_3.to_vec(),
         };
-        let dropped = registry.apply_conflict(vec![
+        let dropped = registry.apply_zone_conflict(vec![
             ChannelEntry {
                 msg: msg(1),
                 parent: MsgId::root(),

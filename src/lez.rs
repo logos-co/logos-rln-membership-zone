@@ -12,7 +12,7 @@ use common::{block::Block as LezBlock, transaction::LeeTransaction};
 use lee::AccountId;
 use rln::prelude::{Hasher, PoseidonHash};
 pub use rln_layouts::events::{Erased, Extended, Registered, RlnEvent, Slashed};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::reader::{fr_from_bytes_le, fr_to_bytes_le};
@@ -44,7 +44,66 @@ pub struct Block {
     pub private_transaction_count: u32,
 }
 
+/// A block as the tree store keeps the adopted ones: the header fields and the events in the
+/// program's own wire form (`selector`, `data`), hex.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredBlock {
+    block_id: u64,
+    prev_block_hash: String,
+    hash: String,
+    timestamp: u64,
+    events: Vec<(String, String)>,
+    private_transaction_count: u32,
+}
+
 impl Block {
+    pub fn to_stored(&self) -> StoredBlock {
+        StoredBlock {
+            block_id: self.block_id(),
+            prev_block_hash: hex::encode(self.prev_block_hash()),
+            hash: hex::encode(self.hash()),
+            timestamp: self.timestamp_ms(),
+            events: self
+                .events
+                .iter()
+                .map(|event| {
+                    let (selector, data) = event.encode();
+                    (hex::encode(selector), hex::encode(data))
+                })
+                .collect(),
+            private_transaction_count: self.private_transaction_count,
+        }
+    }
+
+    pub fn from_stored(stored: &StoredBlock) -> Result<Self> {
+        let events = stored
+            .events
+            .iter()
+            .map(|(selector, data)| {
+                let selector: [u8; 8] = hex::decode(selector)
+                    .ok()
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(|| anyhow!("stored event selector"))?;
+                let data = hex::decode(data).context("stored event data")?;
+                RlnEvent::decode(selector, &data)
+                    .ok_or_else(|| anyhow!("stored event with an unknown selector"))?
+                    .context("stored event")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            header: BlockHeader {
+                block_id: stored.block_id,
+                prev_block_hash: common::HashType(crate::reader::parse_32(
+                    &stored.prev_block_hash,
+                )?),
+                hash: common::HashType(crate::reader::parse_32(&stored.hash)?),
+                timestamp: stored.timestamp,
+            },
+            events,
+            private_transaction_count: stored.private_transaction_count,
+        })
+    }
+
     pub fn block_id(&self) -> u64 {
         self.header.block_id
     }

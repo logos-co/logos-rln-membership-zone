@@ -224,6 +224,12 @@ fn save_checkpoint(registry: &Shared, checkpoint: &SequencerCheckpoint) -> Resul
     registry.save()
 }
 
+/// The Zone channel and the node to ask about it.
+struct ZoneChannel {
+    node_url: Url,
+    id: ChannelId,
+}
+
 /// What the node holds for a channel (`GET /channel/:id`), the fields this check reads.
 #[derive(serde::Deserialize)]
 struct ChannelOnChain {
@@ -450,9 +456,63 @@ async fn apply_lez_finalized(
     Ok(())
 }
 
+/// A LEZ block adopted on Bedrock, onto the head. Blocks the SDK skipped before it (a stream
+/// it dropped and reopened, entries it does not echo) are read from the LEZ Sequencer first,
+/// trusted only through the hash chain: they must chain on the head and the adopted block must
+/// chain on the last of them, or nothing is applied.
+async fn adopt_lez_block(source: &LezSequencer, registry: &Shared, block: &Block) -> Result<()> {
+    let gap = registry
+        .write()
+        .expect("registry lock")
+        .apply_lez_adopted(block)?;
+    let Some(expected) = gap else {
+        return Ok(());
+    };
+    let to = block.block_id() - 1;
+    println!(
+        "LEZ blocks {expected}..{to} read from the LEZ Sequencer under adopted block {}",
+        block.block_id()
+    );
+    let filler = source.blocks(expected, to).await?;
+    let mut prev = registry
+        .read()
+        .expect("registry lock")
+        .head()
+        .last_block_hash();
+    for (id, candidate) in (expected..=to).zip(&filler) {
+        if candidate.block_id() != id || prev.is_some_and(|p| candidate.prev_block_hash() != p) {
+            bail!(
+                "LEZ block {} from the LEZ Sequencer does not chain under adopted block {}",
+                candidate.block_id(),
+                block.block_id()
+            );
+        }
+        prev = Some(candidate.hash());
+    }
+    if prev != Some(block.prev_block_hash()) {
+        bail!(
+            "the LEZ Sequencer's blocks {expected}..{to} do not lead to adopted block {}",
+            block.block_id()
+        );
+    }
+    let mut registry = registry.write().expect("registry lock");
+    for candidate in &filler {
+        if registry.apply_lez_adopted(candidate)?.is_some() {
+            bail!("LEZ block {} still missing before", candidate.block_id());
+        }
+    }
+    if registry.apply_lez_adopted(block)?.is_some() {
+        bail!(
+            "adopted LEZ block {} still does not follow the head",
+            block.block_id()
+        );
+    }
+    Ok(())
+}
+
 /// One `BlocksProcessed` event of the Zone SDK on the LEZ channel: adopted LEZ blocks onto the
-/// head, a Bedrock reorg refolds the head, finalized LEZ blocks onto the finalized tree. The
-/// events of a block are logged when the head first sees it.
+/// head, a Bedrock reorg refolds the head over the canonical lineage, finalized LEZ blocks onto
+/// the finalized tree. The events of a block are logged when the head first sees it.
 async fn on_lez_blocks_processed(
     source: &LezSequencer,
     registry: &Shared,
@@ -486,11 +546,7 @@ async fn on_lez_blocks_processed(
                         names.join(", ")
                     );
                 }
-                if let Err(e) = registry
-                    .write()
-                    .expect("registry lock")
-                    .apply_adopted(&block)
-                {
+                if let Err(e) = adopt_lez_block(source, registry, &block).await {
                     println!("{e}");
                 }
             }
@@ -503,13 +559,20 @@ async fn on_lez_blocks_processed(
                 .filter_map(|tx| tx.inscription())
                 .filter_map(decode)
                 .collect();
-            let held = registry
+            registry
                 .write()
                 .expect("registry lock")
-                .apply_lez_conflict(&canonical)?;
+                .apply_lez_conflict()?;
+            for block in &canonical {
+                if let Err(e) = adopt_lez_block(source, registry, block).await {
+                    println!("{e}");
+                    break;
+                }
+            }
             println!(
-                "LEZ channel reorg on Bedrock: the head is the finalized tree folded over {held} \
-                 adopted block(s) again"
+                "LEZ channel reorg on Bedrock: the head is the finalized tree folded over the \
+                 canonical lineage again, at LEZ block {}",
+                registry.read().expect("registry lock").head().lez_block_id
             );
         }
     }
@@ -590,7 +653,7 @@ async fn reconcile_finality(
             for tx in &block.transactions {
                 for info in channel_inscriptions(tx, channel_id) {
                     let entry = entry_of(&info);
-                    let outcome = registry.apply_finalized(entry.clone(), l1_slot);
+                    let outcome = registry.apply_zone_finalized(entry.clone(), l1_slot);
                     if !matches!(outcome, Some(AcceptOutcome::AlreadyApplied)) {
                         report_finalized(&entry, l1_slot, outcome.as_ref());
                         applied += 1;
@@ -607,10 +670,13 @@ async fn reconcile_finality(
 /// One `BlocksProcessed` event of the Zone SDK: the channel tip holds our batches up to `tip`,
 /// the view moved (`channel_update`: an extension, or a conflict whose dropped batches of ours
 /// are published again) and Bedrock finality reached the `finalized` entries, which go into
-/// the final tier.
+/// the final tier. A conflict the node does not confirm (its channel tip is still our newest
+/// entry) is ignored: the SDK also reports a pending entry it could not see mined as orphaned,
+/// and publishing it again would fork our own channel.
 async fn on_blocks_processed(
     sdk: &mut ZoneSequencer<NodeHttpClient>,
     registry: &Shared,
+    channel: &ZoneChannel,
     tip: [u8; 32],
     checkpoint: &SequencerCheckpoint,
     channel_update: &ChannelUpdate,
@@ -646,9 +712,26 @@ async fn on_blocks_processed(
             registry
                 .write()
                 .expect("registry lock")
-                .apply_extension(entries);
+                .apply_zone_extension(entries);
         }
         ChannelUpdate::Conflict { .. } => {
+            let newest_held: Option<String> = registry
+                .read()
+                .expect("registry lock")
+                .zone
+                .view()
+                .last()
+                .map(|entry| hex::encode(<[u8; 32]>::from(entry.msg)));
+            if let Some(on_chain) = channel_on_chain(&channel.node_url, channel.id).await?
+                && newest_held.is_some_and(|m| m.eq_ignore_ascii_case(&on_chain.tip_message))
+            {
+                println!(
+                    "the SDK reports a conflict on the channel, but the node's channel tip is \
+                     still our newest entry {}..: nothing was dropped, ignored",
+                    &on_chain.tip_message[..8]
+                );
+                return registry.write().expect("registry lock").save();
+            }
             let canonical: Vec<ChannelEntry> = channel_update
                 .canonical_chain()
                 .into_iter()
@@ -659,7 +742,7 @@ async fn on_blocks_processed(
             let dropped = registry
                 .write()
                 .expect("registry lock")
-                .apply_conflict(canonical);
+                .apply_zone_conflict(canonical);
             // A reorg dropped our batches: publish the same payloads again, in order (new
             // messages, since their parent changed).
             for entry in dropped {
@@ -692,7 +775,7 @@ async fn on_blocks_processed(
             let outcome = registry
                 .write()
                 .expect("registry lock")
-                .apply_finalized(entry.clone(), l1_slot);
+                .apply_zone_finalized(entry.clone(), l1_slot);
             report_finalized(&entry, l1_slot, outcome.as_ref());
         }
     }
@@ -1118,6 +1201,10 @@ async fn main() -> Result<()> {
     }
     println!("waiting for the Zone SDK to be ready...");
 
+    let zone_channel = ZoneChannel {
+        node_url: node_url.clone(),
+        id: channel_id,
+    };
     let mut ready = false;
     let mut lez_ready = false;
     // Batches LEZ has contradicted, as last reported (warned once per change).
@@ -1145,6 +1232,7 @@ async fn main() -> Result<()> {
                     on_blocks_processed(
                         &mut sdk,
                         &registry,
+                        &zone_channel,
                         tip,
                         &checkpoint,
                         &channel_update,
