@@ -1,6 +1,6 @@
 //! One node's state: the LEZ chain as the Zone SDK reports it (`LezChain`: the finalized tree
 //! on disk, the adopted blocks folded over it), the Zone channel as the SDK reports it
-//! (`ChainState`), the changes no batch carries yet, and the two SDK checkpoints. All of it
+//! (`ZoneChain`), the changes no batch carries yet, and the two SDK checkpoints. All of it
 //! lives in the tree store's metadata, so a restart opens the store and continues.
 
 use std::path::Path;
@@ -13,13 +13,13 @@ use serde_json::{Value, json};
 
 use crate::{
     batch::{Batch, Change, Kind},
-    chain::{
-        AcceptOutcome, BatchIngestError, ChainState, ChannelEntry, FinalEntry, Judge,
-        PublishRecord, StallReason, Tip,
-    },
     lez::Block,
     lez_chain::{Adopted, Finalized, LezChain},
     reader::{EMPTY_ROOT, Reader},
+    zone_chain::{
+        AcceptOutcome, BatchIngestError, ChannelEntry, FinalEntry, Judge, PublishRecord,
+        StallReason, Tip, ZoneChain,
+    },
 };
 
 /// The indexer judges a batch against the tree of the finalized LEZ blocks only.
@@ -164,7 +164,7 @@ pub struct Registry {
     /// The LEZ chain: the finalized tree on disk, the adopted blocks folded over it.
     pub lez: LezChain,
     /// The channel: final tier and view.
-    pub chain: ChainState,
+    pub zone: ZoneChain,
     pub first_lez_block_id: u64,
     /// Changes of the LEZ blocks after the head tip, in derivation-rule order, each with the
     /// block that made it: the next batch's content for the sequencer, the head's lead over
@@ -250,7 +250,7 @@ impl Registry {
             .unwrap_or(first_lez_block_id);
         let lez = LezChain::new(final_reader)?;
         let judge = indexer.then_some(&lez as &dyn Judge);
-        let chain = ChainState::restore(first_lez_block_id, final_entries, stall, &view, judge)?;
+        let zone = ZoneChain::restore(first_lez_block_id, final_entries, stall, &view, judge)?;
         let own_pending: Vec<String> = get("own_pending")
             .map(serde_json::from_value)
             .transpose()
@@ -292,7 +292,7 @@ impl Registry {
         };
         Ok(Self {
             lez,
-            chain,
+            zone,
             first_lez_block_id,
             pending_changes,
             own_pending,
@@ -316,9 +316,9 @@ impl Registry {
             .collect();
         let extra = json!({
             "first_lez_block_id": self.first_lez_block_id,
-            "view": hex::encode(self.chain.encode_view()),
-            "final": self.chain.final_entries(),
-            "stall": self.chain.stall(),
+            "view": hex::encode(self.zone.encode_view()),
+            "final": self.zone.final_entries(),
+            "stall": self.zone.stall(),
             "anchor": self.anchor,
             "own_pending": self.own_pending.iter().map(hex::encode).collect::<Vec<_>>(),
             "orphaned": self.orphaned,
@@ -360,7 +360,7 @@ impl Registry {
 
     /// The LEZ block the head tip covers to: the block before the first while no batch does.
     pub fn covered_to(&self) -> u64 {
-        self.chain
+        self.zone
             .head_tip()
             .map_or(self.first_lez_block_id.saturating_sub(1), |tip| {
                 tip.to_lez_block_id
@@ -463,7 +463,7 @@ impl Registry {
     /// a batch this node would park never reaches Bedrock.
     pub fn would_apply(&self, batch: &Batch) -> Result<(), BatchIngestError> {
         let judge = self.indexer.then_some(&self.lez as &dyn Judge);
-        self.chain.would_apply(batch, judge)
+        self.zone.would_apply(batch, judge)
     }
 
     /// A batch of ours handed to the SDK: into the view on the pin it was built on.
@@ -474,7 +474,7 @@ impl Registry {
             batch: Some(batch.clone()),
         };
         let judge = self.indexer.then_some(&self.lez as &dyn Judge);
-        let record = self.chain.record_publish(entry, judge);
+        let record = self.zone.record_publish(entry, judge);
         if record != PublishRecord::AlreadyInView {
             self.own_pending.push(msg.into());
         }
@@ -485,7 +485,7 @@ impl Registry {
     /// Entries that entered the view (`ChannelUpdate::Extension`).
     pub fn apply_extension(&mut self, adopted: Vec<ChannelEntry>) {
         let judge = self.indexer.then_some(&self.lez as &dyn Judge);
-        self.chain.apply_extension(adopted, judge);
+        self.zone.apply_extension(adopted, judge);
         self.trim_pending();
     }
 
@@ -493,7 +493,7 @@ impl Registry {
     /// that left it, to publish again.
     pub fn apply_conflict(&mut self, canonical: Vec<ChannelEntry>) -> Vec<ChannelEntry> {
         let judge = self.indexer.then_some(&self.lez as &dyn Judge);
-        let dropped = self.chain.apply_conflict(canonical, judge);
+        let dropped = self.zone.apply_conflict(canonical, judge);
         self.orphaned += dropped.len() as u64;
         for entry in &dropped {
             let msg: [u8; 32] = entry.msg.into();
@@ -507,9 +507,9 @@ impl Registry {
     pub fn apply_finalized(&mut self, entry: ChannelEntry, l1_slot: u64) -> Option<AcceptOutcome> {
         let msg: [u8; 32] = entry.msg.into();
         let judge = self.indexer.then_some(&self.lez as &dyn Judge);
-        let outcome = self.chain.apply_finalized(entry, l1_slot, judge);
+        let outcome = self.zone.apply_finalized(entry, l1_slot, judge);
         self.own_pending.retain(|m| *m != msg);
-        let tip = self.chain.final_tip();
+        let tip = self.zone.final_tip();
         self.anchor = Some(ZoneAnchorRecord {
             slot: l1_slot.max(self.anchor.map_or(0, |a| a.slot)),
             to_lez_block_id: tip.map_or(self.first_lez_block_id.saturating_sub(1), |t| {
@@ -542,7 +542,7 @@ impl Registry {
 
     /// The indexer folds again what the judge could not decide: LEZ read further.
     pub fn retry_folds(&mut self) -> usize {
-        let decided = self.chain.retry_folds(Some(&self.lez));
+        let decided = self.zone.retry_folds(Some(&self.lez));
         self.trim_pending();
         decided
     }
@@ -555,7 +555,7 @@ impl Registry {
     /// Every entry of the channel, final tier first then the view, as the API shows them.
     pub fn entries(&self) -> Vec<EntryView> {
         let mut out: Vec<EntryView> = self
-            .chain
+            .zone
             .final_entries()
             .iter()
             .map(|f| {
@@ -569,7 +569,7 @@ impl Registry {
                 )
             })
             .collect();
-        for (entry, outcome) in self.chain.view_outcomes() {
+        for (entry, outcome) in self.zone.view_outcomes() {
             let msg: [u8; 32] = entry.msg.into();
             out.push(EntryView::new(
                 msg,
@@ -730,7 +730,7 @@ mod test {
         }
         {
             let mut registry = Registry::open(&dir, [0; 32], 1, false, false).unwrap();
-            assert_eq!(registry.chain.view().len(), 1);
+            assert_eq!(registry.zone.view().len(), 1);
             assert_eq!(registry.in_flight(), Some([1; 32]));
             assert_eq!(registry.covered_to(), 1);
             assert_eq!(registry.pending_changes.len(), 1);
@@ -755,10 +755,10 @@ mod test {
         }
         {
             let registry = Registry::open(&dir, [0; 32], 1, false, false).unwrap();
-            assert_eq!(registry.chain.final_entries().len(), 1);
-            assert_eq!(registry.chain.final_tip().unwrap().to_lez_block_id, 1);
+            assert_eq!(registry.zone.final_entries().len(), 1);
+            assert_eq!(registry.zone.final_tip().unwrap().to_lez_block_id, 1);
             assert_eq!(registry.anchor().unwrap().slot, 100);
-            assert!(registry.chain.view().is_empty());
+            assert!(registry.zone.view().is_empty());
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -853,6 +853,6 @@ mod test {
         assert_eq!(registry.orphaned_count(), 1);
         assert_eq!(registry.entries()[1].outcome, "applied");
         assert_eq!(registry.covered_to(), 3);
-        assert_eq!(registry.chain.head_root(), root_3);
+        assert_eq!(registry.zone.head_root(), root_3);
     }
 }

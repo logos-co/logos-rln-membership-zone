@@ -283,7 +283,7 @@ struct StoredEntry {
 
 /// The final tier (irreversible, from `finalized`) and the head, which is always the final
 /// state folded over `view`.
-pub struct ChainState {
+pub struct ZoneChain {
     /// The LEZ block the first batch starts at (the program's deployment block).
     first_lez_block_id: u64,
     final_state: ReplayTree,
@@ -300,7 +300,7 @@ pub struct ChainState {
     folds: Vec<Fold>,
 }
 
-impl ChainState {
+impl ZoneChain {
     /// Fresh state: the empty tree, no entry; the first batch must start at `first_lez_block_id`.
     pub fn new(first_lez_block_id: u64) -> Self {
         Self {
@@ -490,16 +490,16 @@ impl ChainState {
             .filter(|held| !seen.contains(&held.msg))
             .cloned()
             .collect();
-        // The entries both views hold keep their folds: a `MsgId` commits to its payload,
-        // so the same id carries the same batch.
-        let fork = self
+        // The entries both views hold (the SDK's `common_prefix`) keep their folds: a `MsgId`
+        // commits to its payload, so the same id carries the same batch.
+        let common_prefix = self
             .view
             .iter()
             .zip(&canonical)
             .take_while(|(held, entry)| held.msg == entry.msg)
             .count();
         self.view = canonical;
-        self.fold_from(fork, judge);
+        self.fold_from(common_prefix, judge);
         dropped
     }
 
@@ -844,7 +844,7 @@ mod test {
 
     #[test]
     fn test_view_folds_record_publish_and_finality_move_the_tiers() {
-        let mut chain = ChainState::new(1);
+        let mut chain = ZoneChain::new(1);
         let empty = ReplayTree::empty();
         let b1 = batch(1, 3, vec![Change::insert(0, leaf(1))], &empty);
         let one = {
@@ -878,7 +878,7 @@ mod test {
 
         // Persist and restore the view.
         let bytes = chain.encode_view();
-        let mut restored = ChainState::new(1);
+        let mut restored = ZoneChain::new(1);
         restored.restore_view(&bytes, None).unwrap();
         assert_eq!(restored.pin(), msg(2));
         assert_eq!(restored.head_root(), chain.head_root());
@@ -899,15 +899,14 @@ mod test {
         );
 
         // Restore from the final tier alone.
-        let again =
-            ChainState::restore(1, chain.final_entries().to_vec(), None, &[], None).unwrap();
+        let again = ZoneChain::restore(1, chain.final_entries().to_vec(), None, &[], None).unwrap();
         assert_eq!(again.final_tip(), chain.final_tip());
         assert_eq!(again.head_root(), chain.head_root());
     }
 
     #[test]
     fn test_conflict_rebuilds_the_view_and_returns_what_left_it() {
-        let mut chain = ChainState::new(1);
+        let mut chain = ZoneChain::new(1);
         let empty = ReplayTree::empty();
         let b1 = batch(1, 1, vec![Change::insert(0, leaf(1))], &empty);
         let b1_again = Batch {
@@ -954,7 +953,7 @@ mod test {
             roots: vec![(2, root_1), (4, root_2)],
             read_to: 0,
         };
-        let mut chain = ChainState::new(1);
+        let mut chain = ZoneChain::new(1);
 
         // LEZ not read at all: both entries wait, the second behind the first (it cannot park
         // on a tip the judge has not confirmed), the head stays empty.
@@ -979,7 +978,7 @@ mod test {
         // A persisted view keeps an undecided entry's batch (it will be judged), not a parked
         // one's.
         let bytes = chain.encode_view();
-        let mut restored = ChainState::new(1);
+        let mut restored = ZoneChain::new(1);
         restored.restore_view(&bytes, Some(&oracle)).unwrap();
         assert_eq!(restored.head_root(), root_2);
 
@@ -1035,7 +1034,7 @@ mod test {
         assert!(chain.final_entries()[2].error.is_some());
 
         // A derivation mismatch: the batch replays fine but LEZ says otherwise.
-        let mut fresh = ChainState::new(1);
+        let mut fresh = ZoneChain::new(1);
         let liar = Oracle {
             roots: vec![(2, [5; 32])],
             read_to: 2,
@@ -1051,7 +1050,7 @@ mod test {
 
     #[test]
     fn test_an_undecodable_inscription_and_a_gap_are_held_not_fatal() {
-        let mut chain = ChainState::new(1);
+        let mut chain = ZoneChain::new(1);
         let empty = ReplayTree::empty();
         let b1 = batch(1, 1, vec![Change::insert(0, leaf(1))], &empty);
         // Garbage on the channel: an entry without a batch, skipped, the lineage goes on.
@@ -1078,7 +1077,7 @@ mod test {
         let last = chain.view_outcomes().last().unwrap().1.clone();
         assert!(matches!(last, Err(BatchIngestError::Deserialize(_))));
         // Finalizing the garbage entry alone: no batch, no outcome, the final msg moves.
-        let mut chain = ChainState::new(1);
+        let mut chain = ZoneChain::new(1);
         assert_eq!(
             chain.apply_finalized(ChannelEntry::new(msg(1), MsgId::root(), &[]), 10, None),
             None
@@ -1090,7 +1089,7 @@ mod test {
     /// testnet program: 49431); one starting anywhere else parks.
     #[test]
     fn test_the_first_batch_starts_at_the_first_lez_block() {
-        let mut chain = ChainState::new(49_431);
+        let mut chain = ZoneChain::new(49_431);
         let empty = ReplayTree::empty();
         let b1 = batch(49_431, 49_500, vec![Change::insert(0, leaf(1))], &empty);
         assert_eq!(
@@ -1111,7 +1110,7 @@ mod test {
             })
         ));
         // A chain that expects block 1 parks the testnet's first batch.
-        let mut from_one = ChainState::new(1);
+        let mut from_one = ZoneChain::new(1);
         assert_eq!(
             from_one.record_publish(entry(1, 0, Some(b1)), None),
             PublishRecord::Skipped

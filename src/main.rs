@@ -1,24 +1,26 @@
 //! The RLN Membership Zone node (`docs/rfc-rln-membership-zone.md`), on the Logos testnet:
 //! one binary, two modes.
 //!
-//! Both derive the tree from the registration program's LEZ blocks (`lez.rs`, `reader.rs`) and
-//! follow the Zone channel on Bedrock through the Zone SDK, as a final tier plus a view
-//! (`chain.rs`, after LEZ's `chain_state`). The sequencer follows the blocks LEZ has closed and
-//! publishes one batch (`batch.rs`) per change or heartbeat; the indexer follows only the LEZ
-//! blocks final on Bedrock, publishes nothing and judges every batch of the channel against
-//! its own tree. Both serve the registry over HTTP (`http.rs`).
+//! Both follow two channels on Bedrock through the Zone SDK, each kept as a final tier plus a
+//! view after LEZ's `chain_state`: the LEZ channel (`lez_chain.rs`), whose inscriptions are the
+//! LEZ blocks the tree is derived from (`lez.rs`, `reader.rs`), and the Zone channel
+//! (`zone_chain.rs`), whose inscriptions are the batches (`batch.rs`). The sequencer publishes
+//! one batch per change or heartbeat over the LEZ blocks adopted on Bedrock; the indexer
+//! publishes nothing and judges every batch against the tree of the LEZ blocks finalized on
+//! Bedrock. Both serve the registry over HTTP (`http.rs`).
 //!
 //! Everything a node must keep lives in `--data-dir`: `key.hex` (the sequencer's accredited
-//! key; the channel id is `sha256(CHANNEL_NAME)`) and `tree/`, a sled store holding the tree,
-//! the reader's state, the Zone channel state and the Zone SDK checkpoint.
+//! key; the channel id is `sha256(CHANNEL_NAME)`; an indexer has none, it signs nothing) and
+//! `tree/`, a sled store holding the tree of the finalized LEZ blocks, the
+//! reader's state, the Zone channel state and both Zone SDK checkpoints.
 
 mod batch;
-mod chain;
 mod http;
 mod lez;
 mod lez_chain;
 mod reader;
 mod registry;
+mod zone_chain;
 
 use std::{
     fs,
@@ -49,10 +51,10 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     batch::Batch,
-    chain::{AcceptOutcome, ChannelEntry, PublishRecord},
     http::{AppState, Shared},
-    lez::{Block, SequencerLez},
+    lez::{Block, LezSequencer},
     registry::Registry,
+    zone_chain::{AcceptOutcome, ChannelEntry, PublishRecord},
 };
 
 /// Seconds between two finality scans (`reconcile_finality`).
@@ -178,8 +180,15 @@ fn parse_32(hex_str: &str, what: &str) -> Result<[u8; 32]> {
     <[u8; 32]>::try_from(bytes).map_err(|_| anyhow!("{what} must be 32 bytes"))
 }
 
-/// The node's key: created on first start, read back after. The sequencer's is the channel's
-/// accredited key; the indexer's only names it to the SDK.
+/// A key that signs nothing: the Zone SDK wants one per instance, a reader of a channel it is
+/// not accredited on never uses it. Fresh on every start, never written.
+fn reader_key() -> Ed25519Key {
+    let mut key_bytes = [0u8; ED25519_SECRET_KEY_SIZE];
+    thread_rng().fill_bytes(&mut key_bytes);
+    Ed25519Key::from_bytes(&key_bytes)
+}
+
+/// The sequencer's accredited key: created on first start, read back after.
 fn load_or_create_key(path: &PathBuf) -> Result<Ed25519Key> {
     let mut key_bytes = [0u8; ED25519_SECRET_KEY_SIZE];
     if path.exists() {
@@ -335,7 +344,7 @@ fn save_lez_checkpoint(registry: &Shared, checkpoint: &SequencerCheckpoint) -> R
 async fn lez_checkpoint_at_lib(
     node: &NodeHttpClient,
     lez_channel_id: ChannelId,
-    source: &SequencerLez,
+    source: &LezSequencer,
 ) -> Result<(SequencerCheckpoint, Block)> {
     let info = node
         .consensus_info()
@@ -389,7 +398,7 @@ async fn lez_checkpoint_at_lib(
 /// tree. They are trusted only through the hash chain: the caller applies the Bedrock-finalized
 /// block after them next, which chains on the last one or is refused.
 async fn fill_final_from_rpc(
-    source: &SequencerLez,
+    source: &LezSequencer,
     registry: &Shared,
     from: u64,
     to: u64,
@@ -416,7 +425,7 @@ async fn fill_final_from_rpc(
 /// A LEZ block Bedrock finalized: onto the finalized tree, the blocks it skipped filled from
 /// the LEZ Sequencer first (pinned by this block's `prev_block_hash`).
 async fn apply_lez_finalized(
-    source: &SequencerLez,
+    source: &LezSequencer,
     registry: &Shared,
     block: &Block,
 ) -> Result<()> {
@@ -445,7 +454,7 @@ async fn apply_lez_finalized(
 /// head, a Bedrock reorg refolds the head, finalized LEZ blocks onto the finalized tree. The
 /// events of a block are logged when the head first sees it.
 async fn on_lez_blocks_processed(
-    source: &SequencerLez,
+    source: &LezSequencer,
     registry: &Shared,
     checkpoint: &SequencerCheckpoint,
     channel_update: &ChannelUpdate,
@@ -524,7 +533,7 @@ fn report_finalized(entry: &ChannelEntry, l1_slot: u64, outcome: Option<&AcceptO
     });
     match outcome {
         Some(AcceptOutcome::Applied(_)) => println!(
-            "batch {range} msg {} FINALIZED at L1 slot {l1_slot}: applied, root {}..",
+            "batch {range} msg {} finalized at L1 slot {l1_slot}: applied, root {}..",
             short(&msg),
             entry
                 .batch
@@ -533,17 +542,17 @@ fn report_finalized(entry: &ChannelEntry, l1_slot: u64, outcome: Option<&AcceptO
                 .unwrap_or_default()
         ),
         Some(AcceptOutcome::Parked(e)) => println!(
-            "batch {range} msg {} FINALIZED at L1 slot {l1_slot}: PARKED, {e}; the final tier \
+            "batch {range} msg {} finalized at L1 slot {l1_slot}: parked, {e}; the final tier \
              is frozen here",
             short(&msg)
         ),
         Some(AcceptOutcome::RetryableFailure(e)) => println!(
-            "batch {range} msg {} FINALIZED at L1 slot {l1_slot}: {e}",
+            "batch {range} msg {} finalized at L1 slot {l1_slot}: {e}",
             short(&msg)
         ),
         Some(AcceptOutcome::AlreadyApplied) => {}
         None => println!(
-            "entry msg {} FINALIZED at L1 slot {l1_slot}: {range}",
+            "entry msg {} finalized at L1 slot {l1_slot}: {range}",
             short(&msg)
         ),
     }
@@ -662,7 +671,7 @@ async fn on_blocks_processed(
     if let Some(gap) = registry
         .read()
         .expect("registry lock")
-        .chain
+        .zone
         .check_for_gaps_in_lineage()
     {
         println!(
@@ -878,7 +887,7 @@ async fn main() -> Result<()> {
     // The LEZ Sequencer RPC: decodes the LEZ blocks and fills finalized history.
     let program_account_id = parse_32(&args.program_account_id, "PROGRAM_ACCOUNT_ID")?;
     let tree_id = parse_32(&args.tree_id, "TREE_ID")?;
-    let source = SequencerLez::new(args.lez_sequencer_url.clone(), program_account_id, tree_id);
+    let source = LezSequencer::new(args.lez_sequencer_url.clone(), program_account_id, tree_id);
     let lez_channel_id = ChannelId::from(parse_32(&args.lez_channel_id, "LEZ_CHANNEL_ID")?);
     let lez_source = format!(
         "LEZ channel {} on Bedrock through the Zone SDK (adopted blocks at the head, finalized \
@@ -922,9 +931,13 @@ async fn main() -> Result<()> {
     });
 
     // The Zone SDK on the node: the sequencer with its accredited key and the wallet key that
-    // pays; the indexer with a key of its own that is not accredited, so it only reads (it
-    // never funds a transaction, the funding key is a name to the SDK).
-    let signing_key = load_or_create_key(&args.data_dir.join("key.hex"))?;
+    // pays; the indexer with a throwaway key, since it only reads (it never funds a
+    // transaction either, the funding key is a name to the SDK).
+    let signing_key = if indexer {
+        reader_key()
+    } else {
+        load_or_create_key(&args.data_dir.join("key.hex"))?
+    };
     let funding_pk = match (&args.funding_pk, indexer) {
         (Some(pk), _) => parse_funding_pk(pk)?,
         (None, true) => parse_funding_pk(&"00".repeat(32))?,
@@ -982,7 +995,7 @@ async fn main() -> Result<()> {
         checkpoint,
     );
 
-    // The Zone SDK on the LEZ channel, read-only: a key of its own, nothing to fund. A fresh
+    // The Zone SDK on the LEZ channel, read-only: a throwaway key, nothing to fund. A fresh
     // store starts at the LIB, on the newest finalized LEZ inscription, with the finalized tree
     // built up to that block from the LEZ Sequencer (pinned by the block's hash).
     let lez_checkpoint: Option<SequencerCheckpoint> = registry
@@ -1039,10 +1052,9 @@ async fn main() -> Result<()> {
             checkpoint
         }
     };
-    let lez_key = load_or_create_key(&args.data_dir.join("lez-key.hex"))?;
     let mut lez_sdk = ZoneSequencer::init_with_config(
         lez_channel_id,
-        lez_key,
+        reader_key(),
         node.clone(),
         SequencerConfig::new(FundingConfig {
             funding_pk: parse_funding_pk(&"00".repeat(32))?,
@@ -1080,14 +1092,14 @@ async fn main() -> Result<()> {
         println!(
             "  channel   {} final (final msg {}), {} in view, covered to LEZ block {}, first \
              block {}{}",
-            registry.chain.final_entries().len(),
-            short(&registry.chain.final_msg().into()),
-            registry.chain.view().len(),
+            registry.zone.final_entries().len(),
+            short(&registry.zone.final_msg().into()),
+            registry.zone.view().len(),
             registry.covered_to(),
             registry.first_lez_block_id,
             if resumed { " (checkpoint resumed)" } else { "" }
         );
-        if let Some(stall) = registry.chain.stall() {
+        if let Some(stall) = registry.zone.stall() {
             println!(
                 "  WARNING   the final tier is frozen at batch msg {} (L1 slot {}): {}; {} \
                  batch(es) parked after it",

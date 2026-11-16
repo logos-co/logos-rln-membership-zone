@@ -105,7 +105,7 @@ async fn summary(State(state): State<AppState>) -> Json<Value> {
         "mode": state.mode,
         "pending_change_count": registry.pending_changes.len(),
         "batch_count": applied,
-        "stall": registry.chain.stall(),
+        "stall": registry.zone.stall(),
         "in_flight": registry.in_flight().map(hex::encode),
         "lez": {
             "adopted_block_id": registry.head().lez_block_id,

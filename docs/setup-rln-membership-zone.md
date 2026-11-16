@@ -91,7 +91,7 @@ sed -i "s/^FUNDING_PK=.*/FUNDING_PK=$(yq .public_keys.PoWClaim ~/keystore.yaml)/
 | `POLL_SEC` | 10 | Seconds between publish checks (the sequencer) or judgments (the indexer) |
 | `HEARTBEAT_SEC` | 3600 | Publish an empty batch after this long without one |
 | `STALE_REFUND_SLOTS` | 0 | LIB slots an unmined batch waits before the Zone SDK re-funds it under a new transaction (0 disables). Off: the mempool is FIFO, a re-funded transaction goes to the back of the queue; the SDK default, 30, re-funded at every finalized block |
-| `DATA_DIR` | `data` | `key.hex` (the channel key), `lez-key.hex` (the read-only key on the LEZ channel) and the tree store `tree/`. Gitignored: copy `key.hex` outside the checkout after the first start, a deleted or re-cloned checkout takes the channel key with it |
+| `DATA_DIR` | `data` | `key.hex` (the channel key, the sequencer only) and the tree store `tree/`. Gitignored: copy `key.hex` outside the checkout after the first start, a deleted or re-cloned checkout takes the channel key with it |
 | `HTTP_ADDR` | `127.0.0.1:3000` | HTTP API bind address |
 
 ### Run
@@ -149,8 +149,7 @@ next batch spans the whole gap.
 
 | File | Content | Lose it and |
 | --- | --- | --- |
-| `data/key.hex` | accredited key | the channel is lost; start a new one with a new `CHANNEL_NAME` |
-| `data/lez-key.hex` | the read-only key on the LEZ channel | nothing: a new one is made |
+| `data/key.hex` | accredited key (the sequencer; an indexer writes none, it signs nothing) | the channel is lost; start a new one with a new `CHANNEL_NAME` |
 | `data/tree/` | sled store: the tree of the finalized LEZ blocks, the reader's state, the Zone channel state (final tier, view, anchor), both Zone SDK checkpoints | the sequencer starts fresh: backfill from slot 0, tree rebuilt from LEZ, and on a channel that already has batches the next batch chains on the root and is refused (below) |
 
 Rule: never delete the tree store on a channel that has batches. The Zone SDK learns the
@@ -178,7 +177,7 @@ store, the key stays.
 ### Run an indexer
 
 The same binary in `--mode indexer` trusts nobody about the batches. It follows the channel
-exactly like the sequencer (the Zone SDK with a key of its own that is not accredited, so it
+exactly like the sequencer (the Zone SDK with a throwaway key that is not accredited, so it
 only reads; a channel with history is walked from genesis once, no start slot to give; started
 before the first batch it begins at the LIB like the sequencer) and reads LEZ exactly like the
 sequencer, but judges the batches against the tree of the LEZ blocks **finalized** on Bedrock
@@ -211,7 +210,7 @@ An indexer is meant to run on and off: stopped for days, started to check what f
 since. Nothing it decides depends on being up: the final tier is re-read from the anchor on
 every start, the view comes back from the SDK, a batch it could not judge yet is judged when
 LEZ finality reaches it, and a missed inscription cannot stick as a wrong outcome (the log says
-`PARKED` for a finalized batch that failed, with the error).
+`parked` for a finalized batch that failed, with the error).
 
 ### HTTP API
 
@@ -491,7 +490,7 @@ batch stays `in_flight` (block production and mempool propagation).
   `CHANNEL_NAME`: the old tree store is still there; stop, `rm -rf data/tree`
   (keep `key.hex`), start again.
 - `WARNING the final tier is frozen at batch msg M (L1 slot S): ...` at start, or a batch
-  `PARKED` in the log: a finalized batch did not apply on the final tier (its error says
+  `parked` in the log: a finalized batch did not apply on the final tier (its error says
   which check), every later one parks after it; `/` shows it as `stall`. On the indexer that
   is what it holds against the channel; on the sequencer it means its own batch was malformed. Only a
   new channel mends it.

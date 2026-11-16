@@ -77,7 +77,7 @@ src/                              the Zone node: sequencer and indexer (MODE), H
   src/reader.rs                   a reader: derivation rules over the events and the tree (sled-backed PmTree)
   src/lez_chain.rs                the LEZ chain as the node keeps it: the finalized tree on disk, the adopted blocks folded over it
   src/batch.rs                    batch wire format (protobuf)
-  src/chain.rs                    the Zone channel as a consumer keeps it, after LEZ's chain_state: final tier, view, folds
+  src/zone_chain.rs               the Zone channel as a consumer keeps it, after LEZ's chain_state: final tier, view, folds
   src/registry.rs                 one node's state: LEZ chain, Zone channel, pending changes, checkpoints, in the tree store
   src/http.rs                     HTTP API: roots, batches, membership with its Merkle proof path, leaves
   src/main.rs                     two Zone SDK readers (LEZ channel, Zone channel); the sequencer publishes, the indexer judges

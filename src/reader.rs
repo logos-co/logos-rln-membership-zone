@@ -277,31 +277,32 @@ impl Reader {
         Self::open_with(config, tree_id, lez_block_id)
     }
 
-    /// A temporary reader with this reader's state: the same tree (every active leaf set),
+    /// A clone of this reader in a temporary store: the same tree (every active leaf set),
     /// memberships, counters, block, hash and root history. The head of a `LezChain` starts
     /// from this and folds the adopted blocks over it.
-    pub fn fork_temporary(&self) -> Result<Self> {
-        let (mut fork, _) = Self::open_temporary(self.tree_id, self.lez_block_id)?;
+    pub fn clone_temporary(&self) -> Result<Self> {
+        let (mut clone, _) = Self::open_temporary(self.tree_id, self.lez_block_id)?;
         for (id, member) in self.active_leaves() {
             let leaf = fr_from_bytes_le(&member.rate_commitment)
                 .map_err(|e| anyhow!("stored leaf of {}: {e}", hex::encode(id)))?;
-            fork.tree
+            clone
+                .tree
                 .set(member.leaf_index as usize, leaf)
                 .with_context(|| format!("set leaf {}", member.leaf_index))?;
         }
-        fork.members = self.members.clone();
-        fork.stats = self.stats;
-        fork.last_block_hash = self.last_block_hash;
-        fork.lez_timestamp_ms = self.lez_timestamp_ms;
-        fork.roots_by_block = self.roots_by_block.clone();
-        if fork.root() != self.root() {
+        clone.members = self.members.clone();
+        clone.stats = self.stats;
+        clone.last_block_hash = self.last_block_hash;
+        clone.lez_timestamp_ms = self.lez_timestamp_ms;
+        clone.roots_by_block = self.roots_by_block.clone();
+        if clone.root() != self.root() {
             bail!(
-                "the forked tree's root {} is not the store's {}",
-                hex::encode(fork.root()),
+                "the cloned tree's root {} is not the store's {}",
+                hex::encode(clone.root()),
                 hex::encode(self.root())
             );
         }
-        Ok(fork)
+        Ok(clone)
     }
 
     fn open_with(
@@ -737,10 +738,10 @@ mod test {
         assert_eq!(reader.last_block_hash(), Some([2; 32]));
     }
 
-    /// A forked reader is the store's tree in a temporary store: same root, memberships,
+    /// A cloned reader is the store's tree in a temporary store: same root, memberships,
     /// history; applying to it leaves the store alone.
     #[test]
-    fn test_fork_temporary_matches_the_store() {
+    fn test_clone_temporary_matches_the_store() {
         let (mut reader, _) = Reader::open_temporary([0; 32], 0).unwrap();
         reader
             .apply_block(&block(1, 1_000, vec![registered(1, 0, 5_000)]))
@@ -748,18 +749,18 @@ mod test {
         reader
             .apply_block(&block(2, 2_000, vec![registered(2, 1, u64::MAX)]))
             .unwrap();
-        let mut fork = reader.fork_temporary().unwrap();
-        assert_eq!(fork.root(), reader.root());
-        assert_eq!(fork.lez_block_id, 2);
-        assert_eq!(fork.active_count(), 2);
-        assert_eq!(fork.root_at(1), reader.root_at(1));
-        assert_eq!(fork.last_block_hash(), reader.last_block_hash());
-        // Block 5 expires leaf 0 on the fork only.
-        fork.apply_block(&block(5, 5_000, vec![])).unwrap();
-        assert_eq!(fork.active_count(), 1);
+        let mut clone = reader.clone_temporary().unwrap();
+        assert_eq!(clone.root(), reader.root());
+        assert_eq!(clone.lez_block_id, 2);
+        assert_eq!(clone.active_count(), 2);
+        assert_eq!(clone.root_at(1), reader.root_at(1));
+        assert_eq!(clone.last_block_hash(), reader.last_block_hash());
+        // Block 5 expires leaf 0 on the clone only.
+        clone.apply_block(&block(5, 5_000, vec![])).unwrap();
+        assert_eq!(clone.active_count(), 1);
         assert_eq!(reader.active_count(), 2);
-        assert_ne!(fork.root(), reader.root());
-        assert!(fork.proof_path(1).is_some());
+        assert_ne!(clone.root(), reader.root());
+        assert!(clone.proof_path(1).is_some());
     }
 
     #[test]

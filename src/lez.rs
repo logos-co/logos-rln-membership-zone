@@ -67,7 +67,7 @@ impl Block {
 /// derived from the program's transactions instead: a block holds the transactions it
 /// executed, so every `Register` to the program is a `Registered`, every `Slash` a `Slashed`
 /// of `poseidon(identity_secret)`, and so on.
-pub struct SequencerLez {
+pub struct LezSequencer {
     client: reqwest::Client,
     url: String,
     program: AccountId,
@@ -75,7 +75,7 @@ pub struct SequencerLez {
     tree_id: [u8; 32],
 }
 
-impl SequencerLez {
+impl LezSequencer {
     pub fn new(url: String, program_account_id: [u8; 32], tree_id: [u8; 32]) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -288,8 +288,8 @@ mod test {
     const PROGRAM: [u8; 32] = [1; 32];
     const TREE: [u8; 32] = [7; 32];
 
-    fn lez() -> SequencerLez {
-        SequencerLez::new("http://unused".into(), PROGRAM, TREE)
+    fn lez() -> LezSequencer {
+        LezSequencer::new("http://unused".into(), PROGRAM, TREE)
     }
 
     /// A LEZ block in its own borsh, the hash computed as LEZ does; the transactions are
@@ -562,7 +562,7 @@ mod test {
                 .unwrap(),
         )
         .unwrap();
-        let lez = SequencerLez::new("http://unused".into(), program, tree_id);
+        let lez = LezSequencer::new("http://unused".into(), program, tree_id);
         let bytes = BASE64.decode(BLOCK_50056).unwrap();
         let block = lez.decode_block(&bytes).unwrap();
         assert_eq!(block.block_id(), 50056);

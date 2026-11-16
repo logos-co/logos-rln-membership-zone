@@ -55,7 +55,7 @@ pub struct LezChain {
 
 impl LezChain {
     pub fn new(final_reader: Reader) -> Result<Self> {
-        let head = final_reader.fork_temporary()?;
+        let head = final_reader.clone_temporary()?;
         Ok(Self {
             final_reader,
             view: vec![],
@@ -116,7 +116,7 @@ impl LezChain {
     /// rebuilt from the final reader over it. Returns the changes of every block applied, in
     /// order; stops at the first block that does not chain (logged by the caller).
     pub fn apply_conflict(&mut self, canonical: &[Block]) -> Result<Vec<(u64, Vec<Change>)>> {
-        self.head = self.final_reader.fork_temporary()?;
+        self.head = self.final_reader.clone_temporary()?;
         self.view.clear();
         let mut applied = vec![];
         for block in canonical {
@@ -174,7 +174,7 @@ impl LezChain {
                     self.view.len()
                 );
                 self.view.clear();
-                self.head = self.final_reader.fork_temporary()?;
+                self.head = self.final_reader.clone_temporary()?;
                 true
             }
             None => {
