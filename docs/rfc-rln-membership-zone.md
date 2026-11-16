@@ -776,7 +776,7 @@ with other contents under the same `block_id`
 (on the testnet about once every twenty blocks, one or two blocks deep, mostly without events).
 A Zone sequencer that applied such a block from the LEZ Sequencer's word and batched it
 has a batch on Bedrock whose `root_after` the rewritten history contradicts:
-every Zone indexer parks it and every batch after it (seen on the testnet on 2026-11-15).
+every Zone indexer parks it and every batch after it (seen on the testnet).
 Reading LEZ blocks from the LEZ channel on Bedrock, adopted ones for the Zone sequencer, closes this:
 a block on Bedrock survives a LEZ Sequencer restart, since the LEZ Sequencer itself rebuilds from the channel.
 What stays open is a Bedrock reorg that orphans a LEZ inscription the Zone sequencer already batched,

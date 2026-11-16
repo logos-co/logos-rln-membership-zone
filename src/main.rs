@@ -114,7 +114,7 @@ struct Args {
     /// Name of the Zone channel: its id is `sha256(name)`.
     #[arg(
         long,
-        default_value = "rln-membership-zone:testnet:v0.3.2-1",
+        default_value = "rln-membership-zone:testnet:v0.3.2-2",
         env = "CHANNEL_NAME"
     )]
     channel_name: String,

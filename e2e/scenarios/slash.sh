@@ -28,11 +28,12 @@ membership=$(zone "/merkle_proof/$id_commitment") || die "the zone does not know
 
 before=$(lez_balance "$LEZ_RLN_PAYER")
 say "slashing leaf $leaf_index from $LEZ_RLN_PAYER (balance $before)"
+# `slash_member` times out when the LEZ Sequencer answers slowly, charged or not, and its
+# balance answer can lag too (seen once: unchanged balance, slash landed). The zone is
+# the judge: the leaf removed within the wait below means the slash landed.
 if ! LEZ_RLN_ID_COMMITMENT="$id_commitment" LEZ_RLN_IDENTITY_SECRET="$identity_secret" "$slash_member" >&2; then
     after=$(lez_balance "$LEZ_RLN_PAYER")
-    ge "$((before - after))" 1000000 \
-        || die "slash_member failed and the payer was not charged ($before -> $after): the slash did not land"
-    say "slash_member timed out but the payer was charged $((before - after)) atomic: the slash landed, going on"
+    say "slash_member timed out (payer $before -> $after); the zone tells whether the slash landed"
 fi
 after=$(lez_balance "$LEZ_RLN_PAYER")
 say "payer balance $before -> $after: the slash cost $((before - after)) atomic (fee)"
@@ -44,7 +45,7 @@ for _ in $(seq 1 120); do
     membership=""
     sleep 10
 done
-[ -n "$membership" ] || die "the zone did not apply the slash within 20 minutes"
+[ -n "$membership" ] || die "the zone did not apply the slash within 20 minutes: it did not land (or LEZ is down)"
 [ "$(printf '%s' "$membership" | jq -r '.removed')" = "slashed" ] \
     || die "removed is $(printf '%s' "$membership" | jq -r '.removed'), not slashed"
 [ "$(printf '%s' "$membership" | jq -r '.proof')" = "null" ] || die "a removed membership still has a proof"

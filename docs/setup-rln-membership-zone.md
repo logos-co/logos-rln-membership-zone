@@ -81,7 +81,7 @@ sed -i "s/^FUNDING_PK=.*/FUNDING_PK=$(yq .public_keys.PoWClaim ~/keystore.yaml)/
 | `FUNDING_PK` | | Node wallet key paying the batches (`PoWClaim`) |
 | `MAX_TX_FEE` | 1000000 | Fee cap per publish, atomic units |
 | `PRIORITY_FEE_PERCENT` | 12 | Reserve over the mandatory fee, the excess is a tip; block builders take the mempool FIFO, so it buys nothing on the testnet (SDK default 12) |
-| `CHANNEL_NAME` | `rln-membership-zone:testnet:v0.3.2-1` | Channel id = `sha256(CHANNEL_NAME)`; `CHANNEL_ID` (64 hex) overrides |
+| `CHANNEL_NAME` | `rln-membership-zone:testnet:v0.3.2-2` | Channel id = `sha256(CHANNEL_NAME)`; `CHANNEL_ID` (64 hex) overrides |
 | `PROGRAM_ACCOUNT_ID` | `f048...106a` | Registration program on the testnet LEZ (`HAxY9...4bBw` in base58) |
 | `TREE_ID` | `47b2de4f...b4cf` | Registry the program serves, first field of every event |
 | `FIRST_LEZ_BLOCK_ID` | 49431 | Block the program was deployed in; nothing before it is read |
