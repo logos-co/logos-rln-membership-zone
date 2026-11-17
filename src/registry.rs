@@ -91,6 +91,10 @@ struct ZoneState {
     own_pending: Vec<String>,
     orphaned: u64,
     pending_changes: Vec<PendingChangeRecord>,
+    /// Batches of ours a reorg dropped whose publish again failed, prost in hex, in publish
+    /// order: the tick publishes them before any new batch.
+    #[serde(default)]
+    to_republish: Vec<String>,
     /// The Zone SDK checkpoint on the Zone channel, its `channel_notes` emptied.
     checkpoint: Option<Value>,
 }
@@ -190,6 +194,10 @@ pub struct Registry {
     own_pending: Vec<[u8; 32]>,
     /// Publishes of ours a Bedrock reorg dropped (the SDK's `orphaned`), published again.
     orphaned: u64,
+    /// Dropped batches whose publish again failed, in publish order: the tick publishes them
+    /// before any new batch, so their changes (trimmed from `pending_changes` when they were
+    /// first published) reach the channel.
+    to_republish: Vec<Batch>,
     anchor: Option<ZoneAnchorRecord>,
     /// The Zone SDK checkpoint on the Zone channel, as JSON, `channel_notes` emptied.
     checkpoint: Option<Value>,
@@ -309,6 +317,15 @@ impl Registry {
                 })
                 .collect::<Result<Vec<_>>>()
         })?;
+        let to_republish = files.zone.as_ref().map_or(Ok(vec![]), |z| {
+            z.to_republish
+                .iter()
+                .map(|h| {
+                    let bytes = hex::decode(h).context("batch to publish again is not hex")?;
+                    Batch::decode(bytes.as_slice()).context("batch to publish again")
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
         let mut registry = Self {
             lez,
             zone,
@@ -316,6 +333,7 @@ impl Registry {
             pending_changes,
             own_pending,
             orphaned: files.zone.as_ref().map_or(0, |z| z.orphaned),
+            to_republish,
             anchor: files.zone.as_ref().and_then(|z| z.anchor),
             checkpoint: files.zone.as_ref().and_then(|z| z.checkpoint.clone()),
             indexer,
@@ -354,6 +372,11 @@ impl Registry {
                     block: *block,
                     change: hex::encode(change.encode_to_vec()),
                 })
+                .collect(),
+            to_republish: self
+                .to_republish
+                .iter()
+                .map(|batch| hex::encode(batch.encode_to_vec()))
                 .collect(),
             checkpoint: self.checkpoint.clone(),
         };
@@ -641,6 +664,23 @@ impl Registry {
     /// How many publishes of ours a Bedrock reorg dropped (published again each time).
     pub fn orphaned_count(&self) -> u64 {
         self.orphaned
+    }
+
+    /// A dropped batch whose publish again failed: the tick publishes it before any new batch.
+    pub fn queue_republish(&mut self, batch: Batch) {
+        self.to_republish.push(batch);
+    }
+
+    /// The oldest dropped batch still to publish again, if any.
+    pub fn next_republish(&self) -> Option<Batch> {
+        self.to_republish.first().cloned()
+    }
+
+    /// The oldest dropped batch is published: out of the queue.
+    pub fn republished(&mut self) {
+        if !self.to_republish.is_empty() {
+            self.to_republish.remove(0);
+        }
     }
 
     /// Whether this node judges the batches instead of publishing them.
@@ -1205,5 +1245,49 @@ mod test {
         assert_eq!(registry.preview_for_leaf(0), None);
         assert_eq!(registry.preview_for_id(&id).map(|(at, _)| at), Some(4));
         assert_eq!(registry.preview_next(), 5);
+    }
+
+    /// A reorg drops a published batch and publishing it again fails: its changes left
+    /// `pending_changes` when it was first published, so the batch waits in a queue the tick
+    /// drains before any new batch, across a restart.
+    #[test]
+    fn test_a_dropped_batch_whose_republish_failed_waits_for_the_tick() {
+        let dir = std::env::temp_dir().join(format!(
+            "zone-registry-republish-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let batch;
+        {
+            let mut registry = Registry::open(&dir, [0; 32], 1, false, false).unwrap();
+            registry
+                .apply_lez_finalized(&block(1, vec![registered(1, 0)]))
+                .unwrap();
+            batch = registry.next_batch().unwrap();
+            registry.record_publish(msg(1), MsgId::root(), &batch);
+            assert!(registry.pending_changes.is_empty());
+            // The reorg drops it; the view is empty again and no new batch carries leaf 0.
+            let dropped = registry.apply_zone_conflict(vec![]);
+            assert_eq!(dropped.len(), 1);
+            assert_eq!(registry.orphaned_count(), 1);
+            assert!(registry.in_flight().is_none());
+            assert!(registry.next_batch().unwrap().changes.is_empty());
+            registry.queue_republish(batch.clone());
+            registry.save().unwrap();
+            registry.close().unwrap();
+        }
+        let mut registry = Registry::open(&dir, [0; 32], 1, false, false).unwrap();
+        assert_eq!(registry.next_republish(), Some(batch.clone()));
+        // Published again: the same payload applies on the head, the queue is empty.
+        assert!(registry.would_apply(&batch).is_ok());
+        assert_eq!(
+            registry.record_publish(msg(2), MsgId::root(), &batch),
+            PublishRecord::Extended
+        );
+        registry.republished();
+        assert_eq!(registry.next_republish(), None);
+        assert_eq!(registry.covered_to(), 1);
+        registry.close().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

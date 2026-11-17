@@ -357,8 +357,9 @@ pub async fn on_blocks_processed(
                 };
                 warn_lineage_gap(registry);
                 // A reorg dropped the sequencer's batches: it publishes the same payloads
-                // again, in order (new messages, since their parent changed). An indexer
-                // publishes nothing.
+                // again, in order (a message id commits to the payload, the parent and the
+                // signer, so the message is the same one when its parent is unchanged, a new
+                // one otherwise). An indexer publishes nothing.
                 for entry in dropped {
                     let Some(batch) = entry.batch else { continue };
                     if publishes {
@@ -411,8 +412,10 @@ pub fn warn_lineage_gap(registry: &Shared) {
     }
 }
 
-/// Publish `batch` again after a reorg orphaned its message `orphaned`: a new message, since
-/// its parent changed. A refusal by the SDK is logged and left to the next conflict or poll.
+/// Publish `batch` again after a reorg orphaned its message `orphaned` (the same message when
+/// its parent is unchanged, a new one otherwise). A refusal by the SDK is logged and the batch
+/// queued: the tick publishes it before any new batch, since its changes left `pending_changes`
+/// when it was first published and no new batch carries them.
 pub async fn republish(
     zone_sdk: &mut ZoneSequencer<NodeHttpClient>,
     registry: &Shared,
@@ -440,7 +443,18 @@ pub async fn republish(
                 short(&info.this_msg.into())
             );
         }
-        Err(e) => warn!("republish after reorg failed: {e}"),
+        Err(e) => {
+            warn!(
+                "batch [{}..{}] msg {} orphaned by a reorg, publishing it again failed: {e}; \
+                 queued, the tick publishes it before any new batch",
+                batch.from_lez_block_id,
+                batch.to_lez_block_id,
+                short(&orphaned)
+            );
+            let mut registry = registry.write().expect("registry lock");
+            registry.queue_republish(batch.clone());
+            registry.save()?;
+        }
     }
     Ok(())
 }
@@ -501,8 +515,9 @@ pub async fn refresh_preview(source: &LezSequencer, registry: &Shared, failed: &
 /// One tick. Both modes refresh the preview of the LEZ blocks the LEZ Sequencer produced
 /// beyond the head (not on Bedrock yet). The indexer judges what it could not judge before
 /// (the finalized tree moved). The sequencer checks its own statements against the tree, then
-/// publishes one batch covering the adopted LEZ blocks not covered yet when changes wait or
-/// the heartbeat is due, with at most one batch in flight. `Err` only for the tree store.
+/// publishes one batch, with at most one in flight: a dropped batch whose publish again
+/// failed first, else a new one covering the adopted LEZ blocks not covered yet when changes
+/// wait or the heartbeat is due. `Err` only for the tree store.
 pub async fn on_tick(
     zone_sdk: &mut ZoneSequencer<NodeHttpClient>,
     registry: &Shared,
@@ -524,18 +539,28 @@ pub async fn on_tick(
         &registry.read().expect("registry lock"),
         &mut counters.contradicted,
     );
-    let batch = {
+    let (queued, batch) = {
         let registry = registry.read().expect("registry lock");
         if registry.in_flight().is_some() {
             return Ok(());
         }
-        let due = registry.lineage().is_empty()
-            || !registry.pending_changes.is_empty()
-            || now_unix().saturating_sub(*last_publish_unix) >= heartbeat_sec;
-        if due { registry.next_batch() } else { None }
+        if let Some(batch) = registry.next_republish() {
+            (true, Some(batch))
+        } else {
+            let due = registry.lineage().is_empty()
+                || !registry.pending_changes.is_empty()
+                || now_unix().saturating_sub(*last_publish_unix) >= heartbeat_sec;
+            (false, if due { registry.next_batch() } else { None })
+        }
     };
     let Some(batch) = batch else { return Ok(()) };
-    publish_batch(zone_sdk, registry, &batch, last_publish_unix).await
+    let published = publish_batch(zone_sdk, registry, &batch, last_publish_unix).await?;
+    if queued && published {
+        let mut registry = registry.write().expect("registry lock");
+        registry.republished();
+        registry.save()?;
+    }
+    Ok(())
 }
 
 /// The sequencer's own batches that LEZ now contradicts (the tree at `to_lez_block_id` has
@@ -560,14 +585,14 @@ pub fn warn_contradicted(registry: &Registry, contradicted_count: &mut usize) {
 
 /// Publish the next batch: recorded as in flight and saved with the checkpoint on success, so
 /// a restart knows it; `last_publish_unix` restarts the heartbeat. A batch too large for one
-/// inscription or a refusal by the SDK is logged and tried again next poll. A batch that
-/// would not apply on our own head is a bug: fatal before anything reaches Bedrock.
+/// inscription or a refusal by the SDK is logged and tried again next poll (`Ok(false)`). A
+/// batch that would not apply on our own head is a bug: fatal before anything reaches Bedrock.
 pub async fn publish_batch(
     zone_sdk: &mut ZoneSequencer<NodeHttpClient>,
     registry: &Shared,
     batch: &Batch,
     last_publish_unix: &mut u64,
-) -> Result<()> {
+) -> Result<bool> {
     if let Err(e) = registry.read().expect("registry lock").would_apply(batch) {
         bail!(
             "batch [{}..{}] would not apply on our own head ({e}); stopping before publishing \
@@ -583,7 +608,7 @@ pub async fn publish_batch(
                 "batch [{}..{}] does not fit one inscription: {e:?}",
                 batch.from_lez_block_id, batch.to_lez_block_id
             );
-            return Ok(());
+            return Ok(false);
         }
     };
     match zone_sdk.handle().publish(inscription).await {
@@ -632,13 +657,17 @@ pub async fn publish_batch(
                     short(&info.this_msg.into())
                 );
             }
+            Ok(true)
         }
         Err(SeqError::Unavailable { reason }) => {
-            info!("not ready to publish ({reason}), retry next poll")
+            info!("not ready to publish ({reason}), retry next poll");
+            Ok(false)
         }
-        Err(e) => warn!("publish failed: {e}"),
+        Err(e) => {
+            warn!("publish failed: {e}");
+            Ok(false)
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -144,7 +144,9 @@ What happens, in order:
    it `in_flight`, until the channel tip shows a Bedrock block holds it: `adopted`) and the
    final tier once in finalized history (`finalized` with its `l1_slot`, 8 to 10 hours later);
    a reorg that drops it from the view (the SDK's `Conflict`, `orphaned`) has it published
-   again under a new message id, counted in `orphaned_count`. Finality comes
+   again (the same message id when its parent is unchanged), counted in `orphaned_count`; when
+   that publish fails the batch waits in `zone.json` and the tick publishes it before any new
+   batch. Finality comes
    from the Zone SDK stream, and every 5 minutes a scan of the finalized L1 blocks from the
    anchor (the slot of the newest final entry) up to the LIB applies what the stream may have
    missed (a restart in between).
