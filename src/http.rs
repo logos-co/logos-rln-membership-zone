@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use crate::{
     batch::{Batch, Change, Kind},
     lez::{self, ProgramEvent, RlnEvent},
-    reader::Member,
+    reader::{Member, Reader, parse_32},
     registry::{BedrockStatus, Registry, event_id_commitment},
     zone_chain::{BatchIngestError, Tip},
 };
@@ -33,13 +33,19 @@ use crate::{
 /// The registry behind the API and the sync loops, one writer at a time.
 pub type Shared = Arc<RwLock<Registry>>;
 
-/// One tree change a batch carried, as the API shows it.
+/// One tree change a batch carried, as the API shows it, with the LEZ transaction behind it
+/// as the tree knows it (a batch carries no transaction hash; a leaf index is never reused, so
+/// the membership at that leaf is the one the change is about).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ChangeRecord {
     pub kind: ChangeKind,
     pub leaf_index: u64,
     /// The leaf inserted, 32 bytes little-endian in hex; `None` for a removal.
     pub rate_commitment: Option<String>,
+    /// The LEZ transaction that made the change: the `Registered` of an insert, the `Slashed` or
+    /// `Erased` of a removal; `None` for a removal by expiry (no transaction) or a leaf this
+    /// node's tree does not hold.
+    pub lez_tx_hash: Option<String>,
 }
 
 /// The two tree operations, as the API names them.
@@ -51,17 +57,24 @@ pub enum ChangeKind {
 }
 
 impl ChangeRecord {
-    fn from_change(change: &Change) -> Option<Self> {
+    fn from_change(change: &Change, head: &Reader) -> Option<Self> {
         Some(match change.kind.as_ref()? {
             Kind::Insert(insert) => Self {
                 kind: ChangeKind::Insert,
                 leaf_index: insert.leaf_index,
                 rate_commitment: Some(hex::encode(&insert.rate_commitment)),
+                lez_tx_hash: head
+                    .member_at(insert.leaf_index)
+                    .map(|(_, m)| hex::encode(m.registered_lez_tx_hash)),
             },
             Kind::Remove(remove) => Self {
                 kind: ChangeKind::Remove,
                 leaf_index: remove.leaf_index,
                 rate_commitment: None,
+                lez_tx_hash: head
+                    .member_at(remove.leaf_index)
+                    .and_then(|(_, m)| m.removed_lez_tx_hash)
+                    .map(hex::encode),
             },
         })
     }
@@ -97,8 +110,8 @@ impl EntryView {
         batch: Option<&Batch>,
         bedrock_status: BedrockStatus,
         l1_slot: Option<u64>,
-        superseded: bool,
         error: Option<&BatchIngestError>,
+        head: &Reader,
     ) -> Self {
         Self {
             msg_id: hex::encode(msg),
@@ -109,12 +122,13 @@ impl EntryView {
             changes: batch.map_or_else(Vec::new, |b| {
                 b.changes
                     .iter()
-                    .filter_map(ChangeRecord::from_change)
+                    .filter_map(|change| ChangeRecord::from_change(change, head))
                     .collect()
             }),
             bedrock_status,
             l1_slot,
-            superseded,
+            // Set by `entries`, which knows the whole lineage.
+            superseded: false,
             // An entry without a batch has nothing to apply and nothing to park on.
             error: error.filter(|_| batch.is_some()).cloned(),
         }
@@ -141,8 +155,8 @@ pub fn entries(registry: &Registry) -> Vec<EntryView> {
                 f.batch().as_ref(),
                 BedrockStatus::Finalized,
                 Some(f.l1_slot),
-                superseded.contains(&f.msg),
                 f.error.as_ref(),
+                registry.head(),
             )
         })
         .collect();
@@ -159,9 +173,12 @@ pub fn entries(registry: &Registry) -> Vec<EntryView> {
             entry.batch.as_ref(),
             status,
             None,
-            superseded.contains(&msg),
             outcome.as_ref().err(),
+            registry.head(),
         ));
+    }
+    for view in &mut out {
+        view.superseded = parse_32(&view.msg_id, "msg id").is_ok_and(|m| superseded.contains(&m));
     }
     out
 }
@@ -398,10 +415,10 @@ async fn merkle_proof(
                 "rate_limit": rate_limit,
                 "active": false,
                 "registered_at_lez_block_id": null,
-                "registered_tx_hash": null,
+                "registered_lez_tx_hash": null,
                 "removed": null,
                 "removed_at_lez_block_id": null,
-                "removed_tx_hash": null,
+                "removed_lez_tx_hash": null,
                 "expiry_timestamp_ms": expiry,
                 "newest_published": root_ref(newest(&registry, false)),
                 "newest_finalized": root_ref(newest(&registry, true)),
@@ -435,10 +452,10 @@ async fn merkle_proof(
             "rate_limit": member.rate_limit,
             "active": member.active,
             "registered_at_lez_block_id": member.registered_at_lez_block_id,
-            "registered_tx_hash": hex::encode(member.registered_tx_hash),
+            "registered_lez_tx_hash": hex::encode(member.registered_lez_tx_hash),
             "removed": member.removed,
             "removed_at_lez_block_id": member.removed_at_lez_block_id,
-            "removed_tx_hash": member.removed_tx_hash.map(hex::encode),
+            "removed_lez_tx_hash": member.removed_lez_tx_hash.map(hex::encode),
             "expiry_timestamp_ms": member.expiry_timestamp_ms,
             "newest_published": root_ref(newest(&registry, false)),
             "newest_finalized": root_ref(newest(&registry, true)),
@@ -458,14 +475,14 @@ async fn leaves(State(state): State<AppState>) -> Json<Value> {
             "id_commitment": hex::encode(id),
             "rate_limit": m.rate_limit,
             "registered_at_lez_block_id": m.registered_at_lez_block_id,
-            "registered_tx_hash": hex::encode(m.registered_tx_hash),
+            "registered_lez_tx_hash": hex::encode(m.registered_lez_tx_hash),
             "expiry_timestamp_ms": m.expiry_timestamp_ms,
             "expires_in_ms": m
                 .active
                 .then(|| m.expiry_timestamp_ms.saturating_sub(registry.head().lez_timestamp_ms)),
             "removed": m.removed,
             "removed_at_lez_block_id": m.removed_at_lez_block_id,
-            "removed_tx_hash": m.removed_tx_hash.map(hex::encode),
+            "removed_lez_tx_hash": m.removed_lez_tx_hash.map(hex::encode),
         })
     };
     let active: Vec<Value> = registry
@@ -681,12 +698,15 @@ mod test {
             .unwrap();
         assert_eq!(removed["active"], false);
         assert_eq!(removed["removed"], json!("slashed"));
-        assert_eq!(removed["removed_tx_hash"], json!("07".repeat(32)));
+        assert_eq!(removed["removed_lez_tx_hash"], json!("07".repeat(32)));
         assert_eq!(removed["removed_at_lez_block_id"], 5);
         assert!(removed["proof"].is_null());
         let Json(all) = leaves(State(state.clone())).await;
         assert_eq!(all["active"].as_array().unwrap().len(), 1);
-        assert_eq!(all["removed"][0]["removed_tx_hash"], json!("07".repeat(32)));
+        assert_eq!(
+            all["removed"][0]["removed_lez_tx_hash"],
+            json!("07".repeat(32))
+        );
         assert!(all["removed"][0]["expires_in_ms"].is_null());
         assert_eq!(all["active"][0]["rate_limit"], 100);
     }
@@ -712,25 +732,25 @@ mod test {
         publish(&mut registry, 1);
         let root_a = hex::encode(registry.head().root());
         registry
+            .apply_lez_adopted(&block(2, vec![registered(2, 1)]))
+            .unwrap();
+        publish(&mut registry, 2);
+        // Leaf 1 slashed: the tree is back at root A (leaf 0 alone), a new run.
+        registry
             .apply_lez_adopted(&block(
-                2,
+                3,
                 vec![ProgramEvent {
                     tx_hash: [7; 32],
                     event: RlnEvent::Slashed(crate::lez::Slashed {
                         tree_id: [0; 32],
                         id_commitment: {
                             let mut id = [0u8; 32];
-                            id[0] = 1;
+                            id[0] = 2;
                             id
                         },
                     }),
                 }],
             ))
-            .unwrap();
-        publish(&mut registry, 2);
-        // The same commitment registers again at leaf 0 (its membership ended): root A again.
-        registry
-            .apply_lez_adopted(&block(3, vec![registered(1, 0)]))
             .unwrap();
         publish(&mut registry, 3);
         assert_eq!(hex::encode(registry.head().root()), root_a);
@@ -738,7 +758,17 @@ mod test {
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].produced_by().msg_id, hex::encode([3; 32]));
         assert_eq!(all[0].entries.len(), 1);
-        assert_eq!(all[1].produced_by().changes[0].kind, ChangeKind::Remove);
+        assert_eq!(all[0].produced_by().changes[0].kind, ChangeKind::Remove);
+        // The removal names the slash, the inserts name their registrations.
+        assert_eq!(
+            all[0].produced_by().changes[0].lez_tx_hash,
+            Some("07".repeat(32))
+        );
+        assert_eq!(all[1].produced_by().changes[0].kind, ChangeKind::Insert);
+        assert_eq!(
+            all[2].produced_by().changes[0].lez_tx_hash,
+            Some("00".repeat(32))
+        );
         assert_eq!(all[2].produced_by().msg_id, hex::encode([1; 32]));
         let two = roots_of(&registry, 2);
         assert_eq!(two.len(), 2);
@@ -942,7 +972,7 @@ mod test {
         let Json(by_id) = merkle_proof(State(state.clone()), Path(id)).await.unwrap();
         assert_eq!(by_id["leaf_index"], 0);
         assert!(by_id["lez_preview"].is_null());
-        assert_eq!(by_id["registered_tx_hash"], json!("00".repeat(32)));
+        assert_eq!(by_id["registered_lez_tx_hash"], json!("00".repeat(32)));
         let (code, _) = merkle_proof(State(state.clone()), Path("7".into()))
             .await
             .unwrap_err();

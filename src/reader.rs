@@ -130,12 +130,12 @@ pub struct Member {
     /// The LEZ block of the `Registered` that made it, and the LEZ transaction.
     pub registered_at_lez_block_id: u64,
     #[serde(with = "hex::serde")]
-    pub registered_tx_hash: [u8; 32],
+    pub registered_lez_tx_hash: [u8; 32],
     /// The LEZ block whose event or expiry step took the leaf out, while it is out, and the
     /// LEZ transaction when an event did (the expiry step has none).
     pub removed_at_lez_block_id: Option<u64>,
     #[serde(with = "hex_option")]
-    pub removed_tx_hash: Option<[u8; 32]>,
+    pub removed_lez_tx_hash: Option<[u8; 32]>,
 }
 
 /// `Option<[u8; 32]>` as hex or `null`.
@@ -538,9 +538,9 @@ impl Reader {
                             active: true,
                             removed: None,
                             registered_at_lez_block_id: block.block_id(),
-                            registered_tx_hash: *tx_hash,
+                            registered_lez_tx_hash: *tx_hash,
                             removed_at_lez_block_id: None,
-                            removed_tx_hash: None,
+                            removed_lez_tx_hash: None,
                         },
                     );
                     changes.push(Change::insert(*leaf_index, fr_to_bytes_le(&leaf).to_vec()));
@@ -574,7 +574,7 @@ impl Reader {
                         member.active = true;
                         member.removed = None;
                         member.removed_at_lez_block_id = None;
-                        member.removed_tx_hash = None;
+                        member.removed_lez_tx_hash = None;
                         self.stats.reinserted += 1;
                         self.tree
                             .set(leaf_index as usize, leaf)
@@ -615,7 +615,7 @@ impl Reader {
             member.active = false;
             member.removed = Some(Removed::Expired);
             member.removed_at_lez_block_id = Some(block.block_id());
-            member.removed_tx_hash = None;
+            member.removed_lez_tx_hash = None;
             self.stats.removed_expired += 1;
             let leaf_index = member.leaf_index;
             self.tree
@@ -668,7 +668,7 @@ impl Reader {
         member.active = false;
         member.removed = Some(cause);
         member.removed_at_lez_block_id = Some(block_id);
-        member.removed_tx_hash = Some(tx_hash);
+        member.removed_lez_tx_hash = Some(tx_hash);
         if !was_active {
             return Ok(None);
         }
@@ -927,7 +927,7 @@ mod test {
             Some(Removed::Slashed)
         );
         assert_eq!(
-            reader.member(&id(1)).and_then(|m| m.removed_tx_hash),
+            reader.member(&id(1)).and_then(|m| m.removed_lez_tx_hash),
             Some([7; 32])
         );
         assert_eq!(reader.active_count(), 0);
@@ -1140,7 +1140,7 @@ mod test {
         assert!(none.is_empty());
         let member = reader.member(&id(1)).unwrap();
         assert_eq!(member.removed, Some(Removed::Slashed));
-        assert_eq!(member.removed_tx_hash, Some([7; 32]));
+        assert_eq!(member.removed_lez_tx_hash, Some([7; 32]));
         assert_eq!(member.removed_at_lez_block_id, Some(3));
         assert_eq!(reader.stats.removed_ended, 0);
         let unknown = vec![

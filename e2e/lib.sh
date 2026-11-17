@@ -82,8 +82,8 @@ membership_status() {
     local answer="$1" lag
     lag=$(lez_l1_lag)
     printf '%s' "$answer" | jq -r --argjson lag "$lag" '
-        if .active == true and .proof != null then "on Bedrock: active, registered in LEZ block \(.registered_at_lez_block_id) (tx \(.registered_tx_hash[0:8])..), in a batch (root \(.proof.root[0:8])..)"
-        elif .active == true then "on Bedrock: active, registered in LEZ block \(.registered_at_lez_block_id) (tx \(.registered_tx_hash[0:8])..), no batch carries it yet"
+        if .active == true and .proof != null then "on Bedrock: active, registered in LEZ block \(.registered_at_lez_block_id) (tx \(.registered_lez_tx_hash[0:8])..), in a batch (root \(.proof.root[0:8])..)"
+        elif .active == true then "on Bedrock: active, registered in LEZ block \(.registered_at_lez_block_id) (tx \(.registered_lez_tx_hash[0:8])..), no batch carries it yet"
         elif .removed != null then "on Bedrock: removed (\(.removed)) in LEZ block \(.removed_at_lez_block_id)"
         elif .lez_preview != null then "in LEZ block \(.lez_preview.lez_block_id) (\(.lez_preview.event), tx \(.lez_preview.tx_hash[0:8])..), NOT on Bedrock yet; LEZ last inscribed \($lag) Bedrock slots ago"
         else "not seen by the zone; LEZ last inscribed \($lag) Bedrock slots ago" end' 2>/dev/null \

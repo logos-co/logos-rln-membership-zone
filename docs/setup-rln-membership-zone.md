@@ -285,8 +285,10 @@ the same root: the `root`, `from_lez_block_id` of the producing batch, `to_lez_b
 the newest batch carrying it, and `batches`, every batch of the run, the producing one first,
 each with `msg_id`, `parent_msg`, `from_lez_block_id`, `to_lez_block_id`, `root`, `changes`
 (the tree changes it made in order: `kind` `insert` with the `rate_commitment` inserted or
-`remove` with `null`, and the `leaf_index`; the producing batch's made the root, heartbeats
-carry it further with none), `bedrock_status`, `l1_slot` and `superseded` (always `false`
+`remove` with `null`, the `leaf_index`, and `lez_tx_hash`, the LEZ transaction behind the
+change as this node's tree knows it, `null` for a removal by expiry; the producing batch's
+made the root, heartbeats carry it further with none), `bedrock_status`, `l1_slot` and
+`superseded` (always `false`
 here: a batch a correction superseded leaves the list with its root). The head's own root,
 ahead of the batches while changes wait, is `head.root`. A root the tree comes back to (a leaf
 inserted then removed empties its slot again) is a new entry, so the window is the newest
@@ -297,8 +299,8 @@ removed member can still prove under; older roots in the window still hold that 
 `/merkle_proof` answers 404 for a leaf index or identity commitment neither the tree nor the
 LEZ Sequencer knows, 400 for a path that is neither a decimal leaf index nor 32 bytes in hex.
 The answer carries the membership as the LEZ head knows it (`leaf_index`, `id_commitment`,
-`rate_limit`, `active`, `registered_at_lez_block_id` and `registered_tx_hash`, `removed`,
-`removed_at_lez_block_id` and `removed_tx_hash`: the LEZ blocks and transactions of its
+`rate_limit`, `active`, `registered_at_lez_block_id` and `registered_lez_tx_hash`, `removed`,
+`removed_at_lez_block_id` and `removed_lez_tx_hash`: the LEZ blocks and transactions of its
 registration and of the event that removed it, `null` for an expiry, `expiry_timestamp_ms`),
 `newest_published` and `newest_finalized` (for a validator to compare with `head.root`),
 `proof` and `lez_preview`. `proof` is the Merkle proof path at the newest valid root: the tree
@@ -318,8 +320,8 @@ Nothing from the preview is ever batched.
 
 `/leaves` lists `active` and `removed` memberships at the LEZ head, by leaf index, the same
 keys for both: `leaf_index`, `id_commitment`, `rate_limit`, `registered_at_lez_block_id`,
-`registered_tx_hash`, `expiry_timestamp_ms`, `expires_in_ms` (against `head.lez_timestamp_ms`;
-`null` once removed), `removed`, `removed_at_lez_block_id`, `removed_tx_hash`.
+`registered_lez_tx_hash`, `expiry_timestamp_ms`, `expires_in_ms` (against `head.lez_timestamp_ms`;
+`null` once removed), `removed`, `removed_at_lez_block_id`, `removed_lez_tx_hash`.
 
 ## 4. LEZ source: the LEZ channel on Bedrock, and the public LEZ Sequencer for history
 
