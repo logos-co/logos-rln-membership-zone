@@ -187,7 +187,8 @@ the checkpoint it chains the next batch on the root; the chain refuses it (`Inva
 silently, and every later batch too. The sequencer checks `GET /channel/:id` on the node at
 start and refuses to run when the channel on chain does not match its data dir (another key,
 a tip it does not know, or no batch at all); the fix is to restore the data dir or to start a
-new channel.
+new channel. Batches of ours after the tip on chain (a Bedrock reorg while the node was down)
+are orphaned at start and published again by the tick.
 
 ### Start a new channel
 
@@ -512,6 +513,10 @@ batch stays `in_flight` (block production and mempool propagation).
   newest batch is Y..`, `channel is on chain (tip X..) but this data dir holds no batch`,
   `channel tip X.. is our batch but the data dir holds no Zone SDK checkpoint`): the data dir
   does not continue the channel on chain; restore it or start a new `CHANNEL_NAME`.
+- `N batch(es) of ours after the channel tip X.. are not on chain: orphaned, published again at
+  the next tick, the Zone SDK checkpoint moved back to the tip` (WARN at start): a Bedrock
+  reorg orphaned batches while the node was down; nothing to do, the tick publishes them again
+  (the same message ids when the parent is unchanged), `orphaned_count` counts them.
 - `LEZ blocks A..B read from the LEZ Sequencer under finalized block N` then `LEZ blocks A..B
   not read: ...; finalized block N waits for the next one`: the LEZ Sequencer is unreachable;
   the gap is filled again under the next finalized block, so a short outage heals itself.

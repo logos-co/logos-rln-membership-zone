@@ -300,15 +300,37 @@ async fn main() -> Result<()> {
     let channel = channel_on_chain(&node_url, channel_id).await?;
     let checkpoint = match &channel {
         Some(channel) => {
-            if !indexer {
-                check_channel_on_chain(
+            if indexer {
+                checkpoint
+            } else {
+                let after = check_channel_on_chain(
                     channel,
                     &signing_key.public_key().to_bytes(),
                     &registry,
                     resumed,
                 )?;
+                if after == 0 {
+                    checkpoint
+                } else {
+                    // Entries of ours the chain does not hold any more: orphaned, published
+                    // again by the tick; the SDK checkpoint moves back to the tip.
+                    let tip = parse_32(&channel.tip_message, "channel tip")?;
+                    let mut registry = registry.write().expect("registry lock");
+                    let orphaned = registry.reconcile_with_chain(tip);
+                    registry.save()?;
+                    warn!(
+                        "{orphaned} batch(es) of ours after the channel tip {} are not on \
+                         chain: orphaned, published again at the next tick, the Zone SDK \
+                         checkpoint moved back to the tip",
+                        short(&tip)
+                    );
+                    registry
+                        .checkpoint()
+                        .map(|c| serde_json::from_value(c.clone()))
+                        .transpose()
+                        .context("Zone SDK checkpoint after the reconciliation")?
+                }
             }
-            checkpoint
         }
         // No message of the channel on chain: nothing to walk, start at the LIB. A batch of
         // ours still in flight is the one thing a stored checkpoint knows better.

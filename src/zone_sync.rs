@@ -75,8 +75,8 @@ pub struct ZoneBlocks<'a> {
 /// What the node holds for a channel (`GET /channel/:id`), the fields this check reads.
 #[derive(serde::Deserialize)]
 pub struct ChannelOnChain {
-    accredited_keys: Vec<String>,
-    tip_message: String,
+    pub accredited_keys: Vec<String>,
+    pub tip_message: String,
 }
 
 /// The channel as the node knows it (`GET /channel/:id`): `None` while no message of it is on
@@ -127,14 +127,15 @@ pub async fn checkpoint_at_lib(node: &NodeHttpClient) -> Result<SequencerCheckpo
 /// a channel's tip from finalized history only, so without a checkpoint it chains the next
 /// batch on the root; on a channel that already has messages that batch is invalid
 /// (`InvalidParent`) and vanishes without a trace. Likewise another key cannot write at all.
-/// The tip on chain must be one of our entries, with nothing after it but publishes of ours
-/// still in flight (the checkpoint carries them; the SDK resubmits or orphans them).
+/// The tip on chain must be one of our entries. Returns how many entries of ours the data dir
+/// holds after that tip: publishes still in flight, or batches a reorg orphaned while this
+/// node was down; the caller reconciles them (`Registry::reconcile_with_chain`).
 pub fn check_channel_on_chain(
     channel: &ChannelOnChain,
     our_key: &[u8; 32],
     registry: &Shared,
     resumed: bool,
-) -> Result<()> {
+) -> Result<usize> {
     let ours = hex::encode(our_key);
     if !channel
         .accredited_keys
@@ -174,19 +175,10 @@ pub fn check_channel_on_chain(
         );
     }
     let after = &entries[at + 1..];
-    if let Some((landed, status)) = after
+    let adopted_here = after
         .iter()
-        .find(|(_, status)| *status != BedrockStatus::Pending)
-    {
-        bail!(
-            "channel tip on chain is {}.., but our batch {} after it is {} here: the Zone \
-             channel state does not match the channel (data from another run?); restore it or \
-             pick another CHANNEL_NAME",
-            &tip[..8],
-            short(landed),
-            format!("{status:?}").to_lowercase()
-        );
-    }
+        .filter(|(_, status)| *status != BedrockStatus::Pending)
+        .count();
     info!(
         "chain: channel tip {}.. is our {} batch{}",
         &tip[..8],
@@ -195,12 +187,16 @@ pub fn check_channel_on_chain(
         } else {
             "last landed"
         },
-        match after.len() {
-            0 => String::new(),
-            n => format!("; {n} batch(es) of ours still in flight"),
+        match (after.len(), adopted_here) {
+            (0, _) => String::new(),
+            (n, 0) => format!("; {n} batch(es) of ours still in flight"),
+            (n, a) => format!(
+                "; {n} batch(es) of ours after it, {a} of them in a Bedrock block here: a \
+                 reorg while this node was down"
+            ),
         }
     );
-    Ok(())
+    Ok(after.len())
 }
 
 /// Say what the final tier made of a finalized entry.
@@ -784,14 +780,49 @@ mod test {
 
     #[test]
     fn test_a_sequencer_restarts_with_a_batch_in_flight() {
-        // The node's tip is our first batch, the second is in flight: start.
-        check_channel_on_chain(&on_chain([1; 32]), &[7; 32], &store(&[[1; 32]]), true).unwrap();
-        // The node's tip is our newest batch: start.
-        check_channel_on_chain(&on_chain([2; 32]), &[7; 32], &store(&[[2; 32]]), true).unwrap();
-        // Our second batch counts as adopted here but the node's tip is still the first: the
-        // data dir is not the channel's state.
-        assert!(
-            check_channel_on_chain(&on_chain([1; 32]), &[7; 32], &store(&[[2; 32]]), true).is_err()
+        // The node's tip is our first batch, the second is in flight: start, one after the tip.
+        assert_eq!(
+            check_channel_on_chain(&on_chain([1; 32]), &[7; 32], &store(&[[1; 32]]), true).unwrap(),
+            1
+        );
+        // The node's tip is our newest batch: start, nothing after it.
+        assert_eq!(
+            check_channel_on_chain(&on_chain([2; 32]), &[7; 32], &store(&[[2; 32]]), true).unwrap(),
+            0
+        );
+        // Our second batch counts as adopted here but the node's tip is still the first: a
+        // reorg while we were down; the caller reconciles the one entry after the tip.
+        let reorged = store(&[[2; 32]]);
+        assert_eq!(
+            check_channel_on_chain(&on_chain([1; 32]), &[7; 32], &reorged, true).unwrap(),
+            1
+        );
+        {
+            let mut registry = reorged.write().unwrap();
+            registry.set_checkpoint(serde_json::json!({
+                "last_msg_id": serde_json::to_value(MsgId::from([2; 32])).unwrap(),
+                "pending_txs": [{"tx": "x"}],
+                "lib": 7
+            }));
+            assert_eq!(registry.reconcile_with_chain([1; 32]), 1);
+            assert_eq!(registry.zone.view().len(), 1);
+            assert_eq!(registry.orphaned_count(), 1);
+            assert!(registry.in_flight().is_none());
+            assert_eq!(registry.covered_to(), 1);
+            let second = registry.next_republish().unwrap();
+            assert_eq!(second.from_lez_block_id, 2);
+            assert!(registry.would_apply(&second).is_ok());
+            let checkpoint = registry.checkpoint().unwrap();
+            assert_eq!(
+                checkpoint["last_msg_id"],
+                serde_json::to_value(MsgId::from([1; 32])).unwrap()
+            );
+            assert_eq!(checkpoint["pending_txs"], serde_json::json!([]));
+            assert_eq!(checkpoint["lib"], 7);
+        }
+        assert_eq!(
+            check_channel_on_chain(&on_chain([1; 32]), &[7; 32], &reorged, true).unwrap(),
+            0
         );
         // No checkpoint: the SDK would chain on the root.
         assert!(

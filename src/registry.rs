@@ -696,6 +696,35 @@ impl Registry {
         self.trim_pending();
     }
 
+    /// The channel's tip on chain is one of our entries and the view holds entries after it:
+    /// they are not on chain (a reorg while this node was down, which the Zone SDK never
+    /// reported). Treated as orphaned: out of the view, their batches queued to publish again
+    /// in order, the Zone SDK checkpoint moved back to the tip (it would chain on them
+    /// otherwise). Returns how many left the view.
+    pub fn reconcile_with_chain(&mut self, tip: [u8; 32]) -> usize {
+        let canonical: Vec<ChannelEntry> = match self
+            .zone
+            .view()
+            .iter()
+            .position(|e| <[u8; 32]>::from(e.msg) == tip)
+        {
+            Some(at) => self.zone.view()[..=at].to_vec(),
+            None => vec![],
+        };
+        self.mark_adopted_up_to(tip);
+        let orphaned = self.apply_zone_conflict(canonical);
+        self.to_republish
+            .extend(orphaned.iter().filter_map(|e| e.batch.clone()));
+        if let Some(fields) = self.checkpoint.as_mut().and_then(Value::as_object_mut) {
+            fields.insert(
+                "last_msg_id".into(),
+                serde_json::to_value(MsgId::from(tip)).expect("a message id serializes"),
+            );
+            fields.insert("pending_txs".into(), json!([]));
+        }
+        orphaned.len()
+    }
+
     /// The whole view at the new tip (`ChannelUpdate::Conflict`); returns the entries the reorg
     /// orphaned: the sequencer's own, to publish again (an indexer publishes nothing and counts
     /// nothing as orphaned).
