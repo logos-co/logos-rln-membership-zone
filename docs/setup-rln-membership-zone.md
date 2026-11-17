@@ -81,7 +81,7 @@ sed -i "s/^FUNDING_PK=.*/FUNDING_PK=$(yq .public_keys.PoWClaim ~/keystore.yaml)/
 | `FUNDING_PK` | | Node wallet key paying the batches (`PoWClaim`) |
 | `MAX_TX_FEE` | 1000000 | Fee cap per publish, atomic units |
 | `PRIORITY_FEE_PERCENT` | 12 | Reserve over the mandatory fee, the excess is a tip; block builders take the mempool FIFO, so it buys nothing on the testnet (SDK default 12) |
-| `CHANNEL_NAME` | `rln-membership-zone:testnet:v0.3.2-2` | Channel id = `sha256(CHANNEL_NAME)`; `CHANNEL_ID` (64 hex) overrides |
+| `CHANNEL_NAME` | `rln-membership-zone:testnet:v0.3.2-3` | Channel id = `sha256(CHANNEL_NAME)`; `CHANNEL_ID` (64 hex) overrides |
 | `PROGRAM_ACCOUNT_ID` | `f048...106a` | Registration program on the testnet LEZ (`HAxY9...4bBw` in base58) |
 | `TREE_ID` | `47b2de4f...b4cf` | Registry the program serves, first field of every event |
 | `FIRST_LEZ_BLOCK_ID` | 49431 | Block the program was deployed in; nothing before it is read |
@@ -116,22 +116,23 @@ What happens, in order:
    only be written by this key. The channel id is `sha256(CHANNEL_NAME)`; there is no
    create step, the first inscription to an unused id creates the channel with the signing
    key as its only accredited key (`posting_timeframe` and `posting_timeout` 0: one writer).
-2. The tree store `data/tree/` (sled) is opened. It holds the tree of the LEZ blocks
-   **finalized** on Bedrock. On a fresh start the node finds the newest LEZ inscription at or
-   below the node's LIB (reading the finalized L1 blocks backwards from it) and builds that tree
-   from `FIRST_LEZ_BLOCK_ID` up to that block with the LEZ Sequencer's `getBlockRange`, pinned
-   by the hash chain to the block Bedrock finalized (a minute); later starts continue from the
-   block the store is at.
+2. The state under `data/` is opened: the tree store `data/tree/` (sled) with the tree of the
+   LEZ blocks **finalized** on Bedrock, and the small files beside it (`reader.json`,
+   `zone.json`, `final.jsonl`, `lez_view.json`). Every start finds the newest LEZ inscription
+   at or below the node's LIB (reading the finalized L1 blocks backwards from it) and fills the
+   tree up to that block with the LEZ Sequencer's `getBlockRange`, pinned by the hash chain to
+   the block Bedrock finalized: from `FIRST_LEZ_BLOCK_ID` on a fresh start (a minute), from the
+   block the store is at after a restart (nothing when it is there already).
 3. Two Zone SDK readers follow Bedrock from the node. One follows the LEZ channel (section 4),
-   from the LIB on a fresh store: the LEZ blocks adopted since are folded over the finalized
-   tree (the head) and kept with the store, the finalized ones move into the tree. Blocks the
+   always from the LIB: the LEZ blocks adopted since are folded over the finalized tree (the
+   head) and kept in `lez_view.json`, the finalized ones move into the tree. Blocks the
    SDK skips (a stream it dropped and reopened, entries it does not echo after a restart) are
    read from the LEZ Sequencer and taken only when they chain on the head and the adopted
    block chains on them. The other follows the Zone channel:
    one with no message on chain yet starts at the LIB (seconds); one with history is walked
    from genesis the first time (30 to 60 minutes on the testnet; a `408 Request Timeout` on a
    backfill page means the node is slow, the SDK retries the page) and from the checkpoint kept
-   in the tree store after that (seconds to minutes). Then `ready` and `LEZ channel ready`.
+   in `zone.json` after that (seconds to minutes). Then `ready` and `LEZ channel ready`.
 4. Every `POLL_SEC` the sequencer checks whether a batch is due: changes from LEZ blocks
    adopted on Bedrock and not covered yet, `HEARTBEAT_SEC` passed without a batch, or none ever
    published; at most one batch in flight. A batch is folded on the sequencer's own head before
@@ -148,8 +149,8 @@ What happens, in order:
    anchor (the slot of the newest final entry) up to the LIB applies what the stream may have
    missed (a restart in between).
 
-Ctrl-C stops it. The next start opens the tree store and continues: both Zone SDK readers from
-their checkpoints, the channel from its final tier and view, the finalized tree from where it
+Ctrl-C stops it. The next start opens the state and continues: the Zone channel from its
+checkpoint, final tier and view, the LEZ channel from the LIB, the finalized tree from where it
 was with the adopted LEZ blocks folded over it again.
 A batch still in flight from the previous run stays so, no second batch is published over it. Events that happened while the sequencer was down are picked up the same way: the
 next batch spans the whole gap.
@@ -159,9 +160,17 @@ next batch spans the whole gap.
 | File | Content | Lose it and |
 | --- | --- | --- |
 | `data/key.hex` | accredited key (the sequencer; an indexer writes none, it signs nothing) | the channel is lost; start a new one with a new `CHANNEL_NAME` |
-| `data/tree/` | sled store: the tree of the finalized LEZ blocks, the adopted LEZ blocks over it, the reader's state, the Zone channel state (final tier, view, anchor), both Zone SDK checkpoints | the sequencer starts fresh: backfill from slot 0, tree rebuilt from LEZ, and on a channel that already has batches the next batch chains on the root and is refused (below) |
+| `data/tree/`, `data/reader.json` | the tree of the finalized LEZ blocks (sled) and the reader's state (memberships, counters, the root after every block that changed the tree); one without the other is refused | rebuilt from LEZ on a fresh start |
+| `data/zone.json`, `data/final.jsonl` | the Zone channel: view, stall, anchor, in-flight publishes, pending changes, the Zone SDK checkpoint (its channel notes left out: this node never spends them); one line per finalized batch, appended | the sequencer starts fresh: backfill from slot 0, and on a channel that already has batches the next batch chains on the root and is refused (below) |
+| `data/lez_view.json` | the adopted LEZ blocks over the finalized tree | the SDK reports them again from the LIB, minutes |
 
-Rule: never delete the tree store on a channel that has batches. The Zone SDK learns the
+Every file is small (bytes per member, per batch, per adopted block) and written only when it
+changed; the node logs their sizes at start and warns when one passes a megabyte. The LEZ
+channel keeps no checkpoint on purpose: the SDK's checkpoint carries every note the followed
+channel owns on the ledger, which for the LEZ channel is LEZ's whole deposit set, megabytes
+rewritten at every event.
+
+Rule: never delete the state on a channel that has batches. The Zone SDK learns the
 channel tip from finalized history only (8 to 10 hours behind on the testnet), so without
 the checkpoint it chains the next batch on the root; the chain refuses it (`InvalidParent`),
 silently, and every later batch too. The sequencer checks `GET /channel/:id` on the node at
@@ -176,12 +185,11 @@ that never got mined), change the name and start clean:
 
 ```bash
 sed -i 's/^CHANNEL_NAME=.*/CHANNEL_NAME=rln-membership-zone:testnet:v0.3.2-x/' .env
-rm -rf data/tree
+rm -rf data/tree data/*.json data/*.jsonl
 ```
 
-`key.hex` can stay. The old channel costs nothing abandoned. A tree store written by an
-earlier node version with another store layout is retired the same way: new channel, new
-store, the key stays.
+`key.hex` can stay. The old channel costs nothing abandoned. State written by an earlier node
+version with another layout is retired the same way: new channel, new state, the key stays.
 
 ### Run an indexer
 
@@ -510,8 +518,8 @@ batch stays `in_flight` (block production and mempool propagation).
   restart between reading LEZ and publishing lost them). A channel whose first batch is
   like that cannot be replayed by an indexer: start a new one (section 3).
 - `channel N final ..., M in view ... (checkpoint resumed)` right after changing
-  `CHANNEL_NAME`: the old tree store is still there; stop, `rm -rf data/tree`
-  (keep `key.hex`), start again.
+  `CHANNEL_NAME`: the old state is still there; stop, `rm -rf data/tree data/*.json
+  data/*.jsonl` (keep `key.hex`), start again.
 - `the final tier is frozen at batch msg M (L1 slot S): ...` (WARN) at start, or a batch
   `parked` in the log: a finalized batch did not apply on the final tier (its error says
   which check), every later one parks after it; `/` shows it as `stall`. On the indexer that
@@ -529,7 +537,7 @@ again):
 
 ```bash
 cd ~/logos-rln-membership-zone
-rm -rf data/tree
+rm -rf data/tree data/*.json data/*.jsonl
 rm -rf data-indexer
 ```
 

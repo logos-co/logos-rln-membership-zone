@@ -11,9 +11,10 @@
 //! Bedrock. Both serve the registry over HTTP (`http.rs`).
 //!
 //! Everything a node must keep lives in `--data-dir`: `key.hex` (the sequencer's accredited
-//! key; the channel id is `sha256(CHANNEL_NAME)`; an indexer has none, it signs nothing) and
-//! `tree/`, a sled store holding the tree of the finalized LEZ blocks, the
-//! reader's state, the Zone channel state and both Zone SDK checkpoints.
+//! key; the channel id is `sha256(CHANNEL_NAME)`; an indexer has none, it signs nothing),
+//! `tree/` (sled, the tree of the finalized LEZ blocks) and the small state files beside it,
+//! each written when it changed (`registry.rs`): `reader.json`, `zone.json`, `final.jsonl`,
+//! `lez_view.json`. The LEZ channel keeps no checkpoint: every start begins at the LIB.
 
 mod batch;
 mod http;
@@ -49,9 +50,7 @@ use tracing::{error, info, warn};
 use crate::{
     http::{AppState, Shared},
     lez::LezSequencer,
-    lez_sync::{
-        apply_lez_finalized, lez_checkpoint_at_lib, on_lez_blocks_processed, set_lez_checkpoint,
-    },
+    lez_sync::{apply_lez_finalized, lez_checkpoint_at_lib, on_lez_blocks_processed},
     registry::Registry,
     zone_sync::{
         FINALITY_SCAN_SEC, ZoneChannel, channel_on_chain, check_channel_on_chain,
@@ -108,7 +107,7 @@ struct Args {
     /// Name of the Zone channel: its id is `sha256(name)`.
     #[arg(
         long,
-        default_value = "rln-membership-zone:testnet:v0.3.2-2",
+        default_value = "rln-membership-zone:testnet:v0.3.2-3",
         env = "CHANNEL_NAME"
     )]
     channel_name: String,
@@ -335,61 +334,33 @@ async fn main() -> Result<()> {
         checkpoint,
     );
 
-    // The Zone SDK on the LEZ channel, read-only: a throwaway key, nothing to fund. A fresh
-    // store starts at the LIB, on the newest finalized LEZ inscription, with the finalized tree
-    // built up to that block from the LEZ Sequencer (pinned by the block's hash).
-    let lez_checkpoint: Option<SequencerCheckpoint> = registry
-        .read()
-        .expect("registry lock")
-        .lez_checkpoint()
-        .map(|c| serde_json::from_value(c.clone()))
-        .transpose()
-        .context("LEZ channel checkpoint in the tree store")?;
-    let lez_checkpoint = match lez_checkpoint {
-        Some(checkpoint) => checkpoint,
-        None => {
-            let (checkpoint, anchor) =
-                lez_checkpoint_at_lib(&node, lez_channel_id, &source).await?;
-            let final_block_id = registry
-                .read()
-                .expect("registry lock")
-                .lez
-                .final_reader()
-                .lez_block_id;
-            if final_block_id >= args.first_lez_block_id {
-                bail!(
-                    "the finalized tree is at LEZ block {final_block_id} but the LEZ channel has \
-                     no checkpoint: start once with REBUILD_TREE=true"
-                );
-            }
-            info!(
-                "lez: finalized LEZ block {} at the LIB (slot {}); reading the finalized \
-                 history up to it from the LEZ Sequencer...",
-                anchor.block_id(),
-                u64::from(checkpoint.lib_slot)
+    // The Zone SDK on the LEZ channel, read-only: a throwaway key, nothing to fund, and no
+    // checkpoint on disk: every start begins at the LIB, on the newest finalized LEZ
+    // inscription, and the finalized tree is filled up to that block from the LEZ Sequencer
+    // under the block's hash (nothing to do when the tree is already there). The SDK then
+    // reports the adopted blocks from the LIB on; the ones persisted come back at once.
+    let (lez_checkpoint, anchor) = lez_checkpoint_at_lib(&node, lez_channel_id, &source).await?;
+    info!(
+        "lez: finalized LEZ block {} at the LIB (slot {})",
+        anchor.block_id(),
+        u64::from(lez_checkpoint.lib_slot)
+    );
+    if anchor.block_id() >= args.first_lez_block_id {
+        apply_lez_finalized(&source, &registry, &anchor).await?;
+        let final_block_id = registry
+            .read()
+            .expect("registry lock")
+            .lez
+            .final_reader()
+            .lez_block_id;
+        if final_block_id < anchor.block_id() {
+            bail!(
+                "the LEZ Sequencer did not serve the history up to LEZ block {}: start again",
+                anchor.block_id()
             );
-            if anchor.block_id() >= args.first_lez_block_id {
-                // The history before it comes from the LEZ Sequencer, under its hash.
-                apply_lez_finalized(&source, &registry, &anchor).await?;
-                let final_block_id = registry
-                    .read()
-                    .expect("registry lock")
-                    .lez
-                    .final_reader()
-                    .lez_block_id;
-                if final_block_id != anchor.block_id() {
-                    bail!(
-                        "the LEZ Sequencer did not serve the history up to LEZ block {}: start \
-                         again",
-                        anchor.block_id()
-                    );
-                }
-            }
-            set_lez_checkpoint(&registry, &checkpoint)?;
-            registry.write().expect("registry lock").save()?;
-            checkpoint
         }
-    };
+        registry.write().expect("registry lock").save()?;
+    }
     let mut lez_sdk = ZoneSequencer::init_with_config(
         lez_channel_id,
         reader_key(),
@@ -426,7 +397,16 @@ async fn main() -> Result<()> {
             registry.head().lez_block_id
         );
         info!("http: http://{}", args.http_addr);
-        info!("data: {}", args.data_dir.display());
+        info!(
+            "data: {} ({})",
+            args.data_dir.display(),
+            registry
+                .state_sizes()
+                .iter()
+                .map(|(name, size)| format!("{name} {} KB", size / 1024))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         info!(
             "channel: {} final (final msg {}), {} in view, covered to LEZ block {}, first \
              block {}{}",
@@ -506,11 +486,10 @@ async fn main() -> Result<()> {
                         }
                         lez_ready = true;
                     }
-                    Event::BlocksProcessed { checkpoint, channel_update, finalized, .. } => {
+                    Event::BlocksProcessed { channel_update, finalized, .. } => {
                         on_lez_blocks_processed(
                             &source,
                             &registry,
-                            &checkpoint,
                             &channel_update,
                             &finalized,
                         )

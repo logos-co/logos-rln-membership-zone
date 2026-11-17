@@ -1,22 +1,31 @@
 //! One node's state: the LEZ chain as the Zone SDK reports it (`LezChain`: the finalized tree
 //! on disk, the adopted blocks folded over it), the Zone channel as the SDK reports it
-//! (`ZoneChain`), the changes no batch carries yet, and the two SDK checkpoints. All of it
-//! lives in the tree store's metadata, so a restart opens the store and continues.
+//! (`ZoneChain`), the changes no batch carries yet, and the Zone SDK checkpoint on the Zone
+//! channel. It lives under the data dir in small pieces, each written only when it changed:
+//! the tree store (`tree/`, sled), the reader's state (`reader.json`), the Zone channel
+//! (`zone.json`, plus `final.jsonl`, one line per finalized entry, appended) and the adopted
+//! LEZ blocks (`lez_view.json`). The LEZ channel has no checkpoint on disk: a start computes
+//! one at the LIB, and the finalized tree is filled up to it from the LEZ Sequencer under the
+//! hash chain.
 
-use std::path::Path;
+use std::{
+    fs,
+    io::Write as _,
+    path::{Path, PathBuf},
+};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use lb_core::mantle::ops::channel::MsgId;
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     batch::{Batch, Change},
     lez::{Block, StoredBlock},
     lez_chain::{Adopted, Finalized, LezChain},
-    reader::{BlockIngestError, EMPTY_ROOT, Reader},
+    reader::{BlockIngestError, EMPTY_ROOT, READER_FILE, Reader, TREE_DIR, write_atomic},
     zone_chain::{
         AcceptOutcome, BatchIngestError, ChannelEntry, FinalEntry, Judge, PublishRecord,
         StallReason, Tip, ZoneChain,
@@ -61,12 +70,110 @@ pub struct Contradicted {
     pub derived: [u8; 32],
 }
 
-/// A pending change as the tree store keeps it: the LEZ block that made it and the change,
-/// prost in hex.
+/// A pending change as `zone.json` keeps it: the LEZ block that made it and the change, prost
+/// in hex.
 #[derive(Serialize, Deserialize)]
 struct PendingChangeRecord {
     block: u64,
     change: String,
+}
+
+/// The Zone channel side of the state (`zone.json`): the view and what goes with it. Small,
+/// rewritten when it changed (the checkpoint moves with every Zone SDK event).
+#[derive(Serialize, Deserialize)]
+struct ZoneState {
+    first_lez_block_id: u64,
+    /// The view in its persisted form (`ZoneChain::encode_view`), hex.
+    view: String,
+    stall: Option<StallReason>,
+    anchor: Option<ZoneAnchorRecord>,
+    /// Publishes of ours not seen in a Bedrock block yet, hex, in publish order.
+    own_pending: Vec<String>,
+    orphaned: u64,
+    pending_changes: Vec<PendingChangeRecord>,
+    /// The Zone SDK checkpoint on the Zone channel, its `channel_notes` emptied.
+    checkpoint: Option<Value>,
+}
+
+/// The Zone channel state file under a data dir.
+pub const ZONE_FILE: &str = "zone.json";
+/// The finalized entries of the Zone channel under a data dir: one JSON line each, appended.
+pub const FINAL_FILE: &str = "final.jsonl";
+/// The adopted LEZ blocks under a data dir.
+pub const LEZ_VIEW_FILE: &str = "lez_view.json";
+
+/// What a data dir held when the registry opened.
+struct StateFiles {
+    dir: Option<PathBuf>,
+    zone: Option<ZoneState>,
+    zone_bytes: Vec<u8>,
+    final_entries: Vec<FinalEntry>,
+    lez_view: Vec<StoredBlock>,
+    lez_view_bytes: Vec<u8>,
+}
+
+impl StateFiles {
+    #[cfg(test)]
+    fn none() -> Self {
+        Self {
+            dir: None,
+            zone: None,
+            zone_bytes: vec![],
+            final_entries: vec![],
+            lez_view: vec![],
+            lez_view_bytes: vec![],
+        }
+    }
+
+    fn read(dir: &Path) -> Result<Self> {
+        let read = |name: &str| -> Result<Option<Vec<u8>>> {
+            let path = dir.join(name);
+            if !path.exists() {
+                return Ok(None);
+            }
+            fs::read(&path)
+                .map(Some)
+                .with_context(|| format!("read {}", path.display()))
+        };
+        let zone_bytes = read(ZONE_FILE)?.unwrap_or_default();
+        let zone = (!zone_bytes.is_empty())
+            .then(|| serde_json::from_slice(&zone_bytes).context(ZONE_FILE))
+            .transpose()?;
+        let lez_view_bytes = read(LEZ_VIEW_FILE)?.unwrap_or_default();
+        let lez_view = if lez_view_bytes.is_empty() {
+            vec![]
+        } else {
+            serde_json::from_slice(&lez_view_bytes).context(LEZ_VIEW_FILE)?
+        };
+        // One finalized entry per line; a torn last line (a crash while appending) is dropped
+        // with a warning, the entry comes again from the SDK or the finality scan.
+        let mut final_entries = vec![];
+        if let Some(bytes) = read(FINAL_FILE)? {
+            for (i, line) in String::from_utf8_lossy(&bytes).lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<FinalEntry>(line) {
+                    Ok(entry) => final_entries.push(entry),
+                    Err(e) => {
+                        warn!(
+                            "{FINAL_FILE} line {}: {e}; the line and the rest are dropped",
+                            i + 1
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            dir: Some(dir.to_path_buf()),
+            zone,
+            zone_bytes,
+            final_entries,
+            lez_view,
+            lez_view_bytes,
+        })
+    }
 }
 
 pub struct Registry {
@@ -84,19 +191,25 @@ pub struct Registry {
     /// Publishes of ours a Bedrock reorg dropped (the SDK's `orphaned`), published again.
     orphaned: u64,
     anchor: Option<ZoneAnchorRecord>,
-    /// The Zone SDK checkpoint on the Zone channel, as JSON.
+    /// The Zone SDK checkpoint on the Zone channel, as JSON, `channel_notes` emptied.
     checkpoint: Option<Value>,
-    /// The Zone SDK checkpoint on the LEZ channel, as JSON.
-    lez_checkpoint: Option<Value>,
     /// The indexer judges every batch against its tree; the sequencer trusts its own.
     indexer: bool,
+    /// Where the state files live; `None` for a temporary registry, which persists nothing.
+    state_dir: Option<PathBuf>,
+    /// What `zone.json` and `lez_view.json` hold, so unchanged state is not written again.
+    written_zone: Vec<u8>,
+    written_lez_view: Vec<u8>,
+    /// How many final entries `final.jsonl` holds, and whether an entry it holds changed
+    /// (the judge decided one) so the file is written whole again.
+    final_written: usize,
+    final_rewrite: bool,
 }
 
 impl Registry {
-    /// Open the tree store under `data_dir` and the Zone channel state kept with it; a fresh store
-    /// starts at `first_lez_block_id`. With `rebuild`, the tree and the reader's state are
-    /// dropped and read again from LEZ (the LEZ channel checkpoint with them) while the Zone
-    /// channel state and its checkpoint are kept.
+    /// Open the state under `data_dir` (created when missing); a fresh one starts at
+    /// `first_lez_block_id`. With `rebuild`, the tree, the reader's state and the adopted
+    /// LEZ blocks are dropped and read again from LEZ, while the Zone channel state is kept.
     pub fn open(
         data_dir: &Path,
         tree_id: [u8; 32],
@@ -104,129 +217,107 @@ impl Registry {
         rebuild: bool,
         indexer: bool,
     ) -> Result<Self> {
-        let dir = data_dir.join("tree");
-        let mut kept = None;
-        if rebuild && dir.exists() {
-            let extra = Reader::take_extra(&dir)?;
-            std::fs::remove_dir_all(&dir).context("drop the tree store")?;
-            kept = Some(extra);
+        fs::create_dir_all(data_dir).with_context(|| format!("create {}", data_dir.display()))?;
+        if rebuild {
+            let tree = data_dir.join(TREE_DIR);
+            if tree.exists() {
+                fs::remove_dir_all(&tree).context("drop the tree store")?;
+            }
+            for name in [READER_FILE, LEZ_VIEW_FILE] {
+                let path = data_dir.join(name);
+                if path.exists() {
+                    fs::remove_file(&path).with_context(|| format!("drop {}", path.display()))?;
+                }
+            }
             info!("tree store dropped; the tree is read again from LEZ");
         }
-        let (mut final_reader, extra) =
-            Reader::open(&dir, tree_id, first_lez_block_id.saturating_sub(1))?;
-        let extra = match kept {
-            Some(kept) => {
-                final_reader.persist(kept.clone())?;
-                kept
-            }
-            None => extra,
-        };
-        Self::from_parts(final_reader, &extra, first_lez_block_id, rebuild, indexer)
+        let final_reader = Reader::open(data_dir, tree_id, first_lez_block_id.saturating_sub(1))?;
+        let files = StateFiles::read(data_dir)?;
+        Self::from_parts(final_reader, files, first_lez_block_id, indexer)
     }
 
-    /// A throwaway store, for tests.
+    /// A throwaway store, for tests: nothing is written.
     #[cfg(test)]
     pub fn open_temporary(first_lez_block_id: u64, indexer: bool) -> Result<Self> {
-        let (final_reader, extra) =
-            Reader::open_temporary([0; 32], first_lez_block_id.saturating_sub(1))?;
-        Self::from_parts(final_reader, &extra, first_lez_block_id, false, indexer)
+        let final_reader = Reader::open_temporary([0; 32], first_lez_block_id.saturating_sub(1))?;
+        Self::from_parts(
+            final_reader,
+            StateFiles::none(),
+            first_lez_block_id,
+            indexer,
+        )
     }
 
     fn from_parts(
         final_reader: Reader,
-        extra: &Value,
+        files: StateFiles,
         first_lez_block_id: u64,
-        rebuild: bool,
         indexer: bool,
     ) -> Result<Self> {
-        let get = |key: &str| extra.get(key).filter(|v| !v.is_null()).cloned();
-        let final_entries: Vec<FinalEntry> = get("final")
-            .map(serde_json::from_value)
-            .transpose()
-            .context("final entries in the tree store")?
-            .unwrap_or_default();
-        let stall: Option<StallReason> = get("stall")
-            .map(serde_json::from_value)
-            .transpose()
-            .context("stall record in the tree store")?;
-        let view = get("view")
-            .and_then(|v| v.as_str().map(hex::decode))
-            .transpose()
-            .context("view in the tree store")?
-            .unwrap_or_default();
-        if let Some(stored) = get("first_lez_block_id").and_then(|v| v.as_u64())
-            && stored != first_lez_block_id
+        if let Some(zone) = &files.zone
+            && zone.first_lez_block_id != first_lez_block_id
         {
-            anyhow::bail!(
-                "the tree store starts at LEZ block {stored}, FIRST_LEZ_BLOCK_ID says \
-                 {first_lez_block_id}: another registry, or another data dir"
+            bail!(
+                "{ZONE_FILE} starts at LEZ block {}, FIRST_LEZ_BLOCK_ID says {first_lez_block_id}: \
+                 another registry, or another data dir",
+                zone.first_lez_block_id
             );
         }
         let mut lez = LezChain::new(final_reader)?;
         // The adopted LEZ blocks of the last run: the SDK does not echo the entries it already
-        // holds, so the view comes back from the store, its changes pending again below.
-        let mut restored_view = vec![];
-        if !rebuild && let Some(stored) = get("lez_view") {
-            let stored: Vec<StoredBlock> =
-                serde_json::from_value(stored).context("adopted LEZ blocks in the tree store")?;
-            let blocks = stored
-                .iter()
-                .map(Block::from_stored)
-                .collect::<Result<Vec<_>>>()?;
-            restored_view = lez.restore_view(&blocks)?;
-        }
-        let judge = indexer.then_some(&lez as &dyn Judge);
-        let zone = ZoneChain::restore(first_lez_block_id, final_entries, stall, &view, judge)?;
-        let own_pending: Vec<String> = get("own_pending")
-            .map(serde_json::from_value)
-            .transpose()
-            .context("own pending publishes in the tree store")?
-            .unwrap_or_default();
-        let own_pending = own_pending
+        // holds, so the view comes back from the file, its changes pending again below.
+        let blocks = files
+            .lez_view
             .iter()
-            .map(|h| crate::reader::parse_32(h))
-            .collect::<Result<_>>()?;
-        let orphaned = get("orphaned").and_then(|v| v.as_u64()).unwrap_or(0);
-        let anchor = get("anchor")
-            .map(serde_json::from_value)
-            .transpose()
-            .context("anchor in the tree store")?;
-        let checkpoint = get("checkpoint");
-        // A rebuild reads the finalized LEZ blocks again from the start: the LEZ channel is
-        // read again from the LIB too.
-        let lez_checkpoint = if rebuild { None } else { get("lez_checkpoint") };
+            .map(Block::from_stored)
+            .collect::<Result<Vec<_>>>()?;
+        let restored_view = lez.restore_view(&blocks)?;
+        let view = files
+            .zone
+            .as_ref()
+            .map(|z| hex::decode(&z.view).context("view in zone.json"))
+            .transpose()?
+            .unwrap_or_default();
+        let stall = files.zone.as_ref().and_then(|z| z.stall.clone());
+        let final_written = files.final_entries.len();
+        let judge = indexer.then_some(&lez as &dyn Judge);
+        let zone =
+            ZoneChain::restore(first_lez_block_id, files.final_entries, stall, &view, judge)?;
+        let own_pending = files.zone.as_ref().map_or(Ok(vec![]), |z| {
+            z.own_pending
+                .iter()
+                .map(|h| crate::reader::parse_32(h))
+                .collect::<Result<Vec<_>>>()
+        })?;
         // The changes applied but not yet in a batch survive a restart with the tree they
-        // changed, as far as the final tier goes (the adopted blocks come back from the SDK and
-        // bring theirs again); a rebuild derives them again from LEZ.
+        // changed, as far as the final tier goes (the adopted blocks bring theirs again below).
         let final_block_id = lez.final_reader().lez_block_id;
-        let pending_changes = match get("pending_changes") {
-            Some(encoded) if !rebuild => {
-                let encoded: Vec<PendingChangeRecord> =
-                    serde_json::from_value(encoded).context("pending changes in the tree store")?;
-                encoded
-                    .iter()
-                    .map(|record| {
-                        let bytes =
-                            hex::decode(&record.change).context("pending change is not hex")?;
-                        let change = Change::decode(bytes.as_slice()).context("pending change")?;
-                        Ok((record.block, change))
-                    })
-                    .filter(|r| !r.as_ref().is_ok_and(|(block, _)| *block > final_block_id))
-                    .collect::<Result<_>>()?
-            }
-            _ => vec![],
-        };
+        let pending_changes = files.zone.as_ref().map_or(Ok(vec![]), |z| {
+            z.pending_changes
+                .iter()
+                .filter(|record| record.block <= final_block_id)
+                .map(|record| {
+                    let bytes = hex::decode(&record.change).context("pending change is not hex")?;
+                    let change = Change::decode(bytes.as_slice()).context("pending change")?;
+                    Ok((record.block, change))
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
         let mut registry = Self {
             lez,
             zone,
             first_lez_block_id,
             pending_changes,
             own_pending,
-            orphaned,
-            anchor,
-            checkpoint,
-            lez_checkpoint,
+            orphaned: files.zone.as_ref().map_or(0, |z| z.orphaned),
+            anchor: files.zone.as_ref().and_then(|z| z.anchor),
+            checkpoint: files.zone.as_ref().and_then(|z| z.checkpoint.clone()),
             indexer,
+            state_dir: files.dir,
+            written_zone: files.zone_bytes,
+            written_lez_view: files.lez_view_bytes,
+            final_written,
+            final_rewrite: false,
         };
         for (block_id, changes) in restored_view {
             registry.add_pending(block_id, changes);
@@ -234,30 +325,77 @@ impl Registry {
         Ok(registry)
     }
 
-    /// Write everything into the tree store.
+    /// Write what changed: the reader's state, `zone.json`, `lez_view.json`, the finalized
+    /// entries appended to `final.jsonl`. A temporary registry writes nothing.
     pub fn save(&mut self) -> Result<()> {
-        let pending_changes: Vec<PendingChangeRecord> = self
-            .pending_changes
-            .iter()
-            .map(|(block, change)| PendingChangeRecord {
-                block: *block,
-                change: hex::encode(change.encode_to_vec()),
-            })
-            .collect();
-        let extra = json!({
-            "first_lez_block_id": self.first_lez_block_id,
-            "view": hex::encode(self.zone.encode_view()),
-            "lez_view": self.lez.view().iter().map(Block::to_stored).collect::<Vec<_>>(),
-            "final": self.zone.final_entries(),
-            "stall": self.zone.stall(),
-            "anchor": self.anchor,
-            "own_pending": self.own_pending.iter().map(hex::encode).collect::<Vec<_>>(),
-            "orphaned": self.orphaned,
-            "pending_changes": pending_changes,
-            "checkpoint": self.checkpoint,
-            "lez_checkpoint": self.lez_checkpoint,
-        });
-        self.lez.persist(extra)
+        self.lez.persist()?;
+        let Some(dir) = self.state_dir.clone() else {
+            return Ok(());
+        };
+        let zone = ZoneState {
+            first_lez_block_id: self.first_lez_block_id,
+            view: hex::encode(self.zone.encode_view()),
+            stall: self.zone.stall().cloned(),
+            anchor: self.anchor,
+            own_pending: self.own_pending.iter().map(hex::encode).collect(),
+            orphaned: self.orphaned,
+            pending_changes: self
+                .pending_changes
+                .iter()
+                .map(|(block, change)| PendingChangeRecord {
+                    block: *block,
+                    change: hex::encode(change.encode_to_vec()),
+                })
+                .collect(),
+            checkpoint: self.checkpoint.clone(),
+        };
+        let bytes = serde_json::to_vec(&zone)?;
+        if bytes != self.written_zone {
+            write_sized(&dir.join(ZONE_FILE), &bytes)?;
+            self.written_zone = bytes;
+        }
+        let stored: Vec<StoredBlock> = self.lez.view().iter().map(Block::to_stored).collect();
+        let bytes = serde_json::to_vec(&stored)?;
+        if bytes != self.written_lez_view {
+            write_sized(&dir.join(LEZ_VIEW_FILE), &bytes)?;
+            self.written_lez_view = bytes;
+        }
+        let final_entries = self.zone.final_entries();
+        let path = dir.join(FINAL_FILE);
+        if self.final_rewrite || final_entries.len() < self.final_written {
+            let mut bytes = vec![];
+            for entry in final_entries {
+                serde_json::to_writer(&mut bytes, entry)?;
+                bytes.push(b'\n');
+            }
+            write_sized(&path, &bytes)?;
+            self.final_rewrite = false;
+        } else if final_entries.len() > self.final_written {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&path)
+                .with_context(|| format!("open {}", path.display()))?;
+            for entry in &final_entries[self.final_written..] {
+                let mut line = serde_json::to_vec(entry)?;
+                line.push(b'\n');
+                file.write_all(&line)
+                    .with_context(|| format!("append to {}", path.display()))?;
+            }
+        }
+        self.final_written = final_entries.len();
+        Ok(())
+    }
+
+    /// The size of every state file, for the start-up report.
+    pub fn state_sizes(&self) -> Vec<(&'static str, u64)> {
+        let Some(dir) = &self.state_dir else {
+            return vec![];
+        };
+        [READER_FILE, ZONE_FILE, FINAL_FILE, LEZ_VIEW_FILE]
+            .into_iter()
+            .map(|name| (name, fs::metadata(dir.join(name)).map_or(0, |m| m.len())))
+            .collect()
     }
 
     pub fn close(&mut self) -> Result<()> {
@@ -268,16 +406,14 @@ impl Registry {
         self.checkpoint.as_ref()
     }
 
-    pub fn set_checkpoint(&mut self, checkpoint: Value) {
+    /// The Zone SDK checkpoint on the Zone channel, kept without its `channel_notes`: the
+    /// notes the channel owns on the ledger, which only a withdraw spends and this node never
+    /// does; the SDK restores from a checkpoint without them (and the set can be large).
+    pub fn set_checkpoint(&mut self, mut checkpoint: Value) {
+        if let Some(fields) = checkpoint.as_object_mut() {
+            fields.insert("channel_notes".into(), json!([]));
+        }
         self.checkpoint = Some(checkpoint);
-    }
-
-    pub fn lez_checkpoint(&self) -> Option<&Value> {
-        self.lez_checkpoint.as_ref()
-    }
-
-    pub fn set_lez_checkpoint(&mut self, checkpoint: Value) {
-        self.lez_checkpoint = Some(checkpoint);
     }
 
     /// The tree at the newest adopted LEZ block: what the API serves and the sequencer batches.
@@ -524,9 +660,13 @@ impl Registry {
         }
     }
 
-    /// The indexer folds again what the judge could not decide: LEZ read further.
+    /// The indexer folds again what the judge could not decide: LEZ read further. A decision
+    /// changes finalized entries already on disk, so `final.jsonl` is written whole again.
     pub fn retry_folds(&mut self) -> usize {
         let decided = self.zone.retry_folds(Some(&self.lez));
+        if decided > 0 {
+            self.final_rewrite = true;
+        }
         self.trim_pending();
         decided
     }
@@ -560,6 +700,19 @@ impl Registry {
         });
         final_entries.chain(view).collect()
     }
+}
+
+/// `write_atomic`, and a warning when one state file grows past a megabyte: the state is
+/// meant to stay small (bytes per member, per batch, per adopted block).
+fn write_sized(path: &Path, bytes: &[u8]) -> Result<()> {
+    if bytes.len() > 1 << 20 {
+        warn!(
+            "{} is {} KB: the state should stay small, look at what grows",
+            path.display(),
+            bytes.len() / 1024
+        );
+    }
+    write_atomic(path, bytes)
 }
 
 #[cfg(test)]
@@ -707,8 +860,9 @@ mod test {
             );
             assert_eq!(registry.head().lez_block_id, 3);
             assert_eq!(registry.pending_changes.len(), 2);
-            registry.set_checkpoint(json!({"lib": 7}));
-            registry.set_lez_checkpoint(json!({"lib": 8}));
+            registry.set_checkpoint(
+                json!({"lib": 7, "channel_notes": [{"note_id": "aa", "value": 5}]}),
+            );
             registry.save().unwrap();
             registry.close().unwrap();
         }
@@ -722,8 +876,11 @@ mod test {
             assert_eq!(registry.head().lez_block_id, 3);
             assert_eq!(registry.lez.view().len(), 1);
             assert_eq!(registry.pending_changes.len(), 2);
-            assert_eq!(registry.checkpoint(), Some(&json!({"lib": 7})));
-            assert_eq!(registry.lez_checkpoint(), Some(&json!({"lib": 8})));
+            // The checkpoint comes back without the channel notes, which this node never spends.
+            assert_eq!(
+                registry.checkpoint(),
+                Some(&json!({"lib": 7, "channel_notes": []}))
+            );
             // The next batch continues from the view's tip up to the head.
             let next = registry.next_batch().unwrap();
             assert_eq!((next.from_lez_block_id, next.to_lez_block_id), (2, 3));
@@ -754,6 +911,18 @@ mod test {
             assert_eq!(registry.zone.final_tip().unwrap().to_lez_block_id, 1);
             assert_eq!(registry.anchor().unwrap().slot, 100);
             assert!(registry.zone.view().is_empty());
+            // The state on disk: four small files, one line per finalized entry.
+            for name in [READER_FILE, ZONE_FILE, FINAL_FILE, LEZ_VIEW_FILE] {
+                assert!(dir.join(name).exists(), "{name}");
+            }
+            let lines = std::fs::read_to_string(dir.join(FINAL_FILE)).unwrap();
+            assert_eq!(lines.lines().count(), 1);
+            assert!(
+                registry
+                    .state_sizes()
+                    .iter()
+                    .all(|(_, size)| *size < 10_000)
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

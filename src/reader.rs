@@ -19,7 +19,8 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    path::Path,
+    fs,
+    path::{Path, PathBuf},
     sync::LazyLock,
 };
 
@@ -188,9 +189,11 @@ pub struct ProofPath {
     pub identity_path_index: Vec<u8>,
 }
 
-/// What the tree store's metadata holds: the reader's state and its owner's `extra`.
+/// The reader's state beside the tree (`reader.json`): where it is, what it counted, every
+/// membership, the root after every block that changed the tree. Small (bytes per member and
+/// per block that changed the tree), rewritten when a block was applied.
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct Meta {
+struct ReaderState {
     tree_id: String,
     lez_block_id: u64,
     /// Hash of the last LEZ block applied, hex; the next block must chain on it.
@@ -202,11 +205,15 @@ struct Meta {
     /// The root after every LEZ block that changed the tree, by block id (as a string, JSON
     /// keys), root hex.
     roots_by_block: BTreeMap<String, String>,
-    extra: Value,
 }
 
+/// The tree store under a data dir.
+pub const TREE_DIR: &str = "tree";
+/// The reader's state file under a data dir.
+pub const READER_FILE: &str = "reader.json";
+
 pub struct Reader {
-    /// The registry this reader follows, stamped on the store so another registry's
+    /// The registry this reader follows, stamped on the state so another registry's
     /// sequencer cannot open it.
     tree_id: [u8; 32],
     tree: PmTree<SledDB, PoseidonHash>,
@@ -222,46 +229,47 @@ pub struct Reader {
     /// The root after every LEZ block that changed the tree: what the tree was at any block
     /// (`root_at`), to check a batch's root against.
     roots_by_block: BTreeMap<u64, [u8; 32]>,
+    /// `reader.json`; `None` for a temporary reader, which persists nothing.
+    state_path: Option<PathBuf>,
+    /// The bytes `persist` wrote last, so an unchanged state is not written again.
+    written: Vec<u8>,
 }
 
 impl Reader {
-    /// Open the tree store at `dir` (created when missing). `lez_block_id` is where a
-    /// fresh reader starts; a store that already holds a reader keeps its own. Returns the
-    /// `extra` its owner persisted last.
-    pub fn open(dir: &Path, tree_id: [u8; 32], lez_block_id: u64) -> Result<(Self, Value)> {
-        let config = PmTreeSledConfig::new()
-            .path(dir.to_path_buf())
-            .temporary(false)
-            .build()
-            .with_context(|| format!("tree store at {}", dir.display()))?;
-        Self::open_with(config, tree_id, lez_block_id)
-    }
-
-    /// Only the owner's `extra` of the store at `dir`, read off the raw metadata so a store
-    /// written by an older layout still gives it up (for a rebuild).
-    pub fn take_extra(dir: &Path) -> Result<Value> {
-        let config = PmTreeSledConfig::new()
-            .path(dir.to_path_buf())
-            .temporary(false)
-            .build()
-            .with_context(|| format!("tree store at {}", dir.display()))?;
-        let mut tree = <PmTree<SledDB, PoseidonHash> as ZerokitMerkleTree>::new(
-            TREE_DEPTH,
-            Fr::default(),
-            config,
-        )
-        .context("open the tree store")?;
-        let bytes = tree.metadata().unwrap_or_default();
-        tree.close().context("close the tree store")?;
-        if bytes.is_empty() {
-            return Ok(Value::Null);
+    /// Open the tree store `data_dir/tree` and the reader's state `data_dir/reader.json`
+    /// (both created when missing). `lez_block_id` is where a fresh reader starts; a store
+    /// that already holds a reader keeps its own. A tree without a state file is refused: it
+    /// was written by another layout (or the file was lost), start with a fresh data dir.
+    pub fn open(data_dir: &Path, tree_id: [u8; 32], lez_block_id: u64) -> Result<Self> {
+        let dir = data_dir.join(TREE_DIR);
+        let state_path = data_dir.join(READER_FILE);
+        if dir.exists() != state_path.exists() {
+            bail!(
+                "{} holds {} but not {}: another layout, or a file was lost; start with a fresh \
+                 DATA_DIR",
+                data_dir.display(),
+                if dir.exists() { TREE_DIR } else { READER_FILE },
+                if dir.exists() { READER_FILE } else { TREE_DIR }
+            );
         }
-        let meta: Value = serde_json::from_slice(&bytes).context("tree store metadata")?;
-        Ok(meta.get("extra").cloned().unwrap_or(Value::Null))
+        let config = PmTreeSledConfig::new()
+            .path(dir.clone())
+            .temporary(false)
+            .build()
+            .with_context(|| format!("tree store at {}", dir.display()))?;
+        let mut reader = Self::open_with(config, tree_id, lez_block_id)?;
+        if state_path.exists() {
+            let bytes =
+                fs::read(&state_path).with_context(|| format!("read {}", state_path.display()))?;
+            reader.restore(&bytes, &state_path)?;
+            reader.written = bytes;
+        }
+        reader.state_path = Some(state_path);
+        Ok(reader)
     }
 
-    /// A throwaway store (in a temporary directory sled removes when closed).
-    pub fn open_temporary(tree_id: [u8; 32], lez_block_id: u64) -> Result<(Self, Value)> {
+    /// A throwaway store (in a temporary directory sled removes when closed), no state file.
+    pub fn open_temporary(tree_id: [u8; 32], lez_block_id: u64) -> Result<Self> {
         let config = PmTreeSledConfig::new().temporary(true).build()?;
         Self::open_with(config, tree_id, lez_block_id)
     }
@@ -270,7 +278,7 @@ impl Reader {
     /// memberships, counters, block, hash and root history. The head of a `LezChain` starts
     /// from this and folds the adopted blocks over it.
     pub fn clone_temporary(&self) -> Result<Self> {
-        let (mut clone, _) = Self::open_temporary(self.tree_id, self.lez_block_id)?;
+        let mut clone = Self::open_temporary(self.tree_id, self.lez_block_id)?;
         for (id, member) in self.active_leaves() {
             let leaf = fr_from_bytes_le(&member.rate_commitment)
                 .map_err(|e| anyhow!("stored leaf of {}: {e}", hex::encode(id)))?;
@@ -294,18 +302,14 @@ impl Reader {
         Ok(clone)
     }
 
-    fn open_with(
-        config: PmTreeSledConfig,
-        tree_id: [u8; 32],
-        lez_block_id: u64,
-    ) -> Result<(Self, Value)> {
+    fn open_with(config: PmTreeSledConfig, tree_id: [u8; 32], lez_block_id: u64) -> Result<Self> {
         let tree = <PmTree<SledDB, PoseidonHash> as ZerokitMerkleTree>::new(
             TREE_DEPTH,
             Fr::default(),
             config,
         )
         .context("open the tree store")?;
-        let mut reader = Self {
+        Ok(Self {
             tree_id,
             tree,
             members: HashMap::new(),
@@ -314,36 +318,44 @@ impl Reader {
             last_block_hash: None,
             lez_timestamp_ms: 0,
             roots_by_block: BTreeMap::new(),
-        };
-        let bytes = reader.tree.metadata().unwrap_or_default();
-        if bytes.is_empty() {
-            return Ok((reader, Value::Null));
-        }
-        let meta: Meta = serde_json::from_slice(&bytes).context("tree store metadata")?;
-        if meta.tree_id != hex::encode(tree_id) {
-            return Err(anyhow!(
-                "the tree store follows registry {}, not {}",
-                meta.tree_id,
-                hex::encode(tree_id)
-            ));
-        }
-        for (id, member) in &meta.members {
-            reader.members.insert(parse_32(id)?, *member);
-        }
-        reader.stats = meta.stats;
-        reader.lez_block_id = meta.lez_block_id;
-        reader.last_block_hash = meta.last_block_hash.as_deref().map(parse_32).transpose()?;
-        reader.lez_timestamp_ms = meta.lez_timestamp_ms;
-        for (block_id, root) in &meta.roots_by_block {
-            let block_id: u64 = block_id.parse().context("root history block id")?;
-            reader.roots_by_block.insert(block_id, parse_32(root)?);
-        }
-        Ok((reader, meta.extra))
+            state_path: None,
+            written: vec![],
+        })
     }
 
-    /// Write the reader's state and its owner's `extra` into the tree store.
-    pub fn persist(&mut self, extra: Value) -> Result<()> {
-        let meta = Meta {
+    /// The state `persist` wrote, read back.
+    fn restore(&mut self, bytes: &[u8], path: &Path) -> Result<()> {
+        let state: ReaderState =
+            serde_json::from_slice(bytes).with_context(|| format!("{}", path.display()))?;
+        if state.tree_id != hex::encode(self.tree_id) {
+            bail!(
+                "{} follows registry {}, not {}",
+                path.display(),
+                state.tree_id,
+                hex::encode(self.tree_id)
+            );
+        }
+        for (id, member) in &state.members {
+            self.members.insert(parse_32(id)?, *member);
+        }
+        self.stats = state.stats;
+        self.lez_block_id = state.lez_block_id;
+        self.last_block_hash = state.last_block_hash.as_deref().map(parse_32).transpose()?;
+        self.lez_timestamp_ms = state.lez_timestamp_ms;
+        for (block_id, root) in &state.roots_by_block {
+            let block_id: u64 = block_id.parse().context("root history block id")?;
+            self.roots_by_block.insert(block_id, parse_32(root)?);
+        }
+        Ok(())
+    }
+
+    /// Write the reader's state to its file, when it changed since the last write. The tree
+    /// itself is in the store already (sled writes through). A temporary reader writes nothing.
+    pub fn persist(&mut self) -> Result<()> {
+        let Some(path) = &self.state_path else {
+            return Ok(());
+        };
+        let state = ReaderState {
             tree_id: hex::encode(self.tree_id),
             lez_block_id: self.lez_block_id,
             last_block_hash: self.last_block_hash.map(hex::encode),
@@ -359,11 +371,13 @@ impl Reader {
                 .iter()
                 .map(|(block_id, root)| (block_id.to_string(), hex::encode(root)))
                 .collect(),
-            extra,
         };
-        self.tree
-            .set_metadata(&serde_json::to_vec(&meta)?)
-            .context("write the tree store metadata")
+        let bytes = serde_json::to_vec(&state)?;
+        if bytes != self.written {
+            write_atomic(path, &bytes)?;
+            self.written = bytes;
+        }
+        Ok(())
     }
 
     /// Flush the store to disk.
@@ -637,8 +651,17 @@ impl Reader {
 }
 
 pub fn parse_32(hex_str: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(hex_str).context("tree store metadata: hex")?;
-    <[u8; 32]>::try_from(bytes).map_err(|_| anyhow!("tree store metadata: not 32 bytes"))
+    let bytes = hex::decode(hex_str).context("state file: hex")?;
+    <[u8; 32]>::try_from(bytes).map_err(|_| anyhow!("state file: not 32 bytes"))
+}
+
+/// Write `bytes` to `path` through a temporary file renamed over it, so a crash leaves either
+/// the old file or the new one, never a torn one.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} over {}", tmp.display(), path.display()))
 }
 
 /// `poseidon(id_commitment, rate_limit)`, the leaf of a membership.
@@ -686,7 +709,7 @@ mod test {
 
     #[test]
     fn test_check_chain_refuses_gaps_disorder_and_a_changed_history() {
-        let (mut reader, _) = Reader::open_temporary([0; 32], 0).unwrap();
+        let mut reader = Reader::open_temporary([0; 32], 0).unwrap();
         let chained = |id: u64, prev: u8, hash: u8| {
             let mut b = block(id, 1_000, vec![]);
             b.header.prev_block_hash = common::HashType([prev; 32]);
@@ -731,7 +754,7 @@ mod test {
     /// history; applying to it leaves the store alone.
     #[test]
     fn test_clone_temporary_matches_the_store() {
-        let (mut reader, _) = Reader::open_temporary([0; 32], 0).unwrap();
+        let mut reader = Reader::open_temporary([0; 32], 0).unwrap();
         reader
             .apply_block(&block(1, 1_000, vec![registered(1, 0, 5_000)]))
             .unwrap();
@@ -754,7 +777,7 @@ mod test {
 
     #[test]
     fn test_register_expire_and_proof_path() {
-        let (mut reader, _) = Reader::open_temporary([0; 32], 0).unwrap();
+        let mut reader = Reader::open_temporary([0; 32], 0).unwrap();
         let empty = reader.root();
         let changes = reader
             .apply_block(&block(1, 1_000, vec![registered(1, 0, 5_000)]))
@@ -778,7 +801,7 @@ mod test {
 
     #[test]
     fn test_extend_after_expiry_puts_the_leaf_back_and_slash_ends_it() {
-        let (mut reader, _) = Reader::open_temporary([0; 32], 0).unwrap();
+        let mut reader = Reader::open_temporary([0; 32], 0).unwrap();
         reader
             .apply_block(&block(1, 1_000, vec![registered(1, 0, 5_000)]))
             .unwrap();
@@ -830,8 +853,7 @@ mod test {
         let dir = std::env::temp_dir().join(format!("zone-sequencer-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let root = {
-            let (mut reader, extra) = Reader::open(&dir, [0; 32], 0).unwrap();
-            assert!(extra.is_null());
+            let mut reader = Reader::open(&dir, [0; 32], 0).unwrap();
             reader
                 .apply_block(&block(
                     1,
@@ -840,19 +862,18 @@ mod test {
                 ))
                 .unwrap();
             reader.apply_block(&block(2, 5_000, vec![])).unwrap();
-            reader.persist(serde_json::json!({ "note": 7 })).unwrap();
+            reader.persist().unwrap();
             let root = reader.root();
             reader.close().unwrap();
             root
         };
         {
-            let (reader, extra) = Reader::open(&dir, [0; 32], 0).unwrap();
+            let reader = Reader::open(&dir, [0; 32], 0).unwrap();
             assert_eq!(reader.root(), root);
             assert_eq!(reader.lez_block_id, 2);
             assert_eq!(reader.active_count(), 1);
             assert_eq!(reader.removed_leaves().len(), 1);
             assert!(reader.proof_path(1).is_some());
-            assert_eq!(extra["note"], 7);
         }
         // Another registry's reader refuses the store (sled holds one lock per store, so the
         // previous reader is dropped first).

@@ -26,15 +26,6 @@ use crate::{
 /// newest LEZ inscription (LEZ inscribes a block every minute or two).
 pub const LEZ_INSCRIPTION_SCAN_PAGES: u64 = 60;
 
-/// The Zone SDK checkpoint on the LEZ channel; written with the state, like `set_checkpoint`.
-pub fn set_lez_checkpoint(registry: &Shared, checkpoint: &SequencerCheckpoint) -> Result<()> {
-    registry
-        .write()
-        .expect("registry lock")
-        .set_lez_checkpoint(serde_json::to_value(checkpoint)?);
-    Ok(())
-}
-
 /// The checkpoint the LEZ channel's reader starts from on a fresh store: at the node's LIB,
 /// on the newest LEZ inscription at or below it (found by reading the finalized L1 blocks
 /// backwards from the LIB, a page at a time), so the SDK walks nothing before. Returns that
@@ -212,11 +203,9 @@ pub async fn adopt_lez_block(
 pub async fn on_lez_blocks_processed(
     source: &LezSequencer,
     registry: &Shared,
-    checkpoint: &SequencerCheckpoint,
     channel_update: &ChannelUpdate,
     finalized: &[FinalizedTx],
 ) -> Result<()> {
-    set_lez_checkpoint(registry, checkpoint)?;
     let decode = |info: &InscriptionInfo| match source.decode_block(&info.payload) {
         Ok(block) => Some(block),
         Err(e) => {

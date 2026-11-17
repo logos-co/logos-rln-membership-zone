@@ -7,7 +7,6 @@
 //! pinned by the hash chain to a block Bedrock finalized.
 
 use anyhow::{Result, bail};
-use serde_json::Value;
 use tracing::warn;
 
 use crate::{
@@ -79,8 +78,8 @@ impl LezChain {
         &self.view
     }
 
-    pub fn persist(&mut self, extra: Value) -> Result<()> {
-        self.final_reader.persist(extra)
+    pub fn persist(&mut self) -> Result<()> {
+        self.final_reader.persist()
     }
 
     pub fn close(&mut self) -> Result<()> {
@@ -267,7 +266,7 @@ mod test {
     }
 
     fn chain() -> LezChain {
-        let (reader, _) = Reader::open_temporary([0; 32], 0).unwrap();
+        let reader = Reader::open_temporary([0; 32], 0).unwrap();
         LezChain::new(reader).unwrap()
     }
 
