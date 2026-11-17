@@ -647,4 +647,4 @@ rm -rf ~/logos-rln-membership-zone/poc
   (section 4); events from the LEZ Sequencer would settle it.
 - Testnet finality (8 to 10 hours) rules out "final" as the only valid-root reference; the
   Zone node serves every root a batch carries and marks the final ones, the consumer picks
-  (RFC Q3).
+  (RFC "Parameters").

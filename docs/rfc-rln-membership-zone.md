@@ -27,8 +27,9 @@ The Zone sequencer computes it and publishes its roots on Bedrock.
 Zone indexers compute it too, check every published root,
 and serve the registry to the RLN Module that RLN-API specifies ("the Module" for short), one in every user's node.
 A Module holds no tree: it proves and validates against the published roots,
-and reads its Merkle proof path and its membership state from a Zone indexer,
-in its own node when it wants to trust nobody.
+and reads its Merkle proof path and its membership state from a Zone node,
+the roots from Bedrock through its own node when it wants to check them,
+and everything from a Zone indexer of its own when it wants to trust nobody.
 
 RLN-API itself does not change; its `logos` namespace binding is filled in as [Module Requirements](#module-requirements) states.
 
@@ -66,7 +67,7 @@ This draft is written against lez-rln and compares with it where that helps a de
 The comparisons are temporary.
 Once the design decisions are settled and the specification is aligned with RLN-API,
 they will be removed, and each repository will implement only its own part.
-They appear in this section and in the [Open Questions](#open-questions).
+They appear in this section and in the [Decisions](#decisions).
 
 ## Semantic
 
@@ -91,7 +92,7 @@ This document adds:
 | Batch | The payload of one `CHANNEL_INSCRIBE` in the Zone channel, carrying the membership-set changes of a contiguous range of LEZ blocks `[from_lez_block_id, to_lez_block_id]`. |
 | Reader | Anything that applies the Derivation Rules to the LEZ blocks and holds the tree: a Zone sequencer or a Zone indexer. |
 | Zone indexer | A Zone sequencer without an accredited key: it derives the tree, checks every batch of the Zone channel against what it derived, and serves the registry to Modules; it runs in any node, as the Module's own node or as a service, and holds no identity. Distinct from the LEZ Indexer. |
-| Registry access | What a Module reads the registry through: a Zone indexer, in its own node or elsewhere; the "registry access" of RLN-API. |
+| Registry access | What a Module reads the registry through, the "registry access" of RLN-API: a Zone node's interface (the Zone sequencer's or a Zone indexer's), the Zone channel on Bedrock through the Module's own node, or a Zone indexer of its own ([Module Requirements](#module-requirements)). |
 | Zone operator | The party that holds the accredited keys of the Zone channel, runs the Zone sequencers, pays their Mantle Transaction fees and receives `registration_fee` at `operator_account_id` ([LEZ Requirements](#lez-requirements)); one party in this draft. |
 
 ## Overview
@@ -248,7 +249,7 @@ The following sections specify the [Derivation Rules](#derivation-rules) every r
 the [Zone Sequencer](#zone-sequencer) (steps 6 and 14) and the [Zone Indexer](#zone-indexer) (steps 7, 8 and 15),
 then what the registry requires from LEZ ([LEZ Requirements](#lez-requirements), steps 2-4 and 12)
 and from the Module ([Module Requirements](#module-requirements), steps 1, 8-11 and 15).
-The [Open Questions](#open-questions) follow.
+The [Decisions](#decisions), the [Parameters](#parameters) and what comes [Later](#later) follow.
 
 ## Derivation Rules
 
@@ -360,7 +361,7 @@ A batch carries only what changes the tree; each leaf's expiry and the reason fo
   (1,835,008 bytes, the node's inscription limit:
   the 2 MiB Bedrock block less 1/8 for the rest of the Mantle Transaction),
   the batch stops at the last LEZ block whose changes still fit and the next batch continues from there;
-  a single LEZ block that does not fit is open.
+  a single LEZ block that does not fit is listed under [Later](#later).
 - A batch with no changes is still valid: it states that the LEZ blocks in its range left the tree unchanged,
   and moves `to_lez_block_id` forward so anyone can tell how far the Zone has followed LEZ.
   The first batch of a channel MAY be empty: it creates the channel.
@@ -392,7 +393,7 @@ What stops is the registry: until the batches are back, validators get no newer 
 so new memberships stay `MEMBERSHIP_PENDING` and removals wait.
 From a Module's side a reorg and a Zone sequencer that stopped look alike, the roots trail LEZ;
 how deep a batch must be before a Module takes its root is the reference depth of
-[Q3](#q3-parameters-window-length-reference-depth-withdrawal-delay-medium).
+[Parameters](#parameters).
 
 ### Corrections
 
@@ -422,7 +423,7 @@ the finalized history on Bedrock, which it reads as a Zone indexer does, plus th
 An outage stops the batches but loses no data or funds:
 every reader keeps following LEZ, and the Zone sequencer resumes from LEZ at any time;
 while it lasts no new root reaches the validators, so new memberships stay `MEMBERSHIP_PENDING` and removals wait.
-The loss of all accredited keys is open.
+The loss of all accredited keys is a governance case ([Later](#later)).
 
 ## Zone Indexer
 
@@ -480,7 +481,8 @@ and every non-empty leaf of that tree against the membership account of the iden
 (`poseidon(id_commitment, rate_limit)` equals the leaf, and `expiry_timestamp_ms` is taken from the account,
 since the root commits the leaves but neither whose they are nor when they expire);
 then it applies the LEZ blocks since.
-The serving interface and the snapshot format are open.
+The serving interface is the HTTP API of the Zone node (the same on a Zone sequencer and a Zone indexer);
+the snapshot format is listed under [Later](#later).
 
 ## LEZ Requirements
 
@@ -530,7 +532,7 @@ This document does not specify that program; it requires the following.
   (the batch that carries it, its inclusion on Bedrock and the reference depth, plus the window length)
   plus the time to detect a double-signal and include the `Slash`,
   so that every validator has stopped accepting the leaf, and any slash has landed, before the deposit can leave the escrow;
-  the numbers are open.
+  the number is a deployment parameter ([Parameters](#parameters)).
 - **Leaf indices.** `Register` assigns them in order, never reuses one, and fails at 2^20.
 - **One registration per identity commitment.** A closed membership account never opens again.
 - **Events.** The program emits one `ProgramEvent` per successful action, whatever the call depth,
@@ -603,7 +605,7 @@ Everything not stated here is as in RLN-API; this document requires the followin
 ```mermaid
 %%{init: {"theme": "base", "flowchart": {"curve": "basis", "nodeSpacing": 40, "rankSpacing": 70, "padding": 6, "wrappingWidth": 400}, "themeVariables": {"lineColor": "#9aa0a6", "primaryTextColor": "#111111", "edgeLabelBackground": "#ffffff", "fontSize": "15px"}, "themeCSS": "marker { overflow: visible; } .arrowMarkerPath { transform: scale(1.7); transform-origin: 5px 5px; } .edgeLabel, .edgeLabel p, .edgeLabel span { font-size: 12px; line-height: 1.2; }"}}%%
 flowchart LR
-    IDX["Zone indexer<br/>(registry access:<br/>own node or a service)"] -->|"#nbsp;valid roots, Merkle proof path,#nbsp;<br/>#nbsp;membership state, ConfigState, LEZ clock#nbsp;<br/>#nbsp;trust: as RLN-API's registry access#nbsp;"| MOD["Module<br/>(user node)"]
+    IDX["Registry access<br/>(a Zone node's interface, the Zone channel<br/>through the Module's node, or its own Zone indexer)"] -->|"#nbsp;valid roots, Merkle proof path,#nbsp;<br/>#nbsp;membership state, ConfigState, LEZ clock#nbsp;<br/>#nbsp;trust: by level, see Registry access#nbsp;"| MOD["Module<br/>(user node)"]
     MOD -->|"#nbsp;Register, Extend, Erase, Slash#nbsp;<br/>#nbsp;trust: the LEZ Sequencer, for the receipt#nbsp;"| LSEQ["LEZ Sequencer<br/>(LEZ)"]
     MOD -->|"#nbsp;RLN-API#nbsp;"| APP["User interface"]
     linkStyle default stroke-width:2.5px
@@ -619,18 +621,24 @@ flowchart LR
 ```
 
 - **Registry access.** The Module holds no tree.
-  It reads the registry through a Zone indexer, in its own node or elsewhere, through one interface:
-  the valid roots, its Merkle proof path, its membership state, `ConfigState` and the LEZ clock ([Serving](#serving)).
-  It trusts that access as RLN-API's registry access.
+  It reads the registry through one interface, the Zone node's ([Serving](#serving)):
+  the valid roots, its Merkle proof path at the newest valid root, its membership state, `ConfigState` and the LEZ clock.
   A wrong answer can make it generate proofs that fail, stop it generating, make it miss the grace period
   or report a wrong status; it cannot move funds, since `Erase` is signed by `holder` and refunds `holder`.
-- **Trust ladder.** Whom a node trusts is a deployment choice.
-  A Module that reads a remote Zone indexer trusts its operator for roots, paths and states,
-  and MAY read several and compare.
-  A node that runs its own Zone indexer trusts the LEZ Sequencer only, as every LEZ consumer does;
-  one whose Zone indexer reads a LEZ Indexer it runs itself, which re-executes the LEZ channel, trusts nobody
-  and trails LEZ by Bedrock finality.
-  A Module that must not reveal which leaf is its own runs its own Zone indexer.
+  Of what it reads, only the roots need trust: a wrong path fails to reproduce the root at the Module itself,
+  before any proof leaves it, and a wrong state only misreports.
+  Three levels of registry access exist; which one a Module uses is its deployment choice:
+  1. **A Zone node's interface.** The Module reads everything from a Zone sequencer or a Zone indexer it is configured with,
+     and trusts its operator for the roots. The simplest; the choice for a Module whose operator runs the Zone, or trusts who does.
+  2. **Roots from Bedrock.** The Module's own node is a Bedrock node, so the Module reads the Zone channel itself
+     and folds the batches as a Zone indexer does without the tree (the replay of the changes, signed by the accredited key):
+     the valid roots come from Bedrock, a Zone node serves only the path and the state, and the path is checked against those roots.
+     This trusts the Zone operator's key as every reader does, and nobody for the roots it holds.
+  3. **A Zone indexer of its own.** The node runs a Zone indexer, derives the tree from LEZ and judges every batch:
+     it trusts nobody, holds the registry at the finalized LEZ blocks (hours behind), and can take part in watching the Zone.
+     The most costly; the choice for a Module that must not reveal which leaf is its own, or that audits.
+  A Module configured with several accesses that disagree (a root for the same `to_lez_block_id`, a path, a state)
+  MUST stop generating and validating and report, rather than follow a majority: a majority can be wrong against Bedrock.
 - **Writes to LEZ.** The Module sends `Register` from the funded account, `Extend` and `Erase` from `holder`,
   and `Slash` from any funded account, to the LEZ Sequencer, and reads back only the receipt.
 - **Valid-root window.** A validator accepts a proof against any root in its window:
@@ -656,8 +664,8 @@ flowchart LR
   lands in an account no key can spend.
   The registry-specific option `active_duration_ms` is the requested active duration,
   defaulting to `max_active_duration_ms`.
-  The Module configuration names LEZ access and one or more Zone indexer endpoints,
-  its own node's first when it runs one.
+  The Module configuration names LEZ access and its registry access: the level above and,
+  for levels 1 and 2, the Zone node endpoints, its own node's first when it runs one.
 - **Registration.** The Module sends `Register` with `expiry_timestamp_ms` = the latest LEZ `timestamp` its registry access serves + `active_duration_ms`.
   The program measures the active duration from the later clock of the block that includes the transaction,
   so the duration shrinks by the inclusion delay:
@@ -688,136 +696,116 @@ and LEZ moves ahead of that, so the cases below state what the Module reports in
   nor its membership provider's): counts as absent, `MEMBERSHIP_FAILED` after the confirmation window;
   the Module registers again with a new identity credential.
 
-## Open Questions
+## Decisions
 
-Questions are ordered by priority.
-High blocks a sound deployment, Medium must be settled before implementation, Low is minor.
+The design choices this document rests on, with what they were chosen over.
 
-### Q1. Leaf capacity exhaustion (High)
+### Leaf capacity
 
-**Problem.** Leaf indices are never reused (`next_leaf_index` never goes back),
-so the registry holds 2^20 memberships over its lifetime,
-and deposits come back:
-register at the minimum `rate_limit`, wait out the active duration and the withdrawal delay,
+Leaf indices are never reused (`next_index` never goes back), so the registry holds 2^20 memberships over its lifetime,
+and deposits come back: register at the minimum `rate_limit`, wait out the active duration and the withdrawal delay,
 `Erase`, and register again with a new identity credential.
-Each round costs only `registration_fee` plus the LEZ transaction fee,
+Each round costs `registration_fee` plus the LEZ transaction fee,
 so 2^20 rounds, run in parallel with as many identity credentials as the attacker can fund deposits for,
-use up the registry at about `2^20 × registration_fee`.
+use up a tree at about `2^20 × registration_fee`.
 
-**Design choices:**
+Decision: every registration pays `registration_fee` ([Funding](#funding)), and the tree scales.
+When a depth-20 tree is full, every reader opens the next one:
+leaf index `i` lives in tree `i / 2^20` at position `i mod 2^20`, so nothing changes on LEZ or in the batches.
+Each tree has its own root; a proof is made against the root of the member's tree,
+and validators keep one valid-root window per tree that still has live leaves.
+No circuit change and no hard capacity, at the cost of several roots in the registry view;
+the readers, the batches' consumers and the Module grow this once a tree fills ([Later](#later)).
 
-- **Price the fee.** Set `registration_fee` so that 2^20 rounds cost more than the attack is worth.
-  Simple and already in `ConfigState`, but honest users pay it too, it follows the token price,
-  and it only makes the attack expensive.
-- **Deeper tree.** Depth 24 or 32 multiplies the rounds needed by 16 or 4096.
-  Zerokit ships depth-20 circuits; another depth needs its own circuit and proving key,
-  and proofs grow with the depth.
-- **Auto-scaling tree.** When a depth-20 tree is full, every reader opens the next one:
-  leaf index `i` lives in tree `i / 2^20` at position `i mod 2^20`, so nothing changes on LEZ or in the batches.
-  Each tree has its own root; a proof is made against the root of the member's tree,
-  and validators keep one valid-root window per tree that still has live leaves.
-  No circuit change and no hard capacity, at the cost of several roots in the registry view.
-- **Index reuse by the readers** (considered, not preferred). Readers could assign indices themselves
-  ("lowest free index") and reuse one after `Erase` or `Slash`; nothing in Zerokit or the circuit forbids it,
-  and the cap would count concurrent memberships instead of lifetime ones.
-  It is not free: the free set is no longer derivable from the tree (an expired membership that nobody erased
-  has an empty leaf yet still owns its index, since an `Extend` can bring it back), so every reader and every
-  snapshot sync carries the free set as extra state rebuilt from LEZ membership accounts;
-  "free" becomes a rule the program and every reader must mirror exactly (freed by `Erase` and `Slash` only,
-  never by expiry, so the program can still count for the atomic capacity check);
-  an expired membership blocks its slot until someone erases it;
-  and the on-chain `leaf_index`, the one anchor a reader checks itself against, is gone.
-  The monotonic index keeps the registry's state at the tree plus one on-chain counter and makes the
-  auto-scaling tree a pure function of the index, which is why pricing plus auto-scaling is preferred.
+Chosen over a deeper tree (Zerokit ships depth-20 circuits; another depth needs its own circuit and proving key,
+and proofs grow with the depth)
+and over index reuse by the readers ("lowest free index" after `Erase` or `Slash`):
+the free set would no longer be derivable from the tree
+(an expired membership nobody erased has an empty leaf yet still owns its index, since an `Extend` can bring it back),
+so every reader and every snapshot would carry it as extra state rebuilt from LEZ accounts,
+"free" would become a rule the program and every reader mirror exactly,
+an expired membership would block its slot until someone erases it,
+and the on-chain `leaf_index`, the one anchor a reader checks itself against, would be gone.
+The monotonic index keeps the registry's state at the tree plus one on-chain counter
+and makes the scaling tree a pure function of the index.
 
-### Q2. Registry accesses that disagree (High)
+### Registry access
 
-**Problem.** A Module trusts its registry access.
-A Module configured with several Zone indexers, or one that switches,
-may get different valid roots for the same `to_lez_block_id`, a different proof path, or a different membership state:
-one of them misread LEZ or Bedrock, or lies.
-The Module cannot tell which from its own data,
-and following the wrong one means proofs nobody accepts, proofs it should not accept, or a wrong status.
-A Zone indexer that disagrees with the batches on Bedrock is caught by any other Zone indexer,
-but a Module sees only what it is served.
+A Module trusts what it reads the registry through, and two accesses can disagree
+(a root for the same `to_lez_block_id`, a path, a state): one misread LEZ or Bedrock, or lies.
+Decision: the three levels of [Module Requirements](#module-requirements).
+Only the roots need trust, and the roots are on Bedrock, so a Module that wants to check them reads the Zone channel
+through its own node (level 2) at no more cost than reading its own chain;
+a Module that trusts the Zone operator reads a Zone node (level 1);
+a Module that trusts nobody, or must not reveal its leaf, runs its own Zone indexer (level 3), the costly one,
+which is also how anyone watches the Zone.
+Accesses that disagree stop the Module; a majority was rejected, since a majority can be wrong against Bedrock.
 
-**Design choices:**
+### Funding
 
-- **Own node first.** A node that runs its own Zone indexer follows it and ignores the others.
-- **Majority.** Follow what most of the configured Zone indexers serve, and drop the ones that differ.
-- **Stop.** Stop generating and validating, report, and wait for an operator decision.
-
-### Q3. Parameters: window length, reference depth, withdrawal delay (Medium)
-
-**Problem.** Three numbers follow from the design but depend on what only a running network shows.
-
-- **Window length.** Validators read Bedrock at slightly different times.
-  A validator ahead of a proof generator holds the generator's root only while it is in its window,
-  so the window must hold enough roots to cover that lead;
-  a validator behind reads on instead ([Module Requirements](#module-requirements)).
-  The same length bounds how stale a root a Module may still use before it answers `RLN_ERR_NOT_READY`,
-  and therefore how long a removed leaf, whose identity secret is public after a `Slash`,
-  can still be used at a validator that is behind, up to `rate_limit` messages per epoch.
-  Longer covers more skew; shorter bounds the exposure.
-- **Reference depth.** Validators take their roots from the batches,
-  and a shallow Bedrock reorg can drop or reorder a batch for a while;
-  a batch should be some Bedrock blocks deep before its root is valid.
-  Every Bedrock block of depth adds to the time a registration takes to become `MEMBERSHIP_ACTIVE`
-  and a removal to take effect.
-  Bedrock finality settles it but takes about 60 min on testnet (`security_param` 120 blocks of 30 s)
-  and about 18 h at the protocol default of 2160 blocks.
-- **Withdrawal delay.** Its bound in [LEZ Requirements](#lez-requirements) rests on the time a removal takes to reach every validator
-  (batch publishing, Bedrock inclusion, the reference depth and the window length)
-  plus the time to detect a double-signal and include the `Slash`.
-
-**Design choices:**
-
-- **Window length.** A few LEZ blocks, set per registry from the measured skew between validators.
-- **Reference depth.** A few Bedrock blocks, set per registry from the observed reorg depth.
-- **Withdrawal delay.** The removal latency above in time, plus the expected double-signal detection time, plus a margin.
-
-### Q4. Funding the Zone (Medium)
-
-**Problem.** Every batch is a Mantle Transaction, and only the Zone operator's accredited keys can send one,
+Every batch is a Mantle Transaction, and only the Zone operator's accredited keys can send one,
 so the Zone operator pays for the Zone out of its node wallets on Bedrock:
 about `(59 + 590) × execution_gas_base_price + (632 + 45 × N) × permanent_storage_gas_price` per batch of `N` insertions
 ([Execution Market](https://lip.logos.co/blockchain/raw/execution-market.html),
 [Storage Markets](https://lip.logos.co/blockchain/raw/storage-markets.html)),
 about 58 Bedrock fee units per membership with both prices at 1 and `N = 100`.
-Users pay on LEZ, not on Bedrock, so the question is how money gets from the users to the Zone operator's wallets.
+Users pay on LEZ, not on Bedrock.
 
-This draft charges each `Register` a non-refundable `registration_fee`, credited to `operator_account_id` on LEZ.
-That raises several points:
+Decision: every `Register` pays the non-refundable `registration_fee`, credited to `operator_account_id` on LEZ,
+and slashed deposits go to `treasury_account_id`.
+At first Logos funds the node wallet and runs the one Zone sequencer, and the fee accrues on LEZ.
+Once the bridge `Withdraw` from LEZ works, the fee (and the treasury, as the operator decides) tops up the wallets,
+as in the [Logos Oracle Zone](https://lip.logos.co/anoncomms/raw/logos-oracle-zone.html),
+and funds the Zone sequencers that come later ([Later](#later)).
+Chosen over no fee (the operator funding the Zone for good as a cost of running the network),
+which would leave the leaf capacity to the tree alone.
+Noted, not changed: the fee is a fixed amount on LEZ while Bedrock gas moves,
+removals cost Bedrock bytes nobody pays for separately, and a fee above the Zone sequencer's cap stops the batches;
+`ConfigState` and the cap are the operator's to adjust ([Later](#later), governance).
+There is no slasher reward: slashers would race each other, and the LEZ Sequencer could copy a pending `Slash` and send it first.
 
-- RLN-API has the funded account pay only `rate_limit × price_per_unit`, and lez-rln charges no fee.
-- The fee is a fixed amount on LEZ, while Bedrock gas prices move.
-- Bringing it to Bedrock needs the bridge `Withdraw` from LEZ, which is disabled today,
-  and LEZ counts 10^9 atomic units per LGO while Bedrock prices gas in LGO with no sub-unit.
-- Removals cost Bedrock bytes too, but nobody pays for them;
-  and if fees rise above the Zone sequencer's fee cap, batches stop.
-- If several parties run Zone sequencers, one `operator_account_id` does not split the income.
-- Slashed deposits go to `treasury_account_id`, an account nobody is named to hold (LEZ cannot burn),
-  so they could fund the Zone as well.
-- There is no slasher reward; with one, slashers would race each other,
-  and the LEZ Sequencer could copy a pending `Slash` and send it first.
+## Parameters
 
-**Design choices:**
+Three numbers follow from the design and are set per deployment from what the running network shows.
+The testnet values are what the implementation ships.
 
-- **Fee.** Keep `registration_fee`. It accrues on LEZ, together with slashed deposits minus an optional slasher reward
-  (`slasher_reward_percent`), and is moved through the bridge `Withdraw` to top up the node wallets,
-  as in the [Logos Oracle Zone](https://lip.logos.co/anoncomms/raw/logos-oracle-zone.html);
-  until the bridge `Withdraw` works, the Zone operator funds the wallets itself and the fee waits on LEZ.
-- **No fee.** Drop `registration_fee`. The Zone operator funds the wallets for good,
-  as a cost of running the network, like the LEZ Sequencer itself;
-  the leaf capacity then rests on the tree choices alone ([Q1](#q1-leaf-capacity-exhaustion-high)).
+- **Window length.** Validators read Bedrock at slightly different times.
+  A validator ahead of a proof generator holds the generator's root only while it is in its window,
+  so the window must hold enough roots to cover that lead; a validator behind reads on instead.
+  The same length bounds how stale a root a Module may still use before it answers `RLN_ERR_NOT_READY`,
+  and therefore how long a removed leaf, whose identity secret is public after a `Slash`,
+  can still be used at a validator that is behind, up to `rate_limit` messages per epoch.
+  Longer covers more skew; shorter bounds the exposure.
+  Testnet: the newest five roots a batch carries.
+- **Reference depth.** Validators take their roots from the batches,
+  and a shallow Bedrock reorg can orphan a batch for a while ([Batches lost on Bedrock](#batches-lost-on-bedrock));
+  a batch should be some Bedrock blocks deep before its root is valid.
+  Every Bedrock block of depth adds to the time a registration takes to become `MEMBERSHIP_ACTIVE`
+  and a removal to take effect; Bedrock finality settles it but takes hours
+  (8 to 10 on the testnet, about 18 at the protocol default of 2160 blocks).
+  Testnet: a batch in a Bedrock block counts (`adopted`); a deployment that wants finality takes `finalized` only.
+- **Withdrawal delay.** Its bound in [LEZ Requirements](#lez-requirements) rests on the time a removal takes to reach every validator
+  (batch publishing, Bedrock inclusion, the reference depth and the window length)
+  plus the time to detect a double-signal and include the `Slash`, plus a margin.
+  Testnet: the deployed program's value, raised once the removal latency is measured.
 
-### Q5. Governance of `ConfigState` (Low)
+## Later
 
-**Problem.** Nobody is named to set or change `ConfigState`,
-to hold `treasury_account_id` and `operator_account_id`,
-or to replace `zone_channel_id` when the accredited keys are lost or the Zone operator misbehaves.
-A change applies to open memberships only through `Extend`, since each membership keeps its own
-grace period and withdrawal delay; prices and rate-limit bounds never touch an open membership.
+Work that builds on the design above without changing it.
+
+- **Several Zone sequencers.** One accredited key per Zone sequencer, Mantle's round-robin with `posting_timeout`,
+  funded by `registration_fee` through the bridge `Withdraw`.
+  With them, the governance of `ConfigState`: who sets prices and bounds,
+  holds `treasury_account_id` and `operator_account_id`, splits the income,
+  and replaces `zone_channel_id` when the accredited keys are lost or the Zone operator misbehaves
+  (a change reaches open memberships only through `Extend`, since each keeps its own grace period and withdrawal delay;
+  prices and rate-limit bounds never touch an open membership).
+- **The scaling tree** in the readers, the Zone node's interface and the Module: one valid-root window per tree.
+- **Events from the LEZ Sequencer** (`getEvents`) in place of the derivation from the program's transactions;
+  chained calls and reverted transactions then count.
+- **A single LEZ block whose changes exceed one inscription.**
+- **The snapshot format** for a Zone indexer that syncs from another ([Serving](#serving)).
+- **A Bedrock depth before batching**, to make corrections rarer ([Corrections](#corrections)).
 
 ## Copyright
 

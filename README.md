@@ -28,7 +28,7 @@ sequencer publishes on the channel `rln-membership-zone:testnet:v0.3.2-3` and an
 it. The Module side is not written.
 
 - **Specification**: [`docs/rfc-rln-membership-zone.md`](docs/rfc-rln-membership-zone.md),
-  a raw LIP draft that ends with the open design questions.
+  a raw LIP draft: the design, its decisions, the deployment parameters and what comes later.
 - **Zone node** (`src/`, bin `zone`), two modes on one binary, both with the HTTP registry
   API. Both read the LEZ blocks from the LEZ channel on Bedrock through the Zone SDK, never
   from a LEZ Sequencer's word alone. The **sequencer** runs on the Logos testnet: it derives
