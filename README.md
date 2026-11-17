@@ -80,7 +80,9 @@ src/                              the Zone node: sequencer and indexer (MODE), H
   src/zone_chain.rs               the Zone channel as a consumer keeps it, after LEZ's chain_state: final tier, view, folds
   src/registry.rs                 one node's state: LEZ chain, Zone channel, pending changes, checkpoints, in the tree store
   src/http.rs                     HTTP API: roots, batches, membership with its Merkle proof path, leaves
-  src/main.rs                     two Zone SDK readers (LEZ channel, Zone channel); the sequencer publishes, the indexer judges
+  src/lez_sync.rs                 the LEZ channel through the Zone SDK: checkpoint at the LIB, history from the LEZ Sequencer under the hash chain, adopted and finalized blocks
+  src/zone_sync.rs                the Zone channel through the Zone SDK: start-up checks, extension, conflict, finality, the finality scan, the sequencer's tick and publish
+  src/main.rs                     configuration, the two Zone SDK readers, the event loop
 lez-sequencer/                    config template to run your own LEZ sequencer for the finalized history
 docs/setup-rln-membership-zone.md setup, operation, monitoring, troubleshooting, cleanup
 ```

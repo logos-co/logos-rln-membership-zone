@@ -14,6 +14,7 @@ use rln::prelude::{Hasher, PoseidonHash};
 pub use rln_layouts::events::{Erased, Extended, Registered, RlnEvent, Slashed};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tracing::warn;
 
 use crate::reader::{fr_from_bytes_le, fr_to_bytes_le};
 
@@ -228,7 +229,7 @@ impl LezSequencer {
                         Ok(Some(event)) => events.push(event),
                         Ok(None) => {}
                         // The tree is then wrong until a restart with `--rebuild-tree`.
-                        Err(e) => println!(
+                        Err(e) => warn!(
                             "LEZ block {block_id} tx {tx_index}: transaction to the program \
                              skipped ({} bytes): {e}; instruction {}",
                             tx.message.instruction_data.len(),

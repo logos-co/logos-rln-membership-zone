@@ -101,8 +101,14 @@ cd ~/logos-rln-membership-zone
 set -a
 . ./.env
 set +a
-RUST_LOG=warn,logos_blockchain=info cargo run
+cargo run
 ```
+
+The log goes to stdout through `tracing` with a timestamp and a level. Without `RUST_LOG` the
+filter is `warn,zone=info,logos_blockchain=error`: the node's own lines at `info`, the Zone
+SDK's at `error` only (its `Pending tx ... expired unmined; orphaned` warnings are noise on the
+LEZ channel, whose inscriptions are not ours). `RUST_LOG=warn,zone=info,logos_blockchain=info`
+shows the SDK at work.
 
 What happens, in order:
 
@@ -448,9 +454,12 @@ batch stays `in_flight` (block production and mempool propagation).
   reaches Bedrock. Fix the cause, start again.
 - `no LEZ inscription in the N finalized L1 slots below the LIB`: `LEZ_CHANNEL_ID` is not the
   LEZ channel, or LEZ stopped inscribing; check with `getChannelId` (section 4).
-- `LEZ blocks A..B read from the LEZ Sequencer under the block Bedrock finalized` then an
-  error: the LEZ Sequencer is unreachable or its history does not chain on the finalized
-  block; the finalized block is applied again at the next one, so a short outage heals itself.
+- `LEZ blocks A..B read from the LEZ Sequencer under finalized block N` then `LEZ blocks A..B
+  not read: ...; finalized block N waits for the next one`: the LEZ Sequencer is unreachable;
+  the gap is filled again under the next finalized block, so a short outage heals itself.
+  `the LEZ Sequencer's history does not lead to LEZ block N, which Bedrock finalized` stops the
+  process with the store intact: that sequencer does not follow Bedrock, point
+  `LEZ_SEQUENCER_URL` at one that does and start again.
 - A batch stays `in_flight` and `curl localhost:8080/mempool/view` does not list its tx hash:
   the node dropped it as invalid at block building (no log at the default level). Check
   `curl localhost:8080/channel/<channel id hex>`: a `tip_message` that is not your newest
@@ -478,15 +487,15 @@ batch stays `in_flight` (block production and mempool propagation).
   fixed (the span is halved down to one block); an older build needs the fix, not a restart.
 - `LEZ channel reorg on Bedrock: the head is the finalized tree folded over N adopted
   block(s) again`: a Bedrock reorg moved or dropped LEZ inscriptions; the head follows the new
-  branch. `WARNING: batch msg M claims root R.. at LEZ block N, LEZ now gives S..` after it
+  branch. `batch msg M claims root R.. at LEZ block N, LEZ now gives S..` (WARN) after it
   means a batch already on Bedrock states a root the new branch contradicts (LEZ produced an
   orphaned block again with other contents): an indexer parks on it and every later one, only
   a new channel mends that.
 - `LEZ blocks A..B read from the LEZ Sequencer under adopted block N`: the SDK skipped blocks
   (a `408 Request Timeout` on a large fetch after a long stop, or entries it holds but does
   not echo); they are filled from the LEZ Sequencer, pinned by the hash chain to block N.
-  `adopted LEZ block N does not chain on the head` after it means the LEZ Sequencer's blocks did
-  not lead to N: nothing applied, the next event tries again.
+  `the LEZ Sequencer's blocks do not lead to adopted LEZ block N (...); not applied` after it
+  means its history is not the one Bedrock adopted: nothing applied, the next event tries again.
 - `Pending tx ... expired unmined; orphaned` in a burst from the Zone SDK, then `the SDK reports
   a conflict on the channel, but the node's channel tip is still our newest entry`: the SDK
   could not see its restored entries mined (the node answered slowly) and declared them
@@ -503,7 +512,7 @@ batch stays `in_flight` (block production and mempool propagation).
 - `channel N final ..., M in view ... (checkpoint resumed)` right after changing
   `CHANNEL_NAME`: the old tree store is still there; stop, `rm -rf data/tree`
   (keep `key.hex`), start again.
-- `WARNING the final tier is frozen at batch msg M (L1 slot S): ...` at start, or a batch
+- `the final tier is frozen at batch msg M (L1 slot S): ...` (WARN) at start, or a batch
   `parked` in the log: a finalized batch did not apply on the final tier (its error says
   which check), every later one parks after it; `/` shows it as `stall`. On the indexer that
   is what it holds against the channel; on the sequencer it means its own batch was malformed. Only a

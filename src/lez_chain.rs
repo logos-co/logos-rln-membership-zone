@@ -8,6 +8,7 @@
 
 use anyhow::{Result, bail};
 use serde_json::Value;
+use tracing::warn;
 
 use crate::{
     batch::Change,
@@ -31,10 +32,13 @@ pub enum Adopted {
 #[derive(Debug)]
 pub enum Finalized {
     /// Chained on the final block and applied; `new_to_head` when the head had not seen it as
-    /// an adopted block (the stream ran ahead of the view, or a restart), with its changes.
+    /// an adopted block (the stream ran ahead of the view, or a restart), with its changes;
+    /// `view_dropped` when the view held another block at its id: the adopted blocks are gone
+    /// from the head, with everything derived from them.
     Applied {
         changes: Vec<Change>,
         new_to_head: bool,
+        view_dropped: bool,
     },
     /// The final tier already holds it.
     AlreadyApplied,
@@ -130,7 +134,7 @@ impl LezChain {
                 Adopted::Applied(changes) => restored.push((block.block_id(), changes)),
                 Adopted::AlreadyApplied => {}
                 Adopted::DoesNotChain(e) => {
-                    println!(
+                    warn!(
                         "persisted LEZ block {} does not chain on the finalized tree: {e}; the \
                          view restarts there",
                         block.block_id()
@@ -160,15 +164,15 @@ impl LezChain {
             ),
         }
         let changes = self.final_reader.apply_block(block)?;
-        let new_to_head = match self.view.first() {
+        let (new_to_head, view_dropped) = match self.view.first() {
             Some(held) if held.hash() == block.hash() => {
                 self.view.remove(0);
-                false
+                (false, false)
             }
             Some(held) => {
                 // The view sits on a branch Bedrock did not finalize and no `Conflict` said
                 // so: the head follows the final tier again, the SDK refills the view.
-                println!(
+                warn!(
                     "LEZ block {} finalized with hash {}.., the view held {}..: {} adopted \
                      block(s) dropped, the head is the final tier again",
                     block.block_id(),
@@ -178,20 +182,53 @@ impl LezChain {
                 );
                 self.view.clear();
                 self.head = self.final_reader.clone_temporary()?;
-                true
+                (true, true)
             }
             None => {
                 // Nothing adopted ahead of the final tier: the head is at the final block and
                 // takes this one too.
                 self.head.apply_block(block)?;
-                true
+                (true, false)
             }
         };
         Ok(Finalized::Applied {
             changes,
             new_to_head,
+            view_dropped,
         })
     }
+}
+
+/// Blocks read from a LEZ Sequencer to fill a gap are trusted only through the hash chain:
+/// `filler` must be the blocks `expected..` in order, chained on `prev` (the hash of the block
+/// before them; `None` when there is none) and leading to `block`, a block Bedrock adopted or
+/// finalized. Checked before anything is applied.
+pub fn check_filler(
+    prev: Option<[u8; 32]>,
+    expected: u64,
+    filler: &[Block],
+    block: &Block,
+) -> Result<(), BlockIngestError> {
+    let mut prev = prev;
+    for (id, candidate) in (expected..).zip(filler.iter().chain(std::iter::once(block))) {
+        if candidate.block_id() != id {
+            return Err(BlockIngestError::UnexpectedBlockId {
+                expected: id,
+                got: candidate.block_id(),
+            });
+        }
+        if let Some(prev) = prev
+            && candidate.prev_block_hash() != prev
+        {
+            return Err(BlockIngestError::BrokenChainLink {
+                block_id: candidate.block_id(),
+                expected_prev: prev,
+                got_prev: candidate.prev_block_hash(),
+            });
+        }
+        prev = Some(candidate.hash());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -320,5 +357,76 @@ mod test {
         assert_eq!(chain.head().root(), root_1);
         // A finalized block that does not chain on the final tier is fatal.
         assert!(chain.apply_finalized(&block(3, 5, 6, vec![])).is_err());
+    }
+
+    /// The outcome says when the view was dropped by finality, so the owner can drop what it
+    /// derived from the adopted blocks.
+    #[test]
+    fn test_finality_on_another_hash_reports_the_view_dropped() {
+        let mut chain = chain();
+        let b1 = block(1, 0, 1, vec![]);
+        chain.apply_adopted(&b1).unwrap();
+        assert!(matches!(
+            chain.apply_finalized(&b1).unwrap(),
+            Finalized::Applied {
+                new_to_head: false,
+                view_dropped: false,
+                ..
+            }
+        ));
+        chain
+            .apply_adopted(&block(2, 1, 2, vec![registered(2, 0)]))
+            .unwrap();
+        assert!(matches!(
+            chain.apply_finalized(&block(2, 1, 9, vec![])).unwrap(),
+            Finalized::Applied {
+                new_to_head: true,
+                view_dropped: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            chain.apply_finalized(&block(3, 9, 3, vec![])).unwrap(),
+            Finalized::Applied {
+                new_to_head: true,
+                view_dropped: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_check_filler_wants_the_chain_from_prev_to_the_block() {
+        let b3 = block(3, 2, 3, vec![]);
+        let b4 = block(4, 3, 4, vec![]);
+        let b5 = block(5, 4, 5, vec![]);
+        // Before the first block nothing is known: the ids and the links decide.
+        check_filler(None, 3, &[b3.clone(), b4.clone()], &b5).unwrap();
+        check_filler(Some([2; 32]), 3, &[b3.clone(), b4.clone()], &b5).unwrap();
+        // Nothing missing: the block itself must chain on prev.
+        check_filler(Some([4; 32]), 5, &[], &b5).unwrap();
+        assert!(matches!(
+            check_filler(Some([7; 32]), 5, &[], &b5),
+            Err(BlockIngestError::BrokenChainLink { block_id: 5, .. })
+        ));
+        // A gap, a block out of order, a link to another history.
+        assert!(matches!(
+            check_filler(None, 3, std::slice::from_ref(&b3), &b5),
+            Err(BlockIngestError::UnexpectedBlockId {
+                expected: 4,
+                got: 5
+            })
+        ));
+        assert!(matches!(
+            check_filler(None, 3, &[b4.clone(), b3.clone()], &b5),
+            Err(BlockIngestError::UnexpectedBlockId {
+                expected: 3,
+                got: 4
+            })
+        ));
+        assert!(matches!(
+            check_filler(Some([9; 32]), 3, &[b3, b4], &b5),
+            Err(BlockIngestError::BrokenChainLink { block_id: 3, .. })
+        ));
     }
 }

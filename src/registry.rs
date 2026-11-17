@@ -10,9 +10,10 @@ use lb_core::mantle::ops::channel::MsgId;
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tracing::info;
 
 use crate::{
-    batch::{Batch, Change, Kind},
+    batch::{Batch, Change},
     lez::{Block, StoredBlock},
     lez_chain::{Adopted, Finalized, LezChain},
     reader::{BlockIngestError, EMPTY_ROOT, Reader},
@@ -39,117 +40,25 @@ pub struct ZoneAnchorRecord {
     pub root: [u8; 32],
 }
 
-/// One tree change a batch carried, as the API shows it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ChangeRecord {
-    pub kind: ChangeKind,
-    pub leaf_index: u64,
-    /// The leaf inserted, 32 bytes little-endian in hex; `None` for a removal.
-    pub rate_commitment: Option<String>,
+/// Where a channel entry stands on Bedrock, the Zone SDK's word: `pending` (a publish of ours
+/// no Bedrock block holds yet), `adopted` (in a Bedrock block on the current branch: the view)
+/// or `finalized` (the final tier).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BedrockStatus {
+    Pending,
+    Adopted,
+    Finalized,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ChangeKind {
-    Insert,
-    Remove,
-}
-
-impl ChangeRecord {
-    pub fn from_change(change: &Change) -> Option<Self> {
-        Some(match change.kind.as_ref()? {
-            Kind::Insert(insert) => Self {
-                kind: ChangeKind::Insert,
-                leaf_index: insert.leaf_index,
-                rate_commitment: Some(hex::encode(&insert.rate_commitment)),
-            },
-            Kind::Remove(remove) => Self {
-                kind: ChangeKind::Remove,
-                leaf_index: remove.leaf_index,
-                rate_commitment: None,
-            },
-        })
-    }
-}
-
-/// A channel entry as the API shows it. Where it stands on Bedrock is the Zone SDK's word:
-/// `pending` (a publish of ours no Bedrock block holds yet), `adopted` (in a Bedrock block on
-/// the current branch: the view) or `finalized` (the final tier, with the L1 slot of the block
-/// that finalized it). The fold's outcome and error stay internal (LEZ `AcceptOutcome` names):
-/// the API serves the applied entries and the `stall`.
-#[derive(Debug, Clone, Serialize)]
-pub struct EntryView {
-    pub msg_id: String,
-    pub parent_msg: String,
-    /// `None` for an entry that carries no batch.
-    pub from_lez_block_id: Option<u64>,
-    pub to_lez_block_id: Option<u64>,
-    pub root: Option<String>,
-    pub changes: Vec<ChangeRecord>,
-    pub bedrock_status: &'static str,
-    /// The L1 slot of the block that finalized it; `null` before.
-    pub l1_slot: Option<u64>,
-    #[serde(skip)]
-    pub outcome: &'static str,
-    #[serde(skip)]
-    pub error: Option<BatchIngestError>,
-}
-
-impl EntryView {
-    fn new(
-        msg: [u8; 32],
-        parent: [u8; 32],
-        batch: Option<&Batch>,
-        l1_slot: Option<u64>,
-        pending: bool,
-        error: Option<&BatchIngestError>,
-    ) -> Self {
-        Self {
-            msg_id: hex::encode(msg),
-            parent_msg: hex::encode(parent),
-            from_lez_block_id: batch.map(|b| b.from_lez_block_id),
-            to_lez_block_id: batch.map(|b| b.to_lez_block_id),
-            root: batch.map(|b| hex::encode(Tip::from(b).root)),
-            changes: batch.map_or_else(Vec::new, |b| {
-                b.changes
-                    .iter()
-                    .filter_map(ChangeRecord::from_change)
-                    .collect()
-            }),
-            bedrock_status: match (l1_slot, pending) {
-                (Some(_), _) => "finalized",
-                (None, true) => "pending",
-                (None, false) => "adopted",
-            },
-            l1_slot,
-            outcome: match error {
-                None if batch.is_some() => "applied",
-                None => "skipped",
-                Some(e) if e.is_retryable() => "retryable_failure",
-                Some(_) => "parked",
-            },
-            error: error.cloned(),
-        }
-    }
-}
-
-/// The batches carrying one root, the one that produced it first (its changes made the root).
-pub struct RootEntry {
-    pub entries: Vec<EntryView>,
-}
-
-impl RootEntry {
-    pub fn produced_by(&self) -> &EntryView {
-        &self.entries[0]
-    }
-
-    pub fn carried_to_lez_block_id(&self) -> u64 {
-        self.entries
-            .iter()
-            .filter_map(|e| e.to_lez_block_id)
-            .max()
-            .unwrap_or_default()
-    }
+/// A batch on the channel whose root LEZ has since contradicted: the tree derived from LEZ
+/// says `derived` at its `to_lez_block_id`, the batch claims `claimed`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Contradicted {
+    pub msg: [u8; 32],
+    pub to_lez_block_id: u64,
+    pub claimed: [u8; 32],
+    pub derived: [u8; 32],
 }
 
 /// A pending change as the tree store keeps it: the LEZ block that made it and the change,
@@ -201,7 +110,7 @@ impl Registry {
             let extra = Reader::take_extra(&dir)?;
             std::fs::remove_dir_all(&dir).context("drop the tree store")?;
             kept = Some(extra);
-            println!("tree store dropped; the tree is read again from LEZ");
+            info!("tree store dropped; the tree is read again from LEZ");
         }
         let (mut final_reader, extra) =
             Reader::open(&dir, tree_id, first_lez_block_id.saturating_sub(1))?;
@@ -245,9 +154,14 @@ impl Registry {
             .transpose()
             .context("view in the tree store")?
             .unwrap_or_default();
-        let first_lez_block_id = get("first_lez_block_id")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(first_lez_block_id);
+        if let Some(stored) = get("first_lez_block_id").and_then(|v| v.as_u64())
+            && stored != first_lez_block_id
+        {
+            anyhow::bail!(
+                "the tree store starts at LEZ block {stored}, FIRST_LEZ_BLOCK_ID says \
+                 {first_lez_block_id}: another registry, or another data dir"
+            );
+        }
         let mut lez = LezChain::new(final_reader)?;
         // The adopted LEZ blocks of the last run: the SDK does not echo the entries it already
         // holds, so the view comes back from the store, its changes pending again below.
@@ -432,7 +346,13 @@ impl Registry {
             Finalized::Applied {
                 changes,
                 new_to_head,
+                view_dropped,
             } => {
+                if view_dropped {
+                    // The adopted blocks from this id on left the head: so do their changes.
+                    self.pending_changes
+                        .retain(|(held, _)| *held < block.block_id());
+                }
                 if new_to_head {
                     self.add_pending(block.block_id(), changes);
                 }
@@ -445,15 +365,28 @@ impl Registry {
 
     /// The batches whose root is not what the tree derived from LEZ says at their
     /// `to_lez_block_id`: statements LEZ has since contradicted. An indexer parks on them.
-    pub fn contradicted(&self) -> Vec<EntryView> {
-        self.entries()
-            .into_iter()
-            .filter(|e| match (e.to_lez_block_id, &e.root) {
-                (Some(to), Some(root)) => self
-                    .head()
-                    .root_at(to)
-                    .is_some_and(|derived| hex::encode(derived) != *root),
-                _ => false,
+    pub fn contradicted(&self) -> Vec<Contradicted> {
+        let final_batches = self
+            .zone
+            .final_entries()
+            .iter()
+            .filter_map(|f| Some((f.msg, f.batch()?)));
+        let view_batches = self
+            .zone
+            .view()
+            .iter()
+            .filter_map(|e| Some((e.msg.into(), e.batch.clone()?)));
+        final_batches
+            .chain(view_batches)
+            .filter_map(|(msg, batch)| {
+                let claimed = Tip::from(&batch).root;
+                let derived = self.head().root_at(batch.to_lez_block_id)?;
+                (derived != claimed).then_some(Contradicted {
+                    msg,
+                    to_lez_block_id: batch.to_lez_block_id,
+                    claimed,
+                    derived,
+                })
             })
             .collect()
     }
@@ -508,12 +441,15 @@ impl Registry {
         self.trim_pending();
     }
 
-    /// The whole view at the new tip (`ChannelUpdate::Conflict`); returns the entries of ours
-    /// that left it, to publish again.
+    /// The whole view at the new tip (`ChannelUpdate::Conflict`); returns the entries that left
+    /// it: the sequencer's own, to publish again (an indexer publishes nothing and counts
+    /// nothing as orphaned).
     pub fn apply_zone_conflict(&mut self, canonical: Vec<ChannelEntry>) -> Vec<ChannelEntry> {
         let judge = self.indexer.then_some(&self.lez as &dyn Judge);
         let dropped = self.zone.apply_conflict(canonical, judge);
-        self.orphaned += dropped.len() as u64;
+        if !self.indexer {
+            self.orphaned += dropped.len() as u64;
+        }
         for entry in &dropped {
             let msg: [u8; 32] = entry.msg.into();
             self.own_pending.retain(|m| *m != msg);
@@ -563,6 +499,31 @@ impl Registry {
         self.orphaned
     }
 
+    /// Whether this node judges the batches instead of publishing them.
+    pub fn is_indexer(&self) -> bool {
+        self.indexer
+    }
+
+    /// The finality scan read the finalized L1 blocks up to `slot`: the anchor moves there,
+    /// so the next scan starts after it.
+    pub fn scanned_to(&mut self, slot: u64) {
+        if let Some(anchor) = &mut self.anchor {
+            anchor.slot = anchor.slot.max(slot);
+        }
+    }
+
+    /// An anchor for a channel with no finalized entry yet, at the slot the Zone SDK starts
+    /// from: the finality scan covers everything after it.
+    pub fn seed_anchor(&mut self, slot: u64) {
+        if self.anchor.is_none() {
+            self.anchor = Some(ZoneAnchorRecord {
+                slot,
+                to_lez_block_id: self.first_lez_block_id.saturating_sub(1),
+                root: *EMPTY_ROOT,
+            });
+        }
+    }
+
     /// The indexer folds again what the judge could not decide: LEZ read further.
     pub fn retry_folds(&mut self) -> usize {
         let decided = self.zone.retry_folds(Some(&self.lez));
@@ -575,64 +536,29 @@ impl Registry {
         self.pending_changes.retain(|(block, _)| *block > to);
     }
 
-    /// Every entry of the channel, final tier first then the view, as the API shows them.
-    pub fn entries(&self) -> Vec<EntryView> {
-        let mut out: Vec<EntryView> = self
+    /// Whether `msg` is a publish of ours no Bedrock block holds yet.
+    pub fn is_pending(&self, msg: &[u8; 32]) -> bool {
+        self.own_pending.contains(msg)
+    }
+
+    /// Every entry of the channel in lineage order, final tier first then the view, with where
+    /// it stands on Bedrock.
+    pub fn lineage(&self) -> Vec<([u8; 32], BedrockStatus)> {
+        let final_entries = self
             .zone
             .final_entries()
             .iter()
-            .map(|f| {
-                EntryView::new(
-                    f.msg,
-                    f.parent,
-                    f.batch().as_ref(),
-                    Some(f.l1_slot),
-                    false,
-                    f.error.as_ref(),
-                )
-            })
-            .collect();
-        for (entry, outcome) in self.zone.view_outcomes() {
-            let msg: [u8; 32] = entry.msg.into();
-            out.push(EntryView::new(
-                msg,
-                entry.parent.into(),
-                entry.batch.as_ref(),
-                None,
-                self.own_pending.contains(&msg),
-                outcome.as_ref().err(),
-            ));
-        }
-        out
-    }
-
-    /// The roots newest first, at most `window_size`: one entry per run of applied batches
-    /// carrying the same root, the batch that produced it first and every batch of the run
-    /// after it (heartbeats as a rule). A root the tree comes back to later is a new run.
-    pub fn roots(&self, window_size: usize) -> Vec<RootEntry> {
-        let mut runs: Vec<RootEntry> = vec![];
-        for entry in self
-            .entries()
-            .into_iter()
-            .filter(|e| e.outcome == "applied")
-        {
-            match runs.last_mut() {
-                Some(run) if run.produced_by().root == entry.root => run.entries.push(entry),
-                _ => runs.push(RootEntry {
-                    entries: vec![entry],
-                }),
-            }
-        }
-        runs.reverse();
-        runs.truncate(window_size);
-        runs
-    }
-
-    /// The newest applied entry, a finalized one only when `finalized_only`.
-    pub fn newest(&self, finalized_only: bool) -> Option<EntryView> {
-        self.entries().into_iter().rev().find(|e| {
-            e.outcome == "applied" && (e.bedrock_status == "finalized" || !finalized_only)
-        })
+            .map(|f| (f.msg, BedrockStatus::Finalized));
+        let view = self.zone.view().iter().map(|e| {
+            let msg: [u8; 32] = e.msg.into();
+            let status = if self.is_pending(&msg) {
+                BedrockStatus::Pending
+            } else {
+                BedrockStatus::Adopted
+            };
+            (msg, status)
+        });
+        final_entries.chain(view).collect()
     }
 }
 
@@ -690,11 +616,11 @@ mod test {
         assert_eq!(registry.covered_to(), 2);
         assert_eq!(registry.next_batch(), None);
         assert_eq!(registry.in_flight(), Some([1; 32]));
-        assert_eq!(registry.entries()[0].bedrock_status, "pending");
+        assert_eq!(registry.lineage(), vec![([1; 32], BedrockStatus::Pending)]);
         // The channel tip is our batch: adopted.
         assert_eq!(registry.mark_adopted_up_to([1; 32]), vec![[1; 32]]);
         assert_eq!(registry.in_flight(), None);
-        assert_eq!(registry.entries()[0].bedrock_status, "adopted");
+        assert_eq!(registry.lineage(), vec![([1; 32], BedrockStatus::Adopted)]);
         // Finality: into the final tier, the anchor moves.
         let entry = ChannelEntry {
             msg: msg(1),
@@ -705,22 +631,43 @@ mod test {
             registry.apply_zone_finalized(entry, 500),
             Some(AcceptOutcome::Applied(_))
         ));
-        assert_eq!(registry.entries()[0].bedrock_status, "finalized");
-        assert_eq!(registry.entries()[0].l1_slot, Some(500));
+        assert_eq!(
+            registry.lineage(),
+            vec![([1; 32], BedrockStatus::Finalized)]
+        );
+        assert_eq!(registry.zone.final_entries()[0].l1_slot, 500);
         assert_eq!(registry.anchor().unwrap().slot, 500);
         assert_eq!(registry.anchor().unwrap().to_lez_block_id, 2);
-        assert_eq!(registry.roots(5).len(), 1);
-        assert_eq!(registry.newest(true).unwrap().msg_id, hex::encode([1; 32]));
-        // A heartbeat carries the root on: same run.
+        // The finality scan moves the anchor's slot forward only.
+        registry.scanned_to(900);
+        assert_eq!(registry.anchor().unwrap().slot, 900);
+        registry.scanned_to(100);
+        assert_eq!(registry.anchor().unwrap().slot, 900);
+        assert_eq!(registry.anchor().unwrap().to_lez_block_id, 2);
+        // A heartbeat carries the root on.
         registry.apply_lez_adopted(&block(3, vec![])).unwrap();
         let heartbeat = registry.next_batch().unwrap();
         assert!(heartbeat.changes.is_empty());
         registry.record_publish(msg(2), msg(1), &heartbeat);
-        assert_eq!(registry.roots(5).len(), 1);
-        assert_eq!(registry.roots(5)[0].entries.len(), 2);
-        assert_eq!(registry.roots(5)[0].carried_to_lez_block_id(), 3);
-        // Nothing LEZ contradicts.
+        assert_eq!(registry.lineage().len(), 2);
+        // Nothing LEZ contradicts; a batch claiming another root at its block is reported.
         assert!(registry.contradicted().is_empty());
+        let mut liar = heartbeat.clone();
+        liar.root_after = vec![9; 32];
+        registry.apply_lez_adopted(&block(4, vec![])).unwrap();
+        liar.from_lez_block_id = 4;
+        liar.to_lez_block_id = 4;
+        registry.apply_zone_extension(vec![ChannelEntry {
+            msg: msg(3),
+            parent: msg(2),
+            batch: Some(liar),
+        }]);
+        let contradicted = registry.contradicted();
+        assert_eq!(contradicted.len(), 1);
+        assert_eq!(contradicted[0].msg, [3; 32]);
+        assert_eq!(contradicted[0].to_lez_block_id, 4);
+        assert_eq!(contradicted[0].claimed, [9; 32]);
+        assert_eq!(contradicted[0].derived, registry.head().root());
     }
 
     #[test]
@@ -836,8 +783,8 @@ mod test {
             parent: MsgId::root(),
             batch: Some(honest.clone()),
         }]);
-        assert_eq!(registry.entries()[0].outcome, "applied");
-        assert_eq!(registry.entries()[0].bedrock_status, "adopted");
+        assert!(registry.zone.view_outcomes().next().unwrap().1.is_ok());
+        assert_eq!(registry.lineage()[0].1, BedrockStatus::Adopted);
         assert!(registry.pending_changes.is_empty());
         // A batch for blocks the indexer has not read yet: it replays (a heartbeat keeps the
         // root), so only the judge is missing; retryable, decided once LEZ is read.
@@ -852,7 +799,13 @@ mod test {
             parent: msg(1),
             batch: Some(early),
         }]);
-        assert_eq!(registry.entries()[1].outcome, "retryable_failure");
+        let outcome =
+            |registry: &Registry, i: usize| registry.zone.view_outcomes().nth(i).unwrap().1.clone();
+        assert!(
+            outcome(&registry, 1)
+                .as_ref()
+                .is_err_and(BatchIngestError::is_retryable)
+        );
         // Adopted, not finalized: the judge waits.
         registry.apply_lez_adopted(&block(2, vec![])).unwrap();
         registry
@@ -865,10 +818,9 @@ mod test {
             .unwrap();
         assert_eq!(registry.retry_folds(), 1);
         // Decided: block 3 registered someone, the tree derived from LEZ moved on.
-        assert_eq!(registry.entries()[1].outcome, "parked");
         assert!(matches!(
-            registry.entries()[1].error,
-            Some(BatchIngestError::DerivationMismatch { .. })
+            outcome(&registry, 1),
+            Err(BatchIngestError::DerivationMismatch { .. })
         ));
         // The head tip stays at the last applied batch.
         assert_eq!(registry.covered_to(), 1);
@@ -898,9 +850,74 @@ mod test {
             },
         ]);
         assert_eq!(dropped.len(), 1);
-        assert_eq!(registry.orphaned_count(), 1);
-        assert_eq!(registry.entries()[1].outcome, "applied");
+        // The dropped entry was the sequencer's: an indexer counts nothing as orphaned.
+        assert_eq!(registry.orphaned_count(), 0);
+        assert!(outcome(&registry, 1).is_ok());
         assert_eq!(registry.covered_to(), 3);
         assert_eq!(registry.zone.head_root(), root_3);
+        // A sequencer counts its own.
+        let mut sequencer = Registry::open_temporary(1, false).unwrap();
+        sequencer.apply_lez_adopted(&block(1, vec![])).unwrap();
+        let own = sequencer.next_batch().unwrap();
+        sequencer.record_publish(msg(1), MsgId::root(), &own);
+        assert_eq!(sequencer.apply_zone_conflict(vec![]).len(), 1);
+        assert_eq!(sequencer.orphaned_count(), 1);
+    }
+
+    /// Block `block_id` with hash `hash` chaining on hash `prev`.
+    fn chained(block_id: u64, prev: u8, hash: u8, events: Vec<RlnEvent>) -> Block {
+        let mut b = block(block_id, events);
+        b.header.prev_block_hash = common::HashType([prev; 32]);
+        b.header.hash = common::HashType([hash; 32]);
+        b
+    }
+
+    /// Bedrock finalizes a LEZ block with another hash than the adopted one at its id, with
+    /// no `Conflict` first: the view goes, and so do the pending changes derived from it; the
+    /// next batch carries the finalized block's changes only.
+    #[test]
+    fn test_finality_dropping_the_view_drops_its_pending_changes() {
+        let mut registry = Registry::open_temporary(1, false).unwrap();
+        let b1 = chained(1, 0, 1, vec![]);
+        registry.apply_lez_adopted(&b1).unwrap();
+        registry.apply_lez_finalized(&b1).unwrap();
+        let first = registry.next_batch().unwrap();
+        registry.record_publish(msg(1), MsgId::root(), &first);
+        // Adopted: block 2 registers leaf 0, block 3 registers leaf 1.
+        registry
+            .apply_lez_adopted(&chained(2, 1, 2, vec![registered(1, 0)]))
+            .unwrap();
+        registry
+            .apply_lez_adopted(&chained(3, 2, 3, vec![registered(2, 1)]))
+            .unwrap();
+        assert_eq!(registry.pending_changes.len(), 2);
+        // Finalized: another block 2, registering leaf 0 for someone else.
+        registry
+            .apply_lez_finalized(&chained(2, 1, 9, vec![registered(3, 0)]))
+            .unwrap();
+        assert_eq!(registry.head().lez_block_id, 2);
+        assert_eq!(registry.lez.view().len(), 0);
+        assert_eq!(registry.pending_changes.len(), 1);
+        assert_eq!(registry.pending_changes[0].0, 2);
+        let next = registry.next_batch().unwrap();
+        assert_eq!((next.from_lez_block_id, next.to_lez_block_id), (2, 2));
+        assert_eq!(next.changes.len(), 1);
+        registry.would_apply(&next).unwrap();
+        // Its changes are the finalized block's: the leaf is the third commitment's.
+        assert_eq!(registry.head().member_at(0).map(|(id, _)| id[0]), Some(3));
+    }
+
+    #[test]
+    fn test_a_store_of_another_first_block_is_refused() {
+        let dir = std::env::temp_dir().join(format!("zone-registry-first-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut registry = Registry::open(&dir, [0; 32], 10, false, false).unwrap();
+            registry.save().unwrap();
+            registry.close().unwrap();
+        }
+        assert!(Registry::open(&dir, [0; 32], 11, false, false).is_err());
+        assert!(Registry::open(&dir, [0; 32], 10, false, false).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

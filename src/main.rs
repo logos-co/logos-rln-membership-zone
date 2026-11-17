@@ -2,9 +2,10 @@
 //! one binary, two modes.
 //!
 //! Both follow two channels on Bedrock through the Zone SDK, each kept as a final tier plus a
-//! view after LEZ's `chain_state`: the LEZ channel (`lez_chain.rs`), whose inscriptions are the
-//! LEZ blocks the tree is derived from (`lez.rs`, `reader.rs`), and the Zone channel
-//! (`zone_chain.rs`), whose inscriptions are the batches (`batch.rs`). The sequencer publishes
+//! view after LEZ's `chain_state`: the LEZ channel (`lez_chain.rs`, fed by `lez_sync.rs`), whose
+//! inscriptions are the LEZ blocks the tree is derived from (`lez.rs`, `reader.rs`), and the Zone
+//! channel (`zone_chain.rs`, fed by `zone_sync.rs`), whose inscriptions are the batches
+//! (`batch.rs`). The sequencer publishes
 //! one batch per change or heartbeat over the LEZ blocks adopted on Bedrock; the indexer
 //! publishes nothing and judges every batch against the tree of the LEZ blocks finalized on
 //! Bedrock. Both serve the registry over HTTP (`http.rs`).
@@ -18,49 +19,45 @@ mod batch;
 mod http;
 mod lez;
 mod lez_chain;
+mod lez_sync;
 mod reader;
 mod registry;
 mod zone_chain;
+mod zone_sync;
 
 use std::{
     fs,
     path::PathBuf,
     sync::{Arc, RwLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
-use lb_core::mantle::{
-    gas::GasCost,
-    ops::channel::{ChannelId, MsgId, inscribe::Inscription},
-};
+use lb_core::mantle::{gas::GasCost, ops::channel::ChannelId};
 use lb_key_management_system_service::keys::{ED25519_SECRET_KEY_SIZE, Ed25519Key, ZkPublicKey};
 use lb_zone_sdk::{
-    CommonHttpClient, Slot,
-    adapter::{Node as _, NodeHttpClient},
-    sequencer::{
-        ChannelUpdate, Error as SeqError, Event, FinalizedOp, FinalizedTx, FundingConfig,
-        InscriptionInfo, SequencerCheckpoint, SequencerConfig, ZoneSequencer, channel_inscriptions,
-    },
+    CommonHttpClient,
+    adapter::NodeHttpClient,
+    sequencer::{Event, FundingConfig, SequencerCheckpoint, SequencerConfig, ZoneSequencer},
 };
-use prost::Message as _;
 use rand::{RngCore, thread_rng};
 use reqwest::Url;
 use sha2::{Digest as _, Sha256};
+use tracing::{error, info, warn};
 
 use crate::{
-    batch::Batch,
     http::{AppState, Shared},
-    lez::{Block, LezSequencer},
+    lez::LezSequencer,
+    lez_sync::{
+        apply_lez_finalized, lez_checkpoint_at_lib, on_lez_blocks_processed, set_lez_checkpoint,
+    },
     registry::Registry,
-    zone_chain::{AcceptOutcome, ChannelEntry, PublishRecord},
+    zone_sync::{
+        FINALITY_SCAN_SEC, ZoneChannel, channel_on_chain, check_channel_on_chain,
+        checkpoint_at_lib, now_unix, on_blocks_processed, on_tick, reconcile_finality, short,
+    },
 };
-
-/// Seconds between two finality scans (`reconcile_finality`).
-const FINALITY_SCAN_SEC: u64 = 300;
-/// L1 slots per `immutable_blocks` page of the finality scan.
-const FINALITY_SCAN_PAGE: u64 = 100;
 
 /// The registration program on the testnet LEZ: its account id
 /// (`HAxY9SiqUjJQHdtvazFDWFCxn1Jw1dtbUGio8DMC4bBw` in base58).
@@ -72,9 +69,6 @@ const TREE_ID_HEX: &str = "47b2de4f08080e74e2d4beffe8e5e87e709dd598619c9b322b64f
 const DEFAULT_FIRST_LEZ_BLOCK_ID: u64 = 49_431;
 /// The LEZ channel on Bedrock (one inscription per LEZ block) on the testnet.
 const LEZ_CHANNEL_ID_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
-/// Pages of `FINALITY_SCAN_PAGE` finalized L1 slots read backwards from the LIB to find the
-/// newest LEZ inscription (LEZ inscribes a block every minute or two).
-const LEZ_INSCRIPTION_SCAN_PAGES: u64 = 60;
 
 /// What this binary is: the one sequencer of the Zone, or an indexer that trusts nobody.
 #[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
@@ -188,7 +182,8 @@ fn reader_key() -> Ed25519Key {
     Ed25519Key::from_bytes(&key_bytes)
 }
 
-/// The sequencer's accredited key: created on first start, read back after.
+/// The sequencer's accredited key: created on first start (readable by its owner only), read
+/// back after.
 fn load_or_create_key(path: &PathBuf) -> Result<Ed25519Key> {
     let mut key_bytes = [0u8; ED25519_SECRET_KEY_SIZE];
     if path.exists() {
@@ -196,771 +191,27 @@ fn load_or_create_key(path: &PathBuf) -> Result<Ed25519Key> {
         key_bytes = parse_32(&text, "key.hex")?;
     } else {
         thread_rng().fill_bytes(&mut key_bytes);
-        fs::write(path, hex::encode(key_bytes))?;
-        println!("new key written to {}", path.display());
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        options
+            .open(path)
+            .and_then(|mut file| {
+                std::io::Write::write_all(&mut file, hex::encode(key_bytes).as_bytes())
+            })
+            .with_context(|| format!("write {}", path.display()))?;
+        info!("new key written to {}", path.display());
     }
     Ok(Ed25519Key::from_bytes(&key_bytes))
-}
-
-pub fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-fn short(msg: &[u8; 32]) -> String {
-    hex::encode(&msg[..4])
-}
-
-/// A channel entry from an inscription the SDK reports.
-fn entry_of(info: &InscriptionInfo) -> ChannelEntry {
-    ChannelEntry::new(info.this_msg, info.parent_msg, &info.payload)
-}
-
-/// Keep the Zone SDK checkpoint with the tree store.
-fn save_checkpoint(registry: &Shared, checkpoint: &SequencerCheckpoint) -> Result<()> {
-    let mut registry = registry.write().expect("registry lock");
-    registry.set_checkpoint(serde_json::to_value(checkpoint)?);
-    registry.save()
-}
-
-/// The Zone channel and the node to ask about it.
-struct ZoneChannel {
-    node_url: Url,
-    id: ChannelId,
-}
-
-/// What the node holds for a channel (`GET /channel/:id`), the fields this check reads.
-#[derive(serde::Deserialize)]
-struct ChannelOnChain {
-    accredited_keys: Vec<String>,
-    tip_message: String,
-}
-
-/// The channel as the node knows it (`GET /channel/:id`): `None` while no message of it is on
-/// chain (the first inscription creates it).
-async fn channel_on_chain(node_url: &Url, channel_id: ChannelId) -> Result<Option<ChannelOnChain>> {
-    let url = node_url.join(&format!("channel/{}", hex::encode(channel_id.as_ref())))?;
-    let response = reqwest::get(url.clone())
-        .await
-        .with_context(|| format!("GET {url}"))?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    response
-        .error_for_status()
-        .with_context(|| format!("GET {url}"))?
-        .json()
-        .await
-        .map(Some)
-        .with_context(|| format!("GET {url}: unexpected body"))
-}
-
-/// The Zone SDK checkpoint for a channel with no message on chain yet: nothing to backfill, so
-/// the SDK starts at the node's LIB instead of walking finalized history from genesis (30 to
-/// 60 minutes on the testnet, hours when the node is slow). Every field is what a cold start
-/// computes for an empty channel: root tip, no pending transaction, no channel note, root
-/// config lineage.
-async fn checkpoint_at_lib(node: &NodeHttpClient) -> Result<SequencerCheckpoint> {
-    let info = node
-        .consensus_info()
-        .await
-        .map_err(|e| anyhow!("consensus info: {e}"))?
-        .cryptarchia_info;
-    Ok(SequencerCheckpoint {
-        last_msg_id: MsgId::root(),
-        pending_txs: vec![],
-        lib: info.lib,
-        lib_slot: info.lib_slot,
-        channel_notes: vec![],
-        finalized_config: MsgId::root(),
-        funding: vec![],
-    })
-}
-
-/// Refuse to start a sequencer on a channel this data dir cannot continue. The Zone SDK learns
-/// a channel's tip from finalized history only, so without a checkpoint it chains the next
-/// batch on the root; on a channel that already has messages that batch is invalid
-/// (`InvalidParent`) and vanishes without a trace. Likewise another key cannot write at all.
-fn check_channel_on_chain(
-    channel: &ChannelOnChain,
-    our_key: &[u8; 32],
-    registry: &Shared,
-    resumed: bool,
-) -> Result<()> {
-    let ours = hex::encode(our_key);
-    if !channel
-        .accredited_keys
-        .iter()
-        .any(|k| k.eq_ignore_ascii_case(&ours))
-    {
-        bail!(
-            "channel is on chain with accredited keys {:?}, not ours ({ours}): this key cannot \
-             write to it; restore the original key.hex or pick another CHANNEL_NAME",
-            channel.accredited_keys
-        );
-    }
-    let newest_msg = registry
-        .read()
-        .expect("registry lock")
-        .entries()
-        .last()
-        .map(|e| e.msg_id.clone());
-    let tip = channel.tip_message.to_ascii_lowercase();
-    match newest_msg {
-        Some(msg) if msg == tip && resumed => {
-            println!(
-                "  chain     channel tip {}.. is our newest batch",
-                &tip[..8]
-            );
-            Ok(())
-        }
-        Some(msg) if msg == tip => bail!(
-            "channel tip {}.. is our newest batch but the data dir holds no Zone SDK checkpoint: \
-             the SDK would chain on the root and every batch would be invalid; restore the data \
-             dir or pick another CHANNEL_NAME",
-            &tip[..8]
-        ),
-        Some(msg) => bail!(
-            "channel tip on chain is {}.., our newest batch is {}..: the Zone channel state does \
-             not match the channel (a batch of ours may still be in flight, or data from another \
-             run was lost); wait, or pick another CHANNEL_NAME",
-            &tip[..8],
-            &msg[..8]
-        ),
-        None => bail!(
-            "channel is on chain (tip {}..) but this data dir holds no batch: data from another \
-             run was lost; restore it or pick another CHANNEL_NAME",
-            &tip[..8]
-        ),
-    }
-}
-
-/// Keep the Zone SDK checkpoint on the LEZ channel with the tree store.
-fn save_lez_checkpoint(registry: &Shared, checkpoint: &SequencerCheckpoint) -> Result<()> {
-    let mut registry = registry.write().expect("registry lock");
-    registry.set_lez_checkpoint(serde_json::to_value(checkpoint)?);
-    registry.save()
-}
-
-/// The checkpoint the LEZ channel's reader starts from on a fresh store: at the node's LIB,
-/// on the newest LEZ inscription at or below it (found by reading the finalized L1 blocks
-/// backwards from the LIB, a page at a time), so the SDK walks nothing before. Returns that
-/// inscription's LEZ block too: the finalized tree is built up to it.
-async fn lez_checkpoint_at_lib(
-    node: &NodeHttpClient,
-    lez_channel_id: ChannelId,
-    source: &LezSequencer,
-) -> Result<(SequencerCheckpoint, Block)> {
-    let info = node
-        .consensus_info()
-        .await
-        .map_err(|e| anyhow!("consensus info: {e}"))?
-        .cryptarchia_info;
-    let lib_slot = u64::from(info.lib_slot);
-    let mut page_to = lib_slot;
-    for _ in 0..LEZ_INSCRIPTION_SCAN_PAGES {
-        let page_from = page_to.saturating_sub(FINALITY_SCAN_PAGE - 1);
-        let blocks = node
-            .immutable_blocks(Slot::from(page_from), Slot::from(page_to))
-            .await
-            .map_err(|e| anyhow!("immutable blocks {page_from}..{page_to}: {e}"))?;
-        let newest = blocks
-            .iter()
-            .rev()
-            .flat_map(|block| block.transactions.iter().rev())
-            .flat_map(|tx| channel_inscriptions(tx, lez_channel_id).into_iter().rev())
-            .next();
-        if let Some(inscription) = newest {
-            let block = source
-                .decode_block(&inscription.payload)
-                .context("the newest finalized LEZ inscription is not a LEZ block")?;
-            return Ok((
-                SequencerCheckpoint {
-                    last_msg_id: inscription.this_msg,
-                    pending_txs: vec![],
-                    lib: info.lib,
-                    lib_slot: info.lib_slot,
-                    channel_notes: vec![],
-                    finalized_config: MsgId::root(),
-                    funding: vec![],
-                },
-                block,
-            ));
-        }
-        if page_from == 0 {
-            break;
-        }
-        page_to = page_from - 1;
-    }
-    bail!(
-        "no LEZ inscription in the {} finalized L1 slots below the LIB ({lib_slot}): is \
-         LEZ_CHANNEL_ID the LEZ channel?",
-        LEZ_INSCRIPTION_SCAN_PAGES * FINALITY_SCAN_PAGE
-    )
-}
-
-/// Finalized LEZ blocks `from..=to` read from the LEZ Sequencer, applied to the finalized
-/// tree. They are trusted only through the hash chain: the caller applies the Bedrock-finalized
-/// block after them next, which chains on the last one or is refused.
-async fn fill_final_from_rpc(
-    source: &LezSequencer,
-    registry: &Shared,
-    from: u64,
-    to: u64,
-) -> Result<()> {
-    if from > to {
-        return Ok(());
-    }
-    println!(
-        "LEZ blocks {from}..{to} read from the LEZ Sequencer under the block Bedrock finalized"
-    );
-    let blocks = source.blocks(from, to).await?;
-    let mut registry = registry.write().expect("registry lock");
-    for block in &blocks {
-        if let Some(expected) = registry.apply_lez_finalized(block)? {
-            bail!(
-                "the LEZ Sequencer skipped blocks: expected {expected}, got {}",
-                block.block_id()
-            );
-        }
-    }
-    registry.save()
-}
-
-/// A LEZ block Bedrock finalized: onto the finalized tree, the blocks it skipped filled from
-/// the LEZ Sequencer first (pinned by this block's `prev_block_hash`).
-async fn apply_lez_finalized(
-    source: &LezSequencer,
-    registry: &Shared,
-    block: &Block,
-) -> Result<()> {
-    let gap = registry
-        .write()
-        .expect("registry lock")
-        .apply_lez_finalized(block)?;
-    if let Some(expected) = gap {
-        fill_final_from_rpc(source, registry, expected, block.block_id() - 1).await?;
-        if let Some(expected) = registry
-            .write()
-            .expect("registry lock")
-            .apply_lez_finalized(block)?
-        {
-            bail!(
-                "LEZ block {} still does not follow the finalized tree (at {})",
-                block.block_id(),
-                expected - 1
-            );
-        }
-    }
-    Ok(())
-}
-
-/// A LEZ block adopted on Bedrock, onto the head. Blocks the SDK skipped before it (a stream
-/// it dropped and reopened, entries it does not echo) are read from the LEZ Sequencer first,
-/// trusted only through the hash chain: they must chain on the head and the adopted block must
-/// chain on the last of them, or nothing is applied.
-async fn adopt_lez_block(source: &LezSequencer, registry: &Shared, block: &Block) -> Result<()> {
-    let gap = registry
-        .write()
-        .expect("registry lock")
-        .apply_lez_adopted(block)?;
-    let Some(expected) = gap else {
-        return Ok(());
-    };
-    let to = block.block_id() - 1;
-    println!(
-        "LEZ blocks {expected}..{to} read from the LEZ Sequencer under adopted block {}",
-        block.block_id()
-    );
-    let filler = source.blocks(expected, to).await?;
-    let mut prev = registry
-        .read()
-        .expect("registry lock")
-        .head()
-        .last_block_hash();
-    for (id, candidate) in (expected..=to).zip(&filler) {
-        if candidate.block_id() != id || prev.is_some_and(|p| candidate.prev_block_hash() != p) {
-            bail!(
-                "LEZ block {} from the LEZ Sequencer does not chain under adopted block {}",
-                candidate.block_id(),
-                block.block_id()
-            );
-        }
-        prev = Some(candidate.hash());
-    }
-    if prev != Some(block.prev_block_hash()) {
-        bail!(
-            "the LEZ Sequencer's blocks {expected}..{to} do not lead to adopted block {}",
-            block.block_id()
-        );
-    }
-    let mut registry = registry.write().expect("registry lock");
-    for candidate in &filler {
-        if registry.apply_lez_adopted(candidate)?.is_some() {
-            bail!("LEZ block {} still missing before", candidate.block_id());
-        }
-    }
-    if registry.apply_lez_adopted(block)?.is_some() {
-        bail!(
-            "adopted LEZ block {} still does not follow the head",
-            block.block_id()
-        );
-    }
-    Ok(())
-}
-
-/// One `BlocksProcessed` event of the Zone SDK on the LEZ channel: adopted LEZ blocks onto the
-/// head, a Bedrock reorg refolds the head over the canonical lineage, finalized LEZ blocks onto
-/// the finalized tree. The events of a block are logged when the head first sees it.
-async fn on_lez_blocks_processed(
-    source: &LezSequencer,
-    registry: &Shared,
-    checkpoint: &SequencerCheckpoint,
-    channel_update: &ChannelUpdate,
-    finalized: &[FinalizedTx],
-) -> Result<()> {
-    save_lez_checkpoint(registry, checkpoint)?;
-    let decode = |info: &InscriptionInfo| match source.decode_block(&info.payload) {
-        Ok(block) => Some(block),
-        Err(e) => {
-            println!(
-                "LEZ channel entry msg {} is not a LEZ block: {e}",
-                short(&info.this_msg.into())
-            );
-            None
-        }
-    };
-    match channel_update {
-        ChannelUpdate::Extension { adopted } => {
-            for block in adopted
-                .iter()
-                .filter_map(|tx| tx.inscription())
-                .filter_map(decode)
-            {
-                if !block.events.is_empty() {
-                    let names: Vec<_> = block.events.iter().map(lez::selector_name).collect();
-                    println!(
-                        "LEZ block {} adopted: events {}",
-                        block.block_id(),
-                        names.join(", ")
-                    );
-                }
-                if let Err(e) = adopt_lez_block(source, registry, &block).await {
-                    println!("{e}");
-                }
-            }
-        }
-        ChannelUpdate::Conflict { .. } => {
-            let canonical: Vec<Block> = channel_update
-                .canonical_chain()
-                .into_iter()
-                .flatten()
-                .filter_map(|tx| tx.inscription())
-                .filter_map(decode)
-                .collect();
-            registry
-                .write()
-                .expect("registry lock")
-                .apply_lez_conflict()?;
-            for block in &canonical {
-                if let Err(e) = adopt_lez_block(source, registry, block).await {
-                    println!("{e}");
-                    break;
-                }
-            }
-            println!(
-                "LEZ channel reorg on Bedrock: the head is the finalized tree folded over the \
-                 canonical lineage again, at LEZ block {}",
-                registry.read().expect("registry lock").head().lez_block_id
-            );
-        }
-    }
-    for tx in finalized {
-        for op in &tx.ops {
-            let FinalizedOp::Inscription(info) = op else {
-                continue;
-            };
-            let Some(block) = decode(info) else { continue };
-            apply_lez_finalized(source, registry, &block).await?;
-        }
-    }
-    registry.write().expect("registry lock").save()
-}
-
-/// Say what the final tier made of a finalized entry.
-fn report_finalized(entry: &ChannelEntry, l1_slot: u64, outcome: Option<&AcceptOutcome>) {
-    let msg: [u8; 32] = entry.msg.into();
-    let range = entry.batch.as_ref().map_or("no batch".to_string(), |b| {
-        format!("[{}..{}]", b.from_lez_block_id, b.to_lez_block_id)
-    });
-    match outcome {
-        Some(AcceptOutcome::Applied(_)) => println!(
-            "batch {range} msg {} finalized at L1 slot {l1_slot}: applied, root {}..",
-            short(&msg),
-            entry
-                .batch
-                .as_ref()
-                .map(|b| hex::encode(&b.root_after[..4]))
-                .unwrap_or_default()
-        ),
-        Some(AcceptOutcome::Parked(e)) => println!(
-            "batch {range} msg {} finalized at L1 slot {l1_slot}: parked, {e}; the final tier \
-             is frozen here",
-            short(&msg)
-        ),
-        Some(AcceptOutcome::RetryableFailure(e)) => println!(
-            "batch {range} msg {} finalized at L1 slot {l1_slot}: {e}",
-            short(&msg)
-        ),
-        Some(AcceptOutcome::AlreadyApplied) => {}
-        None => println!(
-            "entry msg {} finalized at L1 slot {l1_slot}: {range}",
-            short(&msg)
-        ),
-    }
-}
-
-/// The finality the SDK stream may have missed (a restart between the event and the save):
-/// read the finalized L1 blocks from the anchor up to the LIB and apply every inscription of
-/// the channel found there. Idempotent with the stream path. Returns how many were new.
-async fn reconcile_finality(
-    node: &NodeHttpClient,
-    channel_id: ChannelId,
-    registry: &Shared,
-) -> Result<usize> {
-    let Some(anchor) = registry.read().expect("registry lock").anchor() else {
-        return Ok(0);
-    };
-    let lib = u64::from(
-        node.consensus_info()
-            .await
-            .map_err(|e| anyhow!("consensus info: {e}"))?
-            .cryptarchia_info
-            .lib_slot,
-    );
-    let mut applied = 0;
-    let mut page_from = anchor.slot + 1;
-    while page_from <= lib {
-        let page_to = lib.min(page_from + FINALITY_SCAN_PAGE - 1);
-        let blocks = node
-            .immutable_blocks(Slot::from(page_from), Slot::from(page_to))
-            .await
-            .map_err(|e| anyhow!("immutable blocks {page_from}..{page_to}: {e}"))?;
-        let mut registry = registry.write().expect("registry lock");
-        for block in &blocks {
-            let l1_slot = u64::from(block.header.slot);
-            for tx in &block.transactions {
-                for info in channel_inscriptions(tx, channel_id) {
-                    let entry = entry_of(&info);
-                    let outcome = registry.apply_zone_finalized(entry.clone(), l1_slot);
-                    if !matches!(outcome, Some(AcceptOutcome::AlreadyApplied)) {
-                        report_finalized(&entry, l1_slot, outcome.as_ref());
-                        applied += 1;
-                    }
-                }
-            }
-        }
-        registry.save()?;
-        page_from = page_to + 1;
-    }
-    Ok(applied)
-}
-
-/// One `BlocksProcessed` event of the Zone SDK: the channel tip holds our batches up to `tip`,
-/// the view moved (`channel_update`: an extension, or a conflict whose dropped batches of ours
-/// are published again) and Bedrock finality reached the `finalized` entries, which go into
-/// the final tier. A conflict the node does not confirm (its channel tip is still our newest
-/// entry) is ignored: the SDK also reports a pending entry it could not see mined as orphaned,
-/// and publishing it again would fork our own channel.
-async fn on_blocks_processed(
-    sdk: &mut ZoneSequencer<NodeHttpClient>,
-    registry: &Shared,
-    channel: &ZoneChannel,
-    tip: [u8; 32],
-    checkpoint: &SequencerCheckpoint,
-    channel_update: &ChannelUpdate,
-    finalized: &[FinalizedTx],
-) -> Result<()> {
-    save_checkpoint(registry, checkpoint)?;
-    // The channel tip is one of our batches: it and every pending publish before it are in a
-    // Bedrock block (an inscription we published is not echoed in `adopted` on a plain chain
-    // extension).
-    for msg in registry
-        .write()
-        .expect("registry lock")
-        .mark_adopted_up_to(tip)
-    {
-        println!(
-            "batch msg {} adopted in a Bedrock block (channel tip)",
-            short(&msg)
-        );
-    }
-    match channel_update {
-        ChannelUpdate::Extension { adopted } => {
-            let entries: Vec<ChannelEntry> = adopted
-                .iter()
-                .filter_map(|tx| tx.inscription())
-                .map(entry_of)
-                .collect();
-            for entry in &entries {
-                println!(
-                    "channel entry msg {} adopted in a Bedrock block",
-                    short(&entry.msg.into())
-                );
-            }
-            registry
-                .write()
-                .expect("registry lock")
-                .apply_zone_extension(entries);
-        }
-        ChannelUpdate::Conflict { .. } => {
-            let newest_held: Option<String> = registry
-                .read()
-                .expect("registry lock")
-                .zone
-                .view()
-                .last()
-                .map(|entry| hex::encode(<[u8; 32]>::from(entry.msg)));
-            if let Some(on_chain) = channel_on_chain(&channel.node_url, channel.id).await?
-                && newest_held.is_some_and(|m| m.eq_ignore_ascii_case(&on_chain.tip_message))
-            {
-                println!(
-                    "the SDK reports a conflict on the channel, but the node's channel tip is \
-                     still our newest entry {}..: nothing was dropped, ignored",
-                    &on_chain.tip_message[..8]
-                );
-                return registry.write().expect("registry lock").save();
-            }
-            let canonical: Vec<ChannelEntry> = channel_update
-                .canonical_chain()
-                .into_iter()
-                .flatten()
-                .filter_map(|tx| tx.inscription())
-                .map(entry_of)
-                .collect();
-            let dropped = registry
-                .write()
-                .expect("registry lock")
-                .apply_zone_conflict(canonical);
-            // A reorg dropped our batches: publish the same payloads again, in order (new
-            // messages, since their parent changed).
-            for entry in dropped {
-                let Some(batch) = entry.batch else { continue };
-                republish(sdk, registry, entry.msg.into(), &batch).await?;
-            }
-        }
-    }
-    if let Some(gap) = registry
-        .read()
-        .expect("registry lock")
-        .zone
-        .check_for_gaps_in_lineage()
-    {
-        println!(
-            "WARNING: channel entry msg {} chains on {}, which the view does not hold: the \
-             lineage has a gap",
-            short(&gap.msg.into()),
-            short(&gap.parent.into())
-        );
-    }
-    // Bedrock finality reached entries of the channel: into the final tier.
-    for tx in finalized {
-        let l1_slot = tx.l1_slot.into_inner();
-        for op in &tx.ops {
-            let FinalizedOp::Inscription(info) = op else {
-                continue;
-            };
-            let entry = entry_of(info);
-            let outcome = registry
-                .write()
-                .expect("registry lock")
-                .apply_zone_finalized(entry.clone(), l1_slot);
-            report_finalized(&entry, l1_slot, outcome.as_ref());
-        }
-    }
-    registry.write().expect("registry lock").save()
-}
-
-/// Publish `batch` again after a reorg orphaned its message `orphaned`: a new message, since
-/// its parent changed. A refusal by the SDK is logged and left to the next conflict or poll.
-async fn republish(
-    sdk: &mut ZoneSequencer<NodeHttpClient>,
-    registry: &Shared,
-    orphaned: [u8; 32],
-    batch: &Batch,
-) -> Result<()> {
-    let inscription = Inscription::try_from(batch.encode_to_vec())
-        .map_err(|e| anyhow!("payload too large: {e:?}"))?;
-    match sdk.handle().publish(inscription).await {
-        Ok((result, checkpoint)) => {
-            let info = result.tx.inscription();
-            let record = registry.write().expect("registry lock").record_publish(
-                info.this_msg,
-                info.parent_msg,
-                batch,
-            );
-            save_checkpoint(registry, &checkpoint)?;
-            println!(
-                "batch [{}..{}] msg {} orphaned by a reorg, published again as msg {} \
-                 ({record:?})",
-                batch.from_lez_block_id,
-                batch.to_lez_block_id,
-                short(&orphaned),
-                short(&info.this_msg.into())
-            );
-        }
-        Err(e) => println!("republish after reorg failed: {e}"),
-    }
-    Ok(())
-}
-
-/// One tick. The indexer judges what it could not judge before (the finalized tree moved).
-/// The sequencer checks its own statements against the tree, then publishes one batch
-/// covering the adopted LEZ blocks not covered yet when changes wait or the heartbeat is due,
-/// with at most one batch in flight. `Err` only for the tree store.
-async fn on_tick(
-    sdk: &mut ZoneSequencer<NodeHttpClient>,
-    registry: &Shared,
-    args: &Args,
-    contradicted_count: &mut usize,
-    last_publish_unix: &mut u64,
-) -> Result<()> {
-    if args.mode == Mode::Indexer {
-        let decided = registry.write().expect("registry lock").retry_folds();
-        if decided > 0 {
-            println!("{decided} batch(es) judged now that LEZ finality reached them");
-            registry.write().expect("registry lock").save()?;
-        }
-        return Ok(());
-    }
-    warn_contradicted(&registry.read().expect("registry lock"), contradicted_count);
-    let batch = {
-        let registry = registry.read().expect("registry lock");
-        if registry.in_flight().is_some() {
-            return Ok(());
-        }
-        let due = registry.entries().is_empty()
-            || !registry.pending_changes.is_empty()
-            || now_unix().saturating_sub(*last_publish_unix) >= args.heartbeat_sec;
-        if due { registry.next_batch() } else { None }
-    };
-    let Some(batch) = batch else { return Ok(()) };
-    publish_batch(sdk, registry, &batch, last_publish_unix).await
-}
-
-/// The sequencer's own batches that LEZ now contradicts (the tree at `to_lez_block_id` has
-/// another root than the batch claims), warned once per change of the set.
-fn warn_contradicted(registry: &Registry, contradicted_count: &mut usize) {
-    let contradicted = registry.contradicted();
-    if contradicted.len() == *contradicted_count {
-        return;
-    }
-    *contradicted_count = contradicted.len();
-    for e in contradicted {
-        let now = e
-            .to_lez_block_id
-            .and_then(|to| registry.head().root_at(to))
-            .map(|r| hex::encode(&r[..4]))
-            .unwrap_or_default();
-        println!(
-            "WARNING: batch msg {} claims root {}.. at LEZ block {}, LEZ now gives {}..: an \
-             indexer parks on it and every later batch",
-            &e.msg_id[..8],
-            &e.root.clone().unwrap_or_default()[..8],
-            e.to_lez_block_id.unwrap_or_default(),
-            now
-        );
-    }
-}
-
-/// Publish the next batch: recorded as in flight and saved with the checkpoint on success, so
-/// a restart knows it; `last_publish_unix` restarts the heartbeat. A batch too large for one
-/// inscription or a refusal by the SDK is logged and tried again next poll. A batch that
-/// would not apply on our own head is a bug: fatal before anything reaches Bedrock.
-async fn publish_batch(
-    sdk: &mut ZoneSequencer<NodeHttpClient>,
-    registry: &Shared,
-    batch: &Batch,
-    last_publish_unix: &mut u64,
-) -> Result<()> {
-    if let Err(e) = registry.read().expect("registry lock").would_apply(batch) {
-        bail!(
-            "batch [{}..{}] would not apply on our own head ({e}); stopping before publishing \
-             it",
-            batch.from_lez_block_id,
-            batch.to_lez_block_id
-        );
-    }
-    let inscription = match Inscription::try_from(batch.encode_to_vec()) {
-        Ok(inscription) => inscription,
-        Err(e) => {
-            println!(
-                "batch [{}..{}] does not fit one inscription: {e:?}",
-                batch.from_lez_block_id, batch.to_lez_block_id
-            );
-            return Ok(());
-        }
-    };
-    match sdk.handle().publish(inscription).await {
-        Ok((result, checkpoint)) => {
-            let info = result.tx.inscription();
-            let record = {
-                let mut registry = registry.write().expect("registry lock");
-                let record = registry.record_publish(info.this_msg, info.parent_msg, batch);
-                registry.save()?;
-                record
-            };
-            save_checkpoint(registry, &checkpoint)?;
-            *last_publish_unix = now_unix();
-            let described: Vec<_> = batch.changes.iter().map(|c| c.describe()).collect();
-            println!(
-                "batch [{}..{}] published as msg {} on {}: root {}.., {}{}",
-                batch.from_lez_block_id,
-                batch.to_lez_block_id,
-                short(&info.this_msg.into()),
-                short(&info.parent_msg.into()),
-                hex::encode(&batch.root_after[..4]),
-                if described.is_empty() {
-                    "no changes".into()
-                } else {
-                    described.join("; ")
-                },
-                if record == PublishRecord::Extended {
-                    "".into()
-                } else {
-                    format!(" ({record:?})")
-                }
-            );
-            // Checked above; a disagreement here means the head moved under the publish.
-            if record == PublishRecord::Skipped {
-                let error = registry
-                    .read()
-                    .expect("registry lock")
-                    .entries()
-                    .last()
-                    .and_then(|e| e.error.as_ref().map(ToString::to_string))
-                    .unwrap_or_default();
-                bail!(
-                    "batch msg {} does not apply on our own head ({error}); stopping instead of \
-                     publishing it again",
-                    short(&info.this_msg.into())
-                );
-            }
-        }
-        Err(SeqError::Unavailable { reason }) => {
-            println!("not ready to publish ({reason}), retry next poll")
-        }
-        Err(e) => println!("publish failed: {e}"),
-    }
-    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "warn,zone=info,logos_blockchain=error".into()),
         )
         .init();
     let args = Args::parse();
@@ -1009,7 +260,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("bind {}", args.http_addr))?;
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, http::router(state)).await {
-            eprintln!("http server stopped: {e}");
+            error!("http server stopped: {e}");
         }
     });
 
@@ -1061,8 +312,14 @@ async fn main() -> Result<()> {
             .in_flight()
             .is_none() =>
         {
-            println!("  chain     channel not on chain yet; the first batch creates it");
-            Some(checkpoint_at_lib(&node).await?)
+            info!("chain: channel not on chain yet; the first batch creates it");
+            let checkpoint = checkpoint_at_lib(&node).await?;
+            // The finality scan starts where the SDK does.
+            registry
+                .write()
+                .expect("registry lock")
+                .seed_anchor(u64::from(checkpoint.lib_slot));
+            Some(checkpoint)
         }
         None => checkpoint,
     };
@@ -1105,33 +362,31 @@ async fn main() -> Result<()> {
                      no checkpoint: start once with REBUILD_TREE=true"
                 );
             }
-            println!(
-                "  lez       finalized LEZ block {} at the LIB (slot {}); reading the finalized \
+            info!(
+                "lez: finalized LEZ block {} at the LIB (slot {}); reading the finalized \
                  history up to it from the LEZ Sequencer...",
                 anchor.block_id(),
                 u64::from(checkpoint.lib_slot)
             );
             if anchor.block_id() >= args.first_lez_block_id {
-                fill_final_from_rpc(
-                    &source,
-                    &registry,
-                    args.first_lez_block_id,
-                    anchor.block_id() - 1,
-                )
-                .await?;
-                if registry
-                    .write()
+                // The history before it comes from the LEZ Sequencer, under its hash.
+                apply_lez_finalized(&source, &registry, &anchor).await?;
+                let final_block_id = registry
+                    .read()
                     .expect("registry lock")
-                    .apply_lez_finalized(&anchor)?
-                    .is_some()
-                {
+                    .lez
+                    .final_reader()
+                    .lez_block_id;
+                if final_block_id != anchor.block_id() {
                     bail!(
-                        "the LEZ Sequencer's history does not reach LEZ block {}",
+                        "the LEZ Sequencer did not serve the history up to LEZ block {}: start \
+                         again",
                         anchor.block_id()
                     );
                 }
             }
-            save_lez_checkpoint(&registry, &checkpoint)?;
+            set_lez_checkpoint(&registry, &checkpoint)?;
+            registry.write().expect("registry lock").save()?;
             checkpoint
         }
     };
@@ -1150,30 +405,30 @@ async fn main() -> Result<()> {
 
     {
         let registry = registry.read().expect("registry lock");
-        println!(
+        info!(
             "RLN Membership Zone {}",
             if indexer { "indexer" } else { "sequencer" }
         );
-        println!("  node      {node_url}");
-        println!(
-            "  channel   {} ({})",
+        info!("node: {node_url}");
+        info!(
+            "channel: {} ({})",
             hex::encode(channel_id.as_ref()),
             args.channel_id.as_deref().map_or_else(
                 || format!("sha256 of {:?}", args.channel_name),
                 |_| "given".into()
             )
         );
-        println!("  tree_id   {}", hex::encode(tree_id));
-        println!("  lez       {lez_source}");
-        println!(
-            "  lez       finalized tree at LEZ block {}, head at {}",
+        info!("tree_id: {}", hex::encode(tree_id));
+        info!("lez: {lez_source}");
+        info!(
+            "lez: finalized tree at LEZ block {}, head at {}",
             registry.lez.final_reader().lez_block_id,
             registry.head().lez_block_id
         );
-        println!("  http      http://{}", args.http_addr);
-        println!("  data      {}", args.data_dir.display());
-        println!(
-            "  channel   {} final (final msg {}), {} in view, covered to LEZ block {}, first \
+        info!("http: http://{}", args.http_addr);
+        info!("data: {}", args.data_dir.display());
+        info!(
+            "channel: {} final (final msg {}), {} in view, covered to LEZ block {}, first \
              block {}{}",
             registry.zone.final_entries().len(),
             short(&registry.zone.final_msg().into()),
@@ -1183,8 +438,8 @@ async fn main() -> Result<()> {
             if resumed { " (checkpoint resumed)" } else { "" }
         );
         if let Some(stall) = registry.zone.stall() {
-            println!(
-                "  WARNING   the final tier is frozen at batch msg {} (L1 slot {}): {}; {} \
+            warn!(
+                "the final tier is frozen at batch msg {} (L1 slot {}): {}; {} \
                  batch(es) parked after it",
                 short(&stall.msg),
                 stall.l1_slot,
@@ -1194,12 +449,12 @@ async fn main() -> Result<()> {
         }
     }
     if let Some(msg) = registry.read().expect("registry lock").in_flight() {
-        println!(
+        info!(
             "batch msg {} still in flight from the previous run; no new batch until it lands",
             short(&msg)
         );
     }
-    println!("waiting for the Zone SDK to be ready...");
+    info!("waiting for the Zone SDK to be ready...");
 
     let zone_channel = ZoneChannel {
         node_url: node_url.clone(),
@@ -1216,72 +471,78 @@ async fn main() -> Result<()> {
     let mut finality_tick = tokio::time::interval(Duration::from_secs(FINALITY_SCAN_SEC));
     finality_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    loop {
-        // rustfmt does not reach into `select!`: every arm is one call, the work is in the
-        // `on_*` functions above.
-        tokio::select! {
-            event = sdk.next_event() => match event {
-                Event::Ready => {
-                    if !ready {
-                        println!("ready\n");
+    // The store is closed whatever ends the loop: Ctrl-C, or an error out of an arm.
+    let outcome: Result<()> = async {
+        loop {
+            // rustfmt does not reach into `select!`: every arm is one call, the work is in the
+            // `on_*` functions above.
+            tokio::select! {
+                event = sdk.next_event() => match event {
+                    Event::Ready => {
+                        if !ready {
+                            info!("ready");
+                        }
+                        ready = true;
                     }
-                    ready = true;
-                }
-                Event::BlocksProcessed { checkpoint, channel_update, finalized, .. } => {
-                    let tip: [u8; 32] = channel_view.borrow().tip_message.into();
-                    on_blocks_processed(
+                    Event::BlocksProcessed { checkpoint, channel_update, finalized, .. } => {
+                        let tip: [u8; 32] = channel_view.borrow().tip_message.into();
+                        on_blocks_processed(
+                            &mut sdk,
+                            &registry,
+                            &zone_channel,
+                            tip,
+                            &checkpoint,
+                            &channel_update,
+                            &finalized,
+                        )
+                        .await?;
+                    }
+                    _ => {}
+                },
+                lez_event = lez_sdk.next_event() => match lez_event {
+                    Event::Ready => {
+                        if !lez_ready {
+                            info!("LEZ channel ready");
+                        }
+                        lez_ready = true;
+                    }
+                    Event::BlocksProcessed { checkpoint, channel_update, finalized, .. } => {
+                        on_lez_blocks_processed(
+                            &source,
+                            &registry,
+                            &checkpoint,
+                            &channel_update,
+                            &finalized,
+                        )
+                        .await?;
+                    }
+                    _ => {}
+                },
+                _ = tick.tick(), if ready && lez_ready => {
+                    on_tick(
                         &mut sdk,
                         &registry,
-                        &zone_channel,
-                        tip,
-                        &checkpoint,
-                        &channel_update,
-                        &finalized,
+                        args.heartbeat_sec,
+                        &mut contradicted_count,
+                        &mut last_publish_unix,
                     )
                     .await?;
                 }
-                _ => {}
-            },
-            lez_event = lez_sdk.next_event() => match lez_event {
-                Event::Ready => {
-                    if !lez_ready {
-                        println!("LEZ channel ready");
+                _ = finality_tick.tick(), if ready => {
+                    match reconcile_finality(&node, channel_id, &registry).await {
+                        Ok(0) => {}
+                        Ok(n) => info!("finality scan: {n} entry(ies) the stream had missed"),
+                        Err(e) => warn!("finality scan failed: {e}"),
                     }
-                    lez_ready = true;
                 }
-                Event::BlocksProcessed { checkpoint, channel_update, finalized, .. } => {
-                    on_lez_blocks_processed(
-                        &source,
-                        &registry,
-                        &checkpoint,
-                        &channel_update,
-                        &finalized,
-                    )
-                    .await?;
-                }
-                _ => {}
-            },
-            _ = tick.tick(), if ready && lez_ready => {
-                on_tick(
-                    &mut sdk,
-                    &registry,
-                    &args,
-                    &mut contradicted_count,
-                    &mut last_publish_unix,
-                )
-                .await?;
+                _ = tokio::signal::ctrl_c() => break,
             }
-            _ = finality_tick.tick(), if ready => {
-                match reconcile_finality(&node, channel_id, &registry).await {
-                    Ok(0) => {}
-                    Ok(n) => println!("finality scan: {n} entry(ies) the stream had missed"),
-                    Err(e) => println!("finality scan failed: {e}"),
-                }
-            }
-            _ = tokio::signal::ctrl_c() => break,
         }
+        Ok(())
     }
-    registry.write().expect("registry lock").close()?;
-    println!("stopped; state in {}", args.data_dir.display());
+    .await;
+    let closed = registry.write().expect("registry lock").close();
+    outcome.and(closed)?;
+    info!("stopped; state in {}", args.data_dir.display());
     Ok(())
 }

@@ -30,6 +30,7 @@ use rln::prelude::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::warn;
 use zerokit_utils::merkle_tree::{
     OptimalMerkleConfig, OptimalMerkleTree, ZerokitMerkleProof, ZerokitMerkleTree,
 };
@@ -107,11 +108,8 @@ pub fn fr_from_bytes_le(bytes: &[u8; 32]) -> Result<Fr, String> {
 pub enum Removed {
     /// Its expiry passed on the LEZ clock; the membership itself is not over (an `Extend`
     /// may still put it back).
-    #[serde(alias = "Expired")]
     Expired,
-    #[serde(alias = "Slashed")]
     Slashed,
-    #[serde(alias = "Erased")]
     Erased,
 }
 
@@ -124,15 +122,12 @@ pub struct Member {
     #[serde(with = "hex::serde")]
     pub rate_commitment: [u8; 32],
     /// Whether its leaf is in the tree (it proves while it is).
-    #[serde(alias = "live")]
     pub active: bool,
     /// Why the leaf is not in the tree, when it is not.
     pub removed: Option<Removed>,
     /// The LEZ block of the `Registered` that made it.
-    #[serde(default)]
     pub registered_at_lez_block_id: u64,
     /// The LEZ block whose event or expiry step took the leaf out, while it is out.
-    #[serde(default)]
     pub removed_at_lez_block_id: Option<u64>,
 }
 
@@ -162,7 +157,6 @@ pub struct Stats {
     /// Privacy-preserving transactions with a public effect under the registration program:
     /// they carry no instruction and emit no event, so each changed the registry in a way
     /// this tree does not have.
-    #[serde(alias = "private_transactions")]
     pub private_transaction_count: u64,
 }
 
@@ -198,21 +192,16 @@ pub struct ProofPath {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Meta {
     tree_id: String,
-    #[serde(alias = "applied_block_id")]
     lez_block_id: u64,
     /// Hash of the last LEZ block applied, hex; the next block must chain on it.
-    #[serde(default)]
     last_block_hash: Option<String>,
-    #[serde(alias = "applied_timestamp_ms")]
     lez_timestamp_ms: u64,
     stats: Stats,
     /// By `id_commitment`, hex.
     members: HashMap<String, Member>,
     /// The root after every LEZ block that changed the tree, by block id (as a string, JSON
     /// keys), root hex.
-    #[serde(default)]
     roots_by_block: BTreeMap<String, String>,
-    #[serde(default)]
     extra: Value,
 }
 
@@ -460,7 +449,7 @@ impl Reader {
                     // order (its `events` module); a jump means a block this reader missed or
                     // a program change. Said once, when the block is applied.
                     if *leaf_index != self.stats.registered {
-                        println!(
+                        warn!(
                             "Registered carries leaf_index {leaf_index} after {} Registered \
                              applied: following the event",
                             self.stats.registered
@@ -468,7 +457,7 @@ impl Reader {
                     }
                     self.stats.registered += 1;
                     if self.members.get(id_commitment).is_some_and(|m| !m.ended()) {
-                        println!(
+                        warn!(
                             "Registered {}.. again while its membership is not over; the new \
                              leaf {leaf_index} replaces it",
                             hex::encode(&id_commitment[..4])
@@ -499,14 +488,14 @@ impl Reader {
                 }) => {
                     self.stats.extended += 1;
                     let Some(member) = self.members.get_mut(id_commitment) else {
-                        println!(
+                        warn!(
                             "Extended {}.. without a registration; ignored",
                             hex::encode(&id_commitment[..4])
                         );
                         continue;
                     };
                     if member.ended() {
-                        println!(
+                        warn!(
                             "Extended {}.. after its membership ended; ignored",
                             hex::encode(&id_commitment[..4])
                         );
@@ -589,7 +578,7 @@ impl Reader {
         block_id: u64,
     ) -> Result<Option<Change>> {
         let Some(member) = self.members.get_mut(id_commitment) else {
-            println!(
+            warn!(
                 "{cause:?} {}.. without a registration; ignored",
                 hex::encode(&id_commitment[..4])
             );
@@ -834,23 +823,6 @@ mod test {
             Some(Removed::Slashed)
         );
         assert_eq!(reader.active_count(), 0);
-    }
-
-    #[test]
-    fn test_member_reads_the_previous_layout() {
-        let member: Member = serde_json::from_str(concat!(
-            r#"{"leaf_index":3,"expiry_timestamp_ms":5,"#,
-            r#""rate_commitment":"#,
-            r#""00000000000000000000000000000000000000000000000000000000000000ff","#,
-            r#""live":false,"removed":"Slashed"}"#
-        ))
-        .unwrap();
-        assert!(!member.active);
-        assert_eq!(member.removed, Some(Removed::Slashed));
-        assert_eq!(
-            serde_json::to_value(member.removed).unwrap(),
-            serde_json::json!("slashed")
-        );
     }
 
     #[test]

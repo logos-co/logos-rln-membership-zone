@@ -19,9 +19,182 @@ use axum::{
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::registry::{EntryView, Registry, RootEntry};
+use crate::{
+    batch::{Batch, Change, Kind},
+    registry::{BedrockStatus, Registry},
+    zone_chain::{BatchIngestError, Tip},
+};
 
 pub type Shared = Arc<RwLock<Registry>>;
+
+/// One tree change a batch carried, as the API shows it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ChangeRecord {
+    pub kind: ChangeKind,
+    pub leaf_index: u64,
+    /// The leaf inserted, 32 bytes little-endian in hex; `None` for a removal.
+    pub rate_commitment: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    Insert,
+    Remove,
+}
+
+impl ChangeRecord {
+    fn from_change(change: &Change) -> Option<Self> {
+        Some(match change.kind.as_ref()? {
+            Kind::Insert(insert) => Self {
+                kind: ChangeKind::Insert,
+                leaf_index: insert.leaf_index,
+                rate_commitment: Some(hex::encode(&insert.rate_commitment)),
+            },
+            Kind::Remove(remove) => Self {
+                kind: ChangeKind::Remove,
+                leaf_index: remove.leaf_index,
+                rate_commitment: None,
+            },
+        })
+    }
+}
+
+/// A channel entry as the API shows it: its span, root and changes when it carries a batch,
+/// its `bedrock_status` and, finalized, the L1 slot of the block that finalized it. The fold's
+/// error stays internal (LEZ `BatchIngestError`): the API serves the applied entries and the
+/// `stall`.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryView {
+    pub msg_id: String,
+    pub parent_msg: String,
+    /// `None` for an entry that carries no batch.
+    pub from_lez_block_id: Option<u64>,
+    pub to_lez_block_id: Option<u64>,
+    pub root: Option<String>,
+    pub changes: Vec<ChangeRecord>,
+    pub bedrock_status: BedrockStatus,
+    /// The L1 slot of the block that finalized it; `null` before.
+    pub l1_slot: Option<u64>,
+    /// Why its batch did not apply, when it did not (retryable: not judged yet).
+    #[serde(skip)]
+    pub error: Option<BatchIngestError>,
+}
+
+impl EntryView {
+    fn new(
+        msg: [u8; 32],
+        parent: [u8; 32],
+        batch: Option<&Batch>,
+        bedrock_status: BedrockStatus,
+        l1_slot: Option<u64>,
+        error: Option<&BatchIngestError>,
+    ) -> Self {
+        Self {
+            msg_id: hex::encode(msg),
+            parent_msg: hex::encode(parent),
+            from_lez_block_id: batch.map(|b| b.from_lez_block_id),
+            to_lez_block_id: batch.map(|b| b.to_lez_block_id),
+            root: batch.map(|b| hex::encode(Tip::from(b).root)),
+            changes: batch.map_or_else(Vec::new, |b| {
+                b.changes
+                    .iter()
+                    .filter_map(ChangeRecord::from_change)
+                    .collect()
+            }),
+            bedrock_status,
+            l1_slot,
+            // An entry without a batch has nothing to apply and nothing to park on.
+            error: error.filter(|_| batch.is_some()).cloned(),
+        }
+    }
+
+    /// Whether the entry carries a batch the fold applied (LEZ `AcceptOutcome::Applied`).
+    pub fn applied(&self) -> bool {
+        self.root.is_some() && self.error.is_none()
+    }
+}
+
+/// Every entry of the channel, final tier first then the view, as the API shows them.
+pub fn entries(registry: &Registry) -> Vec<EntryView> {
+    let mut out: Vec<EntryView> = registry
+        .zone
+        .final_entries()
+        .iter()
+        .map(|f| {
+            EntryView::new(
+                f.msg,
+                f.parent,
+                f.batch().as_ref(),
+                BedrockStatus::Finalized,
+                Some(f.l1_slot),
+                f.error.as_ref(),
+            )
+        })
+        .collect();
+    for (entry, outcome) in registry.zone.view_outcomes() {
+        let msg: [u8; 32] = entry.msg.into();
+        let status = if registry.is_pending(&msg) {
+            BedrockStatus::Pending
+        } else {
+            BedrockStatus::Adopted
+        };
+        out.push(EntryView::new(
+            msg,
+            entry.parent.into(),
+            entry.batch.as_ref(),
+            status,
+            None,
+            outcome.as_ref().err(),
+        ));
+    }
+    out
+}
+
+/// The batches carrying one root, the one that produced it first (its changes made the root).
+pub struct RootEntry {
+    pub entries: Vec<EntryView>,
+}
+
+impl RootEntry {
+    pub fn produced_by(&self) -> &EntryView {
+        &self.entries[0]
+    }
+
+    pub fn carried_to_lez_block_id(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter_map(|e| e.to_lez_block_id)
+            .max()
+            .unwrap_or_default()
+    }
+}
+
+/// The roots newest first, at most `window_size`: one entry per run of applied batches
+/// carrying the same root, the batch that produced it first and every batch of the run after
+/// it (heartbeats as a rule). A root the tree comes back to later is a new run.
+pub fn roots_of(registry: &Registry, window_size: usize) -> Vec<RootEntry> {
+    let mut runs: Vec<RootEntry> = vec![];
+    for entry in entries(registry).into_iter().filter(EntryView::applied) {
+        match runs.last_mut() {
+            Some(run) if run.produced_by().root == entry.root => run.entries.push(entry),
+            _ => runs.push(RootEntry {
+                entries: vec![entry],
+            }),
+        }
+    }
+    runs.reverse();
+    runs.truncate(window_size);
+    runs
+}
+
+/// The newest applied entry, a finalized one only when `finalized_only`.
+pub fn newest(registry: &Registry, finalized_only: bool) -> Option<EntryView> {
+    entries(registry)
+        .into_iter()
+        .rev()
+        .find(|e| e.applied() && (e.bedrock_status == BedrockStatus::Finalized || !finalized_only))
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -86,11 +259,7 @@ fn root_ref(entry: Option<EntryView>) -> Value {
 
 async fn summary(State(state): State<AppState>) -> Json<Value> {
     let registry = state.registry.read().expect("registry lock");
-    let applied = registry
-        .entries()
-        .iter()
-        .filter(|e| e.outcome == "applied")
-        .count();
+    let applied = entries(&registry).iter().filter(|e| e.applied()).count();
     let body = json!({
         "zone_channel_id": state.channel_id,
         "lez_source": state.lez_source,
@@ -113,8 +282,8 @@ async fn summary(State(state): State<AppState>) -> Json<Value> {
             "finalized_block_id": registry.lez.final_reader().lez_block_id,
         },
         "orphaned_count": registry.orphaned_count(),
-        "newest_published": root_ref(registry.newest(false)),
-        "newest_finalized": root_ref(registry.newest(true)),
+        "newest_published": root_ref(newest(&registry, false)),
+        "newest_finalized": root_ref(newest(&registry, true)),
         "endpoints": [
             "/roots/{window_size}",
             "/merkle_proof/{leaf_index or id_commitment}",
@@ -131,8 +300,7 @@ async fn summary(State(state): State<AppState>) -> Json<Value> {
 /// newest one that removes a leaf, say, are the ones no removed member can still prove under.
 async fn roots(State(state): State<AppState>, Path(window_size): Path<usize>) -> Json<Value> {
     let registry = state.registry.read().expect("registry lock");
-    let roots: Vec<_> = registry
-        .roots(window_size)
+    let roots: Vec<_> = roots_of(&registry, window_size)
         .into_iter()
         .map(RootWindowEntry::new)
         .collect();
@@ -185,8 +353,8 @@ async fn merkle_proof(
             "removed": member.removed,
             "removed_at_lez_block_id": member.removed_at_lez_block_id,
             "expiry_timestamp_ms": member.expiry_timestamp_ms,
-            "newest_published": root_ref(registry.newest(false)),
-            "newest_finalized": root_ref(registry.newest(true)),
+            "newest_published": root_ref(newest(&registry, false)),
+            "newest_finalized": root_ref(newest(&registry, true)),
             "proof": proof,
         }),
     ))
@@ -237,4 +405,161 @@ async fn leaves(State(state): State<AppState>) -> Json<Value> {
 
 fn error(code: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
     (code, Json(json!({ "error": message })))
+}
+
+#[cfg(test)]
+mod test {
+    use lb_core::mantle::ops::channel::MsgId;
+
+    use super::*;
+    use crate::{
+        lez::{Block, BlockHeader, Registered, RlnEvent},
+        zone_chain::ChannelEntry,
+    };
+
+    fn block(block_id: u64, events: Vec<RlnEvent>) -> Block {
+        Block {
+            header: BlockHeader {
+                block_id,
+                prev_block_hash: common::HashType([block_id as u8 - 1; 32]),
+                hash: common::HashType([block_id as u8; 32]),
+                timestamp: 1_000 * block_id,
+            },
+            events,
+            private_transaction_count: 0,
+        }
+    }
+
+    fn registered(n: u8, leaf_index: u64) -> RlnEvent {
+        let mut id_commitment = [0u8; 32];
+        id_commitment[0] = n;
+        RlnEvent::Registered(Registered {
+            tree_id: [0; 32],
+            id_commitment,
+            rate_limit: 100,
+            expiry_timestamp_ms: u64::MAX,
+            leaf_index,
+        })
+    }
+
+    /// A sequencer that registered leaf 0 in LEZ block 1, published it (finalized on Bedrock
+    /// at slot 500), then a heartbeat over block 2 (adopted) and one over block 3 (in flight).
+    fn state() -> AppState {
+        let mut registry = Registry::open_temporary(1, false).unwrap();
+        registry
+            .apply_lez_adopted(&block(1, vec![registered(1, 0)]))
+            .unwrap();
+        let first = registry.next_batch().unwrap();
+        registry.record_publish(MsgId::from([1; 32]), MsgId::root(), &first);
+        registry.mark_adopted_up_to([1; 32]);
+        registry.apply_zone_finalized(
+            ChannelEntry {
+                msg: MsgId::from([1; 32]),
+                parent: MsgId::root(),
+                batch: Some(first),
+            },
+            500,
+        );
+        registry.apply_lez_adopted(&block(2, vec![])).unwrap();
+        let second = registry.next_batch().unwrap();
+        registry.record_publish(MsgId::from([2; 32]), MsgId::from([1; 32]), &second);
+        registry.mark_adopted_up_to([2; 32]);
+        registry.apply_lez_adopted(&block(3, vec![])).unwrap();
+        let third = registry.next_batch().unwrap();
+        registry.record_publish(MsgId::from([3; 32]), MsgId::from([2; 32]), &third);
+        AppState {
+            registry: Arc::new(RwLock::new(registry)),
+            channel_id: "aa".repeat(32),
+            lez_source: "test".into(),
+            mode: "sequencer".into(),
+        }
+    }
+
+    #[test]
+    fn test_entries_roots_and_newest_follow_the_lineage() {
+        let state = state();
+        let registry = state.registry.read().unwrap();
+        let all = entries(&registry);
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            all.iter().map(|e| e.bedrock_status).collect::<Vec<_>>(),
+            vec![
+                BedrockStatus::Finalized,
+                BedrockStatus::Adopted,
+                BedrockStatus::Pending
+            ]
+        );
+        assert_eq!(all[0].l1_slot, Some(500));
+        assert_eq!(all[0].changes.len(), 1);
+        assert_eq!(all[0].changes[0].kind, ChangeKind::Insert);
+        assert!(all.iter().all(EntryView::applied));
+        // One root, carried by three batches to block 3.
+        let roots = roots_of(&registry, 5);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].entries.len(), 3);
+        assert_eq!(roots[0].produced_by().from_lez_block_id, Some(1));
+        assert_eq!(roots[0].carried_to_lez_block_id(), 3);
+        assert_eq!(
+            newest(&registry, false).unwrap().msg_id,
+            hex::encode([3; 32])
+        );
+        assert_eq!(
+            newest(&registry, true).unwrap().msg_id,
+            hex::encode([1; 32])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_handlers_answer_from_the_head() {
+        let state = state();
+        let Json(summary) = summary(State(state.clone())).await;
+        assert_eq!(summary["batch_count"], 3);
+        assert_eq!(summary["in_flight"], json!(hex::encode([3; 32])));
+        assert_eq!(summary["lez"]["adopted_block_id"], 3);
+        assert_eq!(summary["lez"]["finalized_block_id"], 0);
+        assert_eq!(summary["tree"]["active_leaf_count"], 1);
+        assert!(summary["stall"].is_null());
+        assert_eq!(summary["head"]["lez_block_id"], 3);
+        assert_eq!(summary["newest_finalized"]["to_lez_block_id"], 1);
+
+        let Json(roots) = roots(State(state.clone()), Path(5)).await;
+        assert_eq!(roots["roots"].as_array().unwrap().len(), 1);
+        assert_eq!(roots["roots"][0]["from_lez_block_id"], 1);
+        assert_eq!(roots["roots"][0]["to_lez_block_id"], 3);
+        assert_eq!(roots["roots"][0]["root"], summary["head"]["root"]);
+        assert_eq!(
+            roots["roots"][0]["batches"][0]["bedrock_status"],
+            "finalized"
+        );
+        assert!(roots["roots"][0]["batches"][0].get("error").is_none());
+
+        let id = hex::encode({
+            let mut id = [0u8; 32];
+            id[0] = 1;
+            id
+        });
+        let Json(by_index) = merkle_proof(State(state.clone()), Path("0".into()))
+            .await
+            .unwrap();
+        assert_eq!(by_index["id_commitment"], id);
+        assert_eq!(by_index["active"], true);
+        assert_eq!(
+            by_index["proof"]["path_elements"].as_array().unwrap().len(),
+            20
+        );
+        let Json(by_id) = merkle_proof(State(state.clone()), Path(id)).await.unwrap();
+        assert_eq!(by_id["leaf_index"], 0);
+        let (code, _) = merkle_proof(State(state.clone()), Path("7".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        let (code, _) = merkle_proof(State(state.clone()), Path("zz".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+
+        let Json(leaves) = leaves(State(state)).await;
+        assert_eq!(leaves["active"].as_array().unwrap().len(), 1);
+        assert_eq!(leaves["removed"].as_array().unwrap().len(), 0);
+    }
 }

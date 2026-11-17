@@ -16,6 +16,7 @@ use lb_core::mantle::ops::channel::MsgId;
 use prost::Message as _;
 use rln::prelude::{Fr, PoseidonHash};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use zerokit_utils::merkle_tree::{OptimalMerkleConfig, OptimalMerkleTree, ZerokitMerkleTree};
 
 use crate::{
@@ -461,7 +462,7 @@ impl ZoneChain {
                 continue;
             }
             if entry.parent != self.pin() {
-                println!(
+                warn!(
                     "adopted channel entry {} chains on {}, not on the pin {}",
                     short(&entry.msg),
                     short(&entry.parent),
@@ -554,7 +555,9 @@ impl ZoneChain {
         {
             return entry.batch.as_ref().map(|_| AcceptOutcome::AlreadyApplied);
         }
-        // Finality is prefix-monotone: the held entries this one chains on finalize first.
+        // Finality is prefix-monotone: the held entries this one chains on finalize first (the
+        // SDK reports each with its own slot; one it skipped gets this slot, at or after its
+        // own).
         if let Some(ancestor) = self
             .view
             .iter()
@@ -564,7 +567,7 @@ impl ZoneChain {
             self.apply_finalized(ancestor, l1_slot, judge);
         }
         if entry.parent != self.final_msg {
-            println!(
+            warn!(
                 "finalized entry {} chains on {}, not on the final entry {}",
                 short(&entry.msg),
                 short(&entry.parent),
@@ -614,7 +617,10 @@ impl ZoneChain {
         if let Some(stall) = &mut self.stall {
             stall.orphans_since += 1;
             return AcceptOutcome::Parked(BatchIngestError::UnexpectedBlockId {
-                expected: self.final_tip.as_ref().map_or(1, |t| t.to_lez_block_id + 1),
+                expected: self
+                    .final_tip
+                    .as_ref()
+                    .map_or(self.first_lez_block_id, |t| t.to_lez_block_id + 1),
                 got: batch.from_lez_block_id,
             });
         }

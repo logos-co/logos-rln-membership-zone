@@ -6944,9 +6944,9 @@ dependencies = [
 
 [[package]]
 name = "rln"
-version = "3.0.0"
+version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb2b2ee8950bafc4cb25dcf45cf14e3ab8bc0530c697cfb5c40c6257a0e1476d"
+checksum = "9530cb46eef0ff46206cef3098f514a5946790706e7d5f2606f635ab6bb721b7"
 dependencies = [
  "ark-bn254",
  "ark-ec",
@@ -7108,13 +7108,14 @@ dependencies = [
 
 [[package]]
 name = "ruint"
-version = "1.20.1"
+version = "1.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2973657b5127d510e230f5c63d2d106af9c8f79393d8b9f4647323e8196bdde5"
+checksum = "a0de3fa9b4dac39cc2bd65679bacf9f531899d933605e2963b40c2129cdb55f2"
 dependencies = [
  "ark-ff",
  "borsh",
  "proptest",
+ "rand 0.10.3",
  "rand 0.8.8",
  "rand 0.9.5",
  "ruint-macro",
@@ -7413,9 +7414,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.151"
+version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
  "itoa",
  "memchr",
@@ -9302,9 +9303,9 @@ dependencies = [
 
 [[package]]
 name = "zerokit_utils"
-version = "3.0.0"
+version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c286505fb5f19f1f3ffc70b280cca3fab720a9288a65ffc6e0b58a29c98b7e5c"
+checksum = "be562f415e46dda57fd7a268a30e0da5fee263ca4a0ccc4ddff4e9900ee888f2"
 dependencies = [
  "ark-ff",
  "num-bigint",
