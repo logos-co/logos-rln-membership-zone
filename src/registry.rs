@@ -1290,4 +1290,119 @@ mod test {
         registry.close().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// A Bedrock reorg on the LEZ channel replaces an adopted block the sequencer already
+    /// batched (the LEZ Sequencer produced it again with other contents): the batch on the
+    /// channel claims a root the canonical lineage contradicts. The sequencer reports it and
+    /// refuses to publish on top of it (`would_apply` fails on its own head), instead of
+    /// publishing a root the channel replay cannot reach; the correction is RFC Q6.
+    #[test]
+    fn test_a_lez_reorg_contradicting_a_published_batch_is_reported_and_stops_the_batches() {
+        let mut registry = Registry::open_temporary(1, false).unwrap();
+        registry
+            .apply_lez_adopted(&block(1, vec![registered(1, 0)]))
+            .unwrap();
+        registry
+            .apply_lez_adopted(&block(2, vec![registered(2, 1)]))
+            .unwrap();
+        let batch = registry.next_batch().unwrap();
+        assert_eq!(
+            registry.record_publish(msg(1), MsgId::root(), &batch),
+            PublishRecord::Extended
+        );
+        assert!(registry.contradicted().is_empty());
+        // The reorg: block 1 stays, block 2 comes back with another registration.
+        registry.apply_lez_conflict().unwrap();
+        assert_eq!(registry.head().lez_block_id, 0);
+        assert!(registry.pending_changes.is_empty());
+        registry
+            .apply_lez_adopted(&block(1, vec![registered(1, 0)]))
+            .unwrap();
+        registry
+            .apply_lez_adopted(&block(2, vec![registered(3, 1)]))
+            .unwrap();
+        // Block 2 is covered by the batch, so its changes are not pending again; the batch's
+        // root is not the tree's root at block 2 any more.
+        assert!(registry.pending_changes.is_empty());
+        let contradicted = registry.contradicted();
+        assert_eq!(contradicted.len(), 1);
+        assert_eq!(contradicted[0].to_lez_block_id, 2);
+        assert_eq!(contradicted[0].claimed, Tip::from(&batch).root);
+        assert_eq!(contradicted[0].derived, registry.head().root());
+        assert!(registry.next_batch().is_none());
+        // The next block: a batch from the replay's root cannot reach the tree's root.
+        registry
+            .apply_lez_adopted(&block(3, vec![registered(4, 2)]))
+            .unwrap();
+        let next = registry.next_batch().unwrap();
+        assert_eq!((next.from_lez_block_id, next.to_lez_block_id), (3, 3));
+        assert!(matches!(
+            registry.would_apply(&next),
+            Err(BatchIngestError::HashMismatch { .. })
+        ));
+    }
+
+    /// A Bedrock reorg drops two published batches at once: they leave the view in order and
+    /// go back in order, each on the one before (`Stale` when not), and no new batch can stand
+    /// in for them, since their changes left `pending_changes` when they were first published.
+    #[test]
+    fn test_two_dropped_batches_go_back_in_order() {
+        let mut registry = Registry::open_temporary(1, false).unwrap();
+        registry
+            .apply_lez_adopted(&block(1, vec![registered(1, 0)]))
+            .unwrap();
+        let first = registry.next_batch().unwrap();
+        registry.record_publish(msg(1), MsgId::root(), &first);
+        registry
+            .apply_lez_adopted(&block(2, vec![registered(2, 1)]))
+            .unwrap();
+        let second = registry.next_batch().unwrap();
+        assert_eq!((second.from_lez_block_id, second.to_lez_block_id), (2, 2));
+        registry.record_publish(msg(2), msg(1), &second);
+        assert_eq!(registry.mark_adopted_up_to([2; 32]), vec![[1; 32], [2; 32]]);
+        assert_eq!(registry.covered_to(), 2);
+        // The reorg drops both.
+        let dropped = registry.apply_zone_conflict(vec![]);
+        assert_eq!(
+            dropped.iter().map(|e| e.msg).collect::<Vec<_>>(),
+            vec![msg(1), msg(2)]
+        );
+        assert_eq!(registry.orphaned_count(), 2);
+        assert_eq!(registry.covered_to(), 0);
+        assert!(registry.in_flight().is_none());
+        // A new batch over the same span would carry no changes: it cannot replace them.
+        let instead = registry.next_batch().unwrap();
+        assert_eq!((instead.from_lez_block_id, instead.to_lez_block_id), (1, 2));
+        assert!(instead.changes.is_empty());
+        assert!(matches!(
+            registry.would_apply(&instead),
+            Err(BatchIngestError::HashMismatch { .. })
+        ));
+        // Published again in order, each on the one before.
+        assert!(registry.would_apply(&first).is_ok());
+        assert_eq!(
+            registry.record_publish(msg(3), MsgId::root(), &first),
+            PublishRecord::Extended
+        );
+        // The second on the root would be stale: the pin moved to the first.
+        assert_eq!(
+            registry.record_publish(msg(4), MsgId::root(), &second),
+            PublishRecord::Stale
+        );
+        assert!(registry.would_apply(&second).is_ok());
+        assert_eq!(
+            registry.record_publish(msg(5), msg(3), &second),
+            PublishRecord::Extended
+        );
+        assert_eq!(registry.covered_to(), 2);
+        assert_eq!(registry.in_flight(), Some([5; 32]));
+        assert_eq!(
+            registry.lineage(),
+            vec![
+                ([3; 32], BedrockStatus::Pending),
+                ([5; 32], BedrockStatus::Pending)
+            ]
+        );
+        assert!(registry.contradicted().is_empty());
+    }
 }

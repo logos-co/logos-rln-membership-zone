@@ -364,7 +364,8 @@ and a view, the unfinalized lineage chained on the last finalized one, the head 
 Zone indexers apply or park each batch ([Zone Indexer](#zone-indexer)) as they fold it,
 and a Zone sequencer folds its own batches the same way,
 so it sees a parked batch of its own and knows the channel needs a correction.
-If a reorg drops batches from the view, the Zone sequencer publishes them again on the new tip, unchanged, in order.
+If a reorg drops batches from the view, the Zone sequencer publishes them again on the new tip, unchanged, in order,
+and keeps a dropped batch until it is published again: no later batch carries its changes.
 If the mempool drops a batch, the Zone sequencer builds it again.
 After a restart, a dropped batch or a switch to another Zone sequencer,
 a Zone sequencer continues from the channel's head, which it reads as a Zone indexer does.
@@ -752,7 +753,8 @@ That raises several points:
 
 ### Q5. Batches lost on Bedrock (Medium)
 
-**Problem.** A batch sits in a Bedrock block before finality, and a reorg can orphan or reorder it;
+**Problem.** A batch sits in a Bedrock block before finality, and a reorg can orphan it
+(not reorder it: every inscription names its parent, so a reorg only cuts the lineage short);
 the Zone sequencer then publishes it and every batch after it again ([Zone Sequencer](#zone-sequencer)).
 The tree is unaffected, since every reader derives it from LEZ.
 What stops is the registry: until the batches are back, validators get no newer root,

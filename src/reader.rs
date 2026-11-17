@@ -930,4 +930,58 @@ mod test {
         assert!(Reader::open(&dir, [9; 32], 0).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The tree (sled, written through) and the reader's state (`reader.json`, written by
+    /// `persist`) are two writes: a crash between them leaves the tree a block ahead of the
+    /// state. The next start applies that block again: the rules are idempotent on the tree
+    /// (a leaf set twice, an empty leaf deleted), so the tree, the members and the root
+    /// history come out as if the block had been applied once.
+    #[test]
+    fn test_a_block_applied_again_after_a_crash_leaves_the_same_tree() {
+        let dir =
+            std::env::temp_dir().join(format!("zone-reader-crash-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Block 2 registers leaf 1 and expires leaf 0 (registered in block 1 until 5_000).
+        let block_2 = block(2, 6_000, vec![registered(2, 1, 9_000)]);
+        let (root, members, roots) = {
+            let mut reader = Reader::open(&dir, [0; 32], 0).unwrap();
+            reader
+                .apply_block(&block(1, 1_000, vec![registered(1, 0, 5_000)]))
+                .unwrap();
+            reader.persist().unwrap();
+            // Applied, in the tree, but the crash comes before `persist`.
+            reader.apply_block(&block_2).unwrap();
+            let snapshot = (
+                reader.root(),
+                reader.active_leaves(),
+                reader.roots_by_block.clone(),
+            );
+            reader.close().unwrap();
+            snapshot
+        };
+        let mut reader = Reader::open(&dir, [0; 32], 0).unwrap();
+        // The state is at block 1, the tree already at block 2.
+        assert_eq!(reader.lez_block_id, 1);
+        assert_eq!(reader.root(), root);
+        assert_eq!(reader.active_count(), 1);
+        reader.check_chain(std::slice::from_ref(&block_2)).unwrap();
+        let changes = reader.apply_block(&block_2).unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(reader.root(), root);
+        assert_eq!(reader.lez_block_id, 2);
+        assert_eq!(reader.active_leaves().len(), 1);
+        assert_eq!(
+            reader.active_leaves()[0].1.leaf_index,
+            members[0].1.leaf_index
+        );
+        assert_eq!(reader.roots_by_block, roots);
+        assert_eq!(
+            reader.member(&id(1)).unwrap().removed,
+            Some(Removed::Expired)
+        );
+        assert!(reader.proof_path(0).is_none());
+        assert!(reader.proof_path(1).is_some());
+        reader.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
