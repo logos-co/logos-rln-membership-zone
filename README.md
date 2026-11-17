@@ -23,7 +23,9 @@ and the tree reaches depth 20, the depth Zerokit ships.
 
 ## Status
 
-Early design. Nothing is deployed.
+Prototype on the Logos testnet: the registration program is deployed (LEZ block 49431), the
+sequencer publishes on the channel `rln-membership-zone:testnet:v0.3.2-3` and an indexer judges
+it. The Module side is not written.
 
 - **Specification**: [`docs/rfc-rln-membership-zone.md`](docs/rfc-rln-membership-zone.md),
   a raw LIP draft that ends with the open design questions.
@@ -78,13 +80,17 @@ src/                              the Zone node: sequencer and indexer (MODE), H
   src/lez_chain.rs                the LEZ chain as the node keeps it: the finalized tree on disk, the adopted blocks folded over it
   src/batch.rs                    batch wire format (protobuf)
   src/zone_chain.rs               the Zone channel as a consumer keeps it, after LEZ's chain_state: final tier, view, folds
-  src/registry.rs                 one node's state: LEZ chain, Zone channel, pending changes, checkpoints, in the tree store
+  src/registry.rs                 one node's state: LEZ chain, Zone channel, pending changes, checkpoint, in small files beside the tree store
   src/http.rs                     HTTP API: roots, batches, membership with its Merkle proof path, leaves
   src/lez_sync.rs                 the LEZ channel through the Zone SDK: checkpoint at the LIB, history from the LEZ Sequencer under the hash chain, adopted and finalized blocks
-  src/zone_sync.rs                the Zone channel through the Zone SDK: start-up checks, extension, conflict, finality, the finality scan, the sequencer's tick and publish
+  src/zone_sync.rs                the Zone channel through the Zone SDK: start-up checks, extension, conflict, finality, the finality scan, the sequencer's tick, publish and correction
   src/main.rs                     configuration, the two Zone SDK readers, the event loop
+  src/bin/generate_proof.rs       an RLN proof over the Zone's /merkle_proof answer (the Module's prover side)
+  src/bin/verify_proof.rs         the proof against the Zone's /roots window (the validator side)
+e2e/                              testnet scenarios: provision a LEZ payer, register, slash, prove (lib.sh, testnet.env, scenarios/)
 lez-sequencer/                    config template to run your own LEZ sequencer for the finalized history
 docs/setup-rln-membership-zone.md setup, operation, monitoring, troubleshooting, cleanup
+.env.example                      the node's configuration, every env var with its default
 ```
 
 The Zone SDK and the other `logos-blockchain` crates are git dependencies in `Cargo.toml`,
@@ -137,11 +143,14 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 The unit tests cover the derivation rules (a `Registered` event sets the leaf and the proof
-path, expiry removes it at the LEZ timestamp), the tree store surviving a reopen, the LEZ chain
-(adopted blocks folded over the finalized tree, a reorg refolding them, finality moving them),
-the Zone channel (final tier, view, parked and waiting batches) and the decoding of LEZ blocks
-and the program's instructions (another registry's are dropped, a privacy-preserving
-transaction is skipped and counted), including a real testnet block.
+path, which proves under Zerokit; expiry removes it at the LEZ timestamp), the state files
+surviving a reopen, a crash between two writes and a torn line, the LEZ chain (adopted blocks
+folded over the finalized tree, a reorg refolding them, finality moving them), the Zone
+channel (final tier, view, parked and waiting batches, orphaned batches published again,
+corrections), the HTTP answers and the decoding of LEZ blocks and the program's instructions
+(another registry's are dropped, a privacy-preserving transaction is skipped and counted),
+including a real testnet block. They are the last unit tests written: from here the logic is
+exercised end to end on the testnet (`e2e/`).
 
 ## References
 

@@ -1,14 +1,15 @@
 //! A reader (RFC "Derivation Rules"): holds the tree and applies the rules to the registration
 //! program's events of every LEZ block. The Zone sequencer is a reader; so is every Zone
 //! indexer, which is why they hold the same roots. The tree is a sled-backed Zerokit
-//! `PmTree`; the reader's state beside it (memberships, counters, the block it is at) and
-//! whatever its owner wants kept with it live in the tree store's metadata, so a restart
-//! opens the store and continues.
+//! `PmTree`; the reader's state (memberships, counters, the block it is at, the root after
+//! every block that changed the tree) lives in `reader.json` beside it, written when it
+//! changed, so a restart opens both and continues.
 //!
 //! Rules, per event:
 //! - `Registered` inserts `poseidon(id_commitment, rate_limit)` at `leaf_index`, with the
 //!   membership's expiry (the end of its grace period: a membership in its grace period is
-//!   still in the tree and still proves).
+//!   still in the tree and still proves). A `Registered` for a commitment whose membership is
+//!   not over (the program forbids it today) replaces it: the old leaf leaves the tree.
 //! - `Extended` keeps the new expiry; the tree does not change, unless the reader had already
 //!   expired the leaf (the chain accepts a clock claim a little behind its clock), in which
 //!   case the leaf goes back where it was.
@@ -41,15 +42,22 @@ use crate::{
     lez::{Block, Erased, Extended, ProgramEvent, Registered, RlnEvent, Slashed},
 };
 
+/// The tree depth, the one Zerokit ships circuits for.
 pub const TREE_DEPTH: usize = 20;
 
 /// Why a span of LEZ blocks does not continue the reader's chain (the two chain checks of
 /// LEZ's `BlockIngestError`, same names).
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum BlockIngestError {
     /// A block id out of sequence: the answer is out of order or has a gap.
+    #[error("Unexpected block id: expected {expected}, got {got}")]
     UnexpectedBlockId { expected: u64, got: u64 },
     /// The block does not chain on the block the reader applied before it: another lineage.
+    #[error(
+        "Broken chain link at LEZ block {block_id}: expected prev {}, got prev {}",
+        short(expected_prev),
+        short(got_prev)
+    )]
     BrokenChainLink {
         block_id: u64,
         expected_prev: [u8; 32],
@@ -57,27 +65,17 @@ pub enum BlockIngestError {
     },
 }
 
-impl std::fmt::Display for BlockIngestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnexpectedBlockId { expected, got } => {
-                write!(f, "Unexpected block id: expected {expected}, got {got}")
-            }
-            Self::BrokenChainLink {
-                block_id,
-                expected_prev,
-                got_prev,
-            } => write!(
-                f,
-                "Broken chain link at LEZ block {block_id}: expected prev {}.., got prev {}..",
-                hex::encode(&expected_prev[..4]),
-                hex::encode(&got_prev[..4])
-            ),
-        }
-    }
+/// The first four bytes of a hash in hex with `..`, for logs: `ab12cd34..`.
+pub fn short(bytes: &[u8; 32]) -> String {
+    format!("{}..", hex::encode(&bytes[..4]))
 }
 
-impl std::error::Error for BlockIngestError {}
+/// 32 bytes from hex (`0x` allowed); `what` names the value in the error.
+pub fn parse_32(hex_str: &str, what: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(hex_str.trim().trim_start_matches("0x"))
+        .with_context(|| format!("{what} is not hex"))?;
+    <[u8; 32]>::try_from(bytes).map_err(|_| anyhow!("{what} must be 32 bytes"))
+}
 
 /// The root of the empty tree, what every registry starts from.
 pub static EMPTY_ROOT: LazyLock<[u8; 32]> = LazyLock::new(|| {
@@ -99,8 +97,8 @@ pub fn fr_to_bytes_le(fr: &Fr) -> [u8; 32] {
 }
 
 /// The field element 32 little-endian bytes encode, if they are below the modulus.
-pub fn fr_from_bytes_le(bytes: &[u8; 32]) -> Result<Fr, String> {
-    Fr::deserialize_compressed(&bytes[..]).map_err(|e| format!("not a field element: {e}"))
+pub fn fr_from_bytes_le(bytes: &[u8; 32]) -> Result<Fr> {
+    Fr::deserialize_compressed(&bytes[..]).context("not a field element")
 }
 
 /// Why a leaf left the tree.
@@ -118,6 +116,9 @@ pub enum Removed {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Member {
     pub leaf_index: u64,
+    /// Messages per epoch the membership bought (`user_message_limit` in RLN).
+    #[serde(default)]
+    pub rate_limit: u64,
     pub expiry_timestamp_ms: u64,
     /// The leaf value, `poseidon(id_commitment, rate_limit)`.
     #[serde(with = "hex::serde")]
@@ -150,7 +151,7 @@ mod hex_option {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 32]>, D::Error> {
         let text: Option<String> = Option::deserialize(d)?;
-        text.map(|t| super::parse_32(&t).map_err(serde::de::Error::custom))
+        text.map(|t| super::parse_32(&t, "hash").map_err(serde::de::Error::custom))
             .transpose()
     }
 }
@@ -297,18 +298,23 @@ impl Reader {
         Self::open_with(config, tree_id, lez_block_id)
     }
 
-    /// A clone of this reader in a temporary store: the same tree (every active leaf set),
-    /// memberships, counters, block, hash and root history. The head of a `LezChain` starts
-    /// from this and folds the adopted blocks over it.
+    /// A clone of this reader in a temporary store: the same tree (every leaf the store holds,
+    /// so a store a block ahead of the state after a crash is cloned as it is and both take
+    /// that block again), memberships, counters, block, hash and root history. The head of a
+    /// `LezChain` starts from this and folds the adopted blocks over it.
     pub fn clone_temporary(&self) -> Result<Self> {
         let mut clone = Self::open_temporary(self.tree_id, self.lez_block_id)?;
-        for (id, member) in self.active_leaves() {
-            let leaf = fr_from_bytes_le(&member.rate_commitment)
-                .map_err(|e| anyhow!("stored leaf of {}: {e}", hex::encode(id)))?;
-            clone
+        for index in 0..self.tree.leaves_set() {
+            let leaf = self
                 .tree
-                .set(member.leaf_index as usize, leaf)
-                .with_context(|| format!("set leaf {}", member.leaf_index))?;
+                .get(index)
+                .with_context(|| format!("read leaf {index}"))?;
+            if leaf != Fr::default() {
+                clone
+                    .tree
+                    .set(index, leaf)
+                    .with_context(|| format!("set leaf {index}"))?;
+            }
         }
         clone.members = self.members.clone();
         clone.stats = self.stats;
@@ -359,15 +365,21 @@ impl Reader {
             );
         }
         for (id, member) in &state.members {
-            self.members.insert(parse_32(id)?, *member);
+            self.members
+                .insert(parse_32(id, "member id_commitment")?, *member);
         }
         self.stats = state.stats;
         self.lez_block_id = state.lez_block_id;
-        self.last_block_hash = state.last_block_hash.as_deref().map(parse_32).transpose()?;
+        self.last_block_hash = state
+            .last_block_hash
+            .as_deref()
+            .map(|hash| parse_32(hash, "last_block_hash"))
+            .transpose()?;
         self.lez_timestamp_ms = state.lez_timestamp_ms;
         for (block_id, root) in &state.roots_by_block {
             let block_id: u64 = block_id.parse().context("root history block id")?;
-            self.roots_by_block.insert(block_id, parse_32(root)?);
+            self.roots_by_block
+                .insert(block_id, parse_32(root, "root history root")?);
         }
         Ok(())
     }
@@ -484,7 +496,8 @@ impl Reader {
                 }) => {
                     // The program's `Registered` events of a registry carry 0, 1, 2.. in block
                     // order (its `events` module); a jump means a block this reader missed or
-                    // a program change. Said once, when the block is applied.
+                    // a program change. Said by each reader that applies the block (the head,
+                    // then the final reader).
                     if *leaf_index != self.stats.registered {
                         warn!(
                             "Registered carries leaf_index {leaf_index} after {} Registered \
@@ -493,12 +506,23 @@ impl Reader {
                         );
                     }
                     self.stats.registered += 1;
-                    if self.members.get(id_commitment).is_some_and(|m| !m.ended()) {
+                    // The program forbids a second registration of an open membership; should
+                    // one come, the new leaf replaces the old one, which leaves the tree so
+                    // the tree holds exactly the active leaves.
+                    if let Some(old) = self.members.get(id_commitment).filter(|m| !m.ended()) {
                         warn!(
-                            "Registered {}.. again while its membership is not over; the new \
-                             leaf {leaf_index} replaces it",
-                            hex::encode(&id_commitment[..4])
+                            "Registered {} again while its membership is not over; the new \
+                             leaf {leaf_index} replaces leaf {}",
+                            short(id_commitment),
+                            old.leaf_index
                         );
+                        if old.active && old.leaf_index != *leaf_index {
+                            let old_leaf_index = old.leaf_index;
+                            self.tree
+                                .delete(old_leaf_index as usize)
+                                .with_context(|| format!("delete leaf {old_leaf_index}"))?;
+                            changes.push(Change::remove(old_leaf_index));
+                        }
                     }
                     let leaf = rate_commitment(id_commitment, *rate_limit)?;
                     self.tree
@@ -508,6 +532,7 @@ impl Reader {
                         *id_commitment,
                         Member {
                             leaf_index: *leaf_index,
+                            rate_limit: *rate_limit,
                             expiry_timestamp_ms: *expiry_timestamp_ms,
                             rate_commitment: fr_to_bytes_le(&leaf),
                             active: true,
@@ -528,23 +553,23 @@ impl Reader {
                     self.stats.extended += 1;
                     let Some(member) = self.members.get_mut(id_commitment) else {
                         warn!(
-                            "Extended {}.. without a registration; ignored",
-                            hex::encode(&id_commitment[..4])
+                            "Extended {} without a registration; ignored",
+                            short(id_commitment)
                         );
                         continue;
                     };
                     if member.ended() {
                         warn!(
-                            "Extended {}.. after its membership ended; ignored",
-                            hex::encode(&id_commitment[..4])
+                            "Extended {} after its membership ended; ignored",
+                            short(id_commitment)
                         );
                         continue;
                     }
                     member.expiry_timestamp_ms = *expiry_timestamp_ms;
                     if !member.active {
                         // Expired by this reader, extended on chain: back where it was.
-                        let leaf = fr_from_bytes_le(&member.rate_commitment)
-                            .map_err(|e| anyhow!("stored leaf: {e}"))?;
+                        let leaf =
+                            fr_from_bytes_le(&member.rate_commitment).context("stored leaf")?;
                         let leaf_index = member.leaf_index;
                         member.active = true;
                         member.removed = None;
@@ -631,8 +656,8 @@ impl Reader {
     ) -> Result<Option<Change>> {
         let Some(member) = self.members.get_mut(id_commitment) else {
             warn!(
-                "{cause:?} {}.. without a registration; ignored",
-                hex::encode(&id_commitment[..4])
+                "{cause:?} {} without a registration; ignored",
+                short(id_commitment)
             );
             return Ok(None);
         };
@@ -656,23 +681,10 @@ impl Reader {
     }
 
     /// The Merkle proof path of the leaf at `leaf_index` at this reader's root, if the leaf is
-    /// set: the sibling elements from the leaf up, and the side of each.
+    /// set. The API serves paths at the newest valid root instead (`ReplayTree::proof_path`).
+    #[cfg(test)]
     pub fn proof_path(&self, leaf_index: u64) -> Option<ProofPath> {
-        let index = usize::try_from(leaf_index).ok()?;
-        let leaf = self.tree.get(index).ok()?;
-        if leaf == Fr::default() {
-            return None;
-        }
-        let proof = self.tree.proof(index).ok()?;
-        Some(ProofPath {
-            rate_commitment: fr_to_bytes_le(&leaf),
-            path_elements: proof
-                .get_path_elements()
-                .iter()
-                .map(fr_to_bytes_le)
-                .collect(),
-            identity_path_index: proof.get_path_index(),
-        })
+        proof_path_at(&self.tree, leaf_index)
     }
 
     /// The membership of an identity commitment, active or not.
@@ -689,11 +701,6 @@ impl Reader {
     }
 }
 
-pub fn parse_32(hex_str: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(hex_str).context("state file: hex")?;
-    <[u8; 32]>::try_from(bytes).map_err(|_| anyhow!("state file: not 32 bytes"))
-}
-
 /// Write `bytes` to `path` through a temporary file renamed over it, so a crash leaves either
 /// the old file or the new one, never a torn one.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -703,10 +710,33 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("rename {} over {}", tmp.display(), path.display()))
 }
 
+/// The Merkle proof path of the leaf at `leaf_index` in `tree`, if the leaf is set: the sibling
+/// elements from the leaf up, and the side of each (RLN-API form).
+pub fn proof_path_at<T>(tree: &T, leaf_index: u64) -> Option<ProofPath>
+where
+    T: ZerokitMerkleTree<Hasher = PoseidonHash>,
+    T::Proof: ZerokitMerkleProof<Hasher = PoseidonHash, Index = u8>,
+{
+    let index = usize::try_from(leaf_index).ok()?;
+    let leaf = tree.get(index).ok()?;
+    if leaf == Fr::default() {
+        return None;
+    }
+    let proof = tree.proof(index).ok()?;
+    Some(ProofPath {
+        rate_commitment: fr_to_bytes_le(&leaf),
+        path_elements: proof
+            .get_path_elements()
+            .iter()
+            .map(fr_to_bytes_le)
+            .collect(),
+        identity_path_index: proof.get_path_index(),
+    })
+}
+
 /// `poseidon(id_commitment, rate_limit)`, the leaf of a membership.
 fn rate_commitment(id_commitment: &[u8; 32], rate_limit: u64) -> Result<Fr> {
-    let id_commitment =
-        fr_from_bytes_le(id_commitment).map_err(|e| anyhow!("id_commitment: {e}"))?;
+    let id_commitment = fr_from_bytes_le(id_commitment).context("id_commitment")?;
     Ok(Hasher::<PoseidonHash>::hash_pair(
         id_commitment,
         Fr::from(rate_limit),
@@ -715,6 +745,11 @@ fn rate_commitment(id_commitment: &[u8; 32], rate_limit: u64) -> Result<Fr> {
 
 #[cfg(test)]
 mod test {
+    use rln::prelude::{
+        IdentityKeys, RLNBuilder, RLNMerkleProof, RLNWitnessInput, default_graph_single,
+        default_zkey_single, hash_to_field_le,
+    };
+
     use super::*;
 
     fn id(n: u8) -> [u8; 32] {
@@ -983,5 +1018,151 @@ mod test {
         assert!(reader.proof_path(1).is_some());
         reader.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A second `Registered` for a membership that is not over replaces it: the old leaf leaves
+    /// the tree (so the tree holds exactly the active leaves and a clone of the reader matches
+    /// the store), the new one is the membership.
+    #[test]
+    fn test_registered_again_while_active_removes_the_old_leaf() {
+        let mut reader = Reader::open_temporary([0; 32], 0).unwrap();
+        reader
+            .apply_block(&block(1, 1_000, vec![registered(1, 0, 9_000)]))
+            .unwrap();
+        let changes = reader
+            .apply_block(&block(2, 2_000, vec![registered(1, 1, 9_000)]))
+            .unwrap();
+        let member = reader.member(&id(1)).unwrap();
+        assert_eq!(
+            changes,
+            vec![
+                Change::remove(0),
+                Change::insert(1, member.rate_commitment.to_vec())
+            ]
+        );
+        assert_eq!(reader.active_count(), 1);
+        assert_eq!(member.leaf_index, 1);
+        assert!(reader.proof_path(0).is_none());
+        assert!(reader.proof_path(1).is_some());
+        assert!(reader.clone_temporary().is_ok());
+    }
+
+    /// The proof path the reader serves proves under Zerokit: the path, its order and the
+    /// little-endian form fit `RLNMerkleProof`, and the proof's root is the reader's.
+    #[test]
+    fn test_the_proof_path_proves_under_zerokit() {
+        let keys =
+            IdentityKeys::generate::<PoseidonHash, rand::rngs::ThreadRng>(&mut rand::thread_rng());
+        let id_commitment = fr_to_bytes_le(&keys.id_commitment());
+        let mut reader = Reader::open_temporary([0; 32], 0).unwrap();
+        reader
+            .apply_block(&block(
+                1,
+                1_000,
+                vec![ProgramEvent::from(RlnEvent::Registered(Registered {
+                    tree_id: [0; 32],
+                    id_commitment,
+                    rate_limit: 100,
+                    expiry_timestamp_ms: 9_000,
+                    leaf_index: 0,
+                }))],
+            ))
+            .unwrap();
+        let path = reader.proof_path(0).unwrap();
+        let merkle_proof = RLNMerkleProof::new(
+            path.path_elements
+                .iter()
+                .map(|e| fr_from_bytes_le(e).unwrap())
+                .collect(),
+            path.identity_path_index,
+        );
+        let x = hash_to_field_le(b"signal");
+        let witness = RLNWitnessInput::new_single()
+            .identity_secret(keys.identity_secret())
+            .user_message_limit(Fr::from(100u64))
+            .merkle_proof(merkle_proof)
+            .x(x)
+            .external_nullifier(hash_to_field_le(b"epoch"))
+            .message_id(Fr::from(0u64))
+            .build()
+            .unwrap();
+        let rln = RLNBuilder::stateless()
+            .graph(default_graph_single().clone())
+            .zkey(default_zkey_single().clone())
+            .build();
+        let (proof, values) = rln.generate_proof(&witness).unwrap();
+        assert_eq!(fr_to_bytes_le(&values.root()), reader.root());
+        assert!(
+            rln.verify_with_roots(&proof, &values, &x, &[values.root()])
+                .unwrap()
+        );
+    }
+
+    /// Corners of the rules: a store missing one of its two files is refused; `Slashed` on an
+    /// expired leaf records the cause and the transaction without a change; events for an
+    /// unknown commitment change nothing; two leaves expiring in one block go in leaf order;
+    /// `root_at` past the last block is `None`.
+    #[test]
+    fn test_reader_corners() {
+        let dir = std::env::temp_dir().join(format!("zone-reader-corners-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut reader = Reader::open(&dir, [0; 32], 0).unwrap();
+            reader.persist().unwrap();
+            reader.close().unwrap();
+        }
+        std::fs::remove_file(dir.join(READER_FILE)).unwrap();
+        assert!(Reader::open(&dir, [0; 32], 0).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(READER_FILE), b"{}").unwrap();
+        assert!(Reader::open(&dir, [0; 32], 0).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut reader = Reader::open_temporary([0; 32], 0).unwrap();
+        reader
+            .apply_block(&block(
+                1,
+                1_000,
+                vec![registered(2, 1, 5_000), registered(1, 0, 5_000)],
+            ))
+            .unwrap();
+        let expired = reader.apply_block(&block(2, 5_000, vec![])).unwrap();
+        assert_eq!(expired, vec![Change::remove(0), Change::remove(1)]);
+        let slashed = ProgramEvent {
+            tx_hash: [7; 32],
+            event: RlnEvent::Slashed(Slashed {
+                tree_id: [0; 32],
+                id_commitment: id(1),
+            }),
+        };
+        let none = reader.apply_block(&block(3, 6_000, vec![slashed])).unwrap();
+        assert!(none.is_empty());
+        let member = reader.member(&id(1)).unwrap();
+        assert_eq!(member.removed, Some(Removed::Slashed));
+        assert_eq!(member.removed_tx_hash, Some([7; 32]));
+        assert_eq!(member.removed_at_lez_block_id, Some(3));
+        assert_eq!(reader.stats.removed_ended, 0);
+        let unknown = vec![
+            ProgramEvent::from(RlnEvent::Extended(Extended {
+                tree_id: [0; 32],
+                id_commitment: id(9),
+                expiry_timestamp_ms: 9_000,
+            })),
+            ProgramEvent::from(RlnEvent::Erased(Erased {
+                tree_id: [0; 32],
+                id_commitment: id(9),
+            })),
+        ];
+        assert!(
+            reader
+                .apply_block(&block(4, 7_000, unknown))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!((reader.stats.extended, reader.stats.erased), (1, 1));
+        assert!(reader.member(&id(9)).is_none());
+        assert_eq!(reader.root_at(4), Some(*EMPTY_ROOT));
+        assert!(reader.root_at(5).is_none());
     }
 }

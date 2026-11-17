@@ -12,7 +12,7 @@ use tracing::warn;
 use crate::{
     batch::Change,
     lez::Block,
-    reader::{BlockIngestError, Reader},
+    reader::{BlockIngestError, Reader, short},
 };
 
 /// What an adopted block did to the head.
@@ -51,8 +51,8 @@ pub struct LezChain {
     final_reader: Reader,
     /// Adopted blocks not finalized yet, chained on the final block, lineage order.
     view: Vec<Block>,
-    /// The final reader folded over the view: a temporary store, rebuilt from the final
-    /// reader on start and on every `Conflict`.
+    /// The final reader folded over the view: a temporary store, the final reader cloned on
+    /// start and on every `Conflict`, the view folded over it.
     head: Reader,
 }
 
@@ -172,11 +172,11 @@ impl LezChain {
                 // The view sits on a branch Bedrock did not finalize and no `Conflict` said
                 // so: the head follows the final tier again, the SDK refills the view.
                 warn!(
-                    "LEZ block {} finalized with hash {}.., the view held {}..: {} adopted \
-                     block(s) dropped, the head is the final tier again",
+                    "LEZ block {} finalized with hash {}, the view held {}: {} adopted block(s) \
+                     dropped, the head is the final tier again",
                     block.block_id(),
-                    hex::encode(&block.hash()[..4]),
-                    hex::encode(&held.hash()[..4]),
+                    short(&block.hash()),
+                    short(&held.hash()),
                     self.view.len()
                 );
                 self.view.clear();
@@ -426,6 +426,59 @@ mod test {
         assert!(matches!(
             check_filler(Some([9; 32]), 3, &[b3, b4], &b5),
             Err(BlockIngestError::BrokenChainLink { block_id: 3, .. })
+        ));
+    }
+
+    /// A persisted view whose first block does not chain on the final tier (another lineage,
+    /// or a view older than the tier) restarts empty; one that chains partly stops at the first
+    /// block that does not.
+    #[test]
+    fn test_a_persisted_view_that_does_not_chain_restarts_where_it_breaks() {
+        let mut chain = chain();
+        chain.apply_finalized(&block(1, 0, 1, vec![])).unwrap();
+        let foreign = chain
+            .restore_view(&[block(2, 7, 8, vec![]), block(3, 8, 9, vec![])])
+            .unwrap();
+        assert!(foreign.is_empty());
+        assert!(chain.view().is_empty());
+        assert_eq!(chain.head().lez_block_id, 1);
+        let partly = chain
+            .restore_view(&[
+                block(2, 1, 2, vec![registered(1, 0)]),
+                block(3, 9, 3, vec![]),
+            ])
+            .unwrap();
+        assert_eq!(partly.len(), 1);
+        assert_eq!((partly[0].0, partly[0].1.len()), (2, 1));
+        assert_eq!(chain.view().len(), 1);
+        assert_eq!(chain.head().lez_block_id, 2);
+    }
+
+    /// An adopted block at or below the final block is known through its hash: the final
+    /// block itself must match, an older id is taken on its word, and a fresh chain (no hash
+    /// yet) refuses an id below its first block.
+    #[test]
+    fn test_an_adopted_block_below_the_final_tier_is_known_by_its_hash() {
+        let mut fresh = LezChain::new(Reader::open_temporary([0; 32], 10).unwrap()).unwrap();
+        assert!(matches!(
+            fresh.apply_adopted(&block(5, 4, 5, vec![])).unwrap(),
+            Adopted::DoesNotChain(BlockIngestError::UnexpectedBlockId {
+                expected: 11,
+                got: 5
+            })
+        ));
+        fresh.apply_finalized(&block(11, 0, 11, vec![])).unwrap();
+        assert!(matches!(
+            fresh.apply_adopted(&block(5, 4, 5, vec![])).unwrap(),
+            Adopted::AlreadyApplied
+        ));
+        assert!(matches!(
+            fresh.apply_adopted(&block(11, 0, 11, vec![])).unwrap(),
+            Adopted::AlreadyApplied
+        ));
+        assert!(matches!(
+            fresh.apply_adopted(&block(11, 0, 99, vec![])).unwrap(),
+            Adopted::DoesNotChain(_)
         ));
     }
 }

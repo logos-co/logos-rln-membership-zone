@@ -6,16 +6,19 @@
 //! (`zone.json`, plus `final.jsonl`, one line per finalized entry, appended) and the adopted
 //! LEZ blocks (`lez_view.json`). The LEZ channel has no checkpoint on disk: a start computes
 //! one at the LIB, and the finalized tree is filled up to it from the LEZ Sequencer under the
-//! hash chain.
+//! hash chain. The files are written in an order a crash between two writes cannot break: the
+//! final tier first (what the Zone SDK never reports again), then `zone.json`, then the LEZ
+//! view and the reader (what the LEZ channel reports again from the LIB).
 
 use std::{
+    collections::HashSet,
     fs,
     io::Write as _,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context as _, Result, bail};
-use lb_core::mantle::ops::channel::MsgId;
+use lb_core::mantle::ops::channel::{MsgId, inscribe::MAX_BYTES as MAX_INSCRIPTION_BYTES};
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -25,12 +28,16 @@ use crate::{
     batch::{Batch, Change},
     lez::{Block, ProgramEvent, RlnEvent, StoredBlock},
     lez_chain::{Adopted, Finalized, LezChain},
-    reader::{BlockIngestError, EMPTY_ROOT, READER_FILE, Reader, TREE_DIR, write_atomic},
+    reader::{BlockIngestError, EMPTY_ROOT, READER_FILE, Reader, TREE_DIR, parse_32, write_atomic},
     zone_chain::{
-        AcceptOutcome, BatchIngestError, ChannelEntry, FinalEntry, Judge, PublishRecord,
-        StallReason, Tip, ZoneChain,
+        AcceptOutcome, BatchIngestError, ChannelEntry, FinalEntry, Judge, PublishRecord, Tip,
+        ZoneChain,
     },
 };
+
+/// A state file past this size is warned about: the state is meant to stay small (bytes per
+/// member, per batch, per adopted block).
+const STATE_FILE_WARN_BYTES: usize = 1 << 20;
 
 /// The indexer judges a batch against the tree of the finalized LEZ blocks only.
 impl Judge for LezChain {
@@ -39,8 +46,8 @@ impl Judge for LezChain {
     }
 }
 
-/// Where the final tier was last read up to on L1 (LEZ `ZoneAnchorRecord`): the slot of the
-/// newest finalized entry and the final tip there.
+/// Where the final tier was last read up to on Bedrock (LEZ `ZoneAnchorRecord`): the slot the
+/// finality scan continues after, and the final tip there (kept for inspection).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ZoneAnchorRecord {
     pub slot: u64,
@@ -85,14 +92,13 @@ struct ZoneState {
     first_lez_block_id: u64,
     /// The view in its persisted form (`ZoneChain::encode_view`), hex.
     view: String,
-    stall: Option<StallReason>,
     anchor: Option<ZoneAnchorRecord>,
     /// Publishes of ours not seen in a Bedrock block yet, hex, in publish order.
     own_pending: Vec<String>,
     orphaned: u64,
     pending_changes: Vec<PendingChangeRecord>,
-    /// Batches of ours a reorg dropped whose publish again failed, prost in hex, in publish
-    /// order: the tick publishes them before any new batch.
+    /// Orphaned batches of ours whose publish again failed, prost in hex, in publish order: the
+    /// tick publishes them before any new batch.
     #[serde(default)]
     to_republish: Vec<String>,
     /// The Zone SDK checkpoint on the Zone channel, its `channel_notes` emptied.
@@ -112,6 +118,9 @@ struct StateFiles {
     zone: Option<ZoneState>,
     zone_bytes: Vec<u8>,
     final_entries: Vec<FinalEntry>,
+    /// `final.jsonl` must be written whole at the next save: a torn line was dropped, or the
+    /// entries were changed on the way in.
+    final_rewrite: bool,
     lez_view: Vec<StoredBlock>,
     lez_view_bytes: Vec<u8>,
 }
@@ -124,6 +133,7 @@ impl StateFiles {
             zone: None,
             zone_bytes: vec![],
             final_entries: vec![],
+            final_rewrite: false,
             lez_view: vec![],
             lez_view_bytes: vec![],
         }
@@ -150,8 +160,11 @@ impl StateFiles {
             serde_json::from_slice(&lez_view_bytes).context(LEZ_VIEW_FILE)?
         };
         // One finalized entry per line; a torn last line (a crash while appending) is dropped
-        // with a warning, the entry comes again from the SDK or the finality scan.
+        // with a warning and the file is written whole at the next save; the entry comes again
+        // from the finality scan (the files are written final tier first, so the anchor is
+        // still before it).
         let mut final_entries = vec![];
+        let mut final_rewrite = false;
         if let Some(bytes) = read(FINAL_FILE)? {
             for (i, line) in String::from_utf8_lossy(&bytes).lines().enumerate() {
                 if line.trim().is_empty() {
@@ -164,6 +177,7 @@ impl StateFiles {
                             "{FINAL_FILE} line {}: {e}; the line and the rest are dropped",
                             i + 1
                         );
+                        final_rewrite = true;
                         break;
                     }
                 }
@@ -174,12 +188,15 @@ impl StateFiles {
             zone,
             zone_bytes,
             final_entries,
+            final_rewrite,
             lez_view,
             lez_view_bytes,
         })
     }
 }
 
+/// One node's state: the LEZ chain, the Zone channel, the changes no batch carries yet, the
+/// publishes in flight and the Zone SDK checkpoint, persisted under the data dir.
 pub struct Registry {
     /// The LEZ chain: the finalized tree on disk, the adopted blocks folded over it.
     pub lez: LezChain,
@@ -192,9 +209,9 @@ pub struct Registry {
     pub pending_changes: Vec<(u64, Change)>,
     /// Our own publishes not seen in a Bedrock block yet, in publish order.
     own_pending: Vec<[u8; 32]>,
-    /// Publishes of ours a Bedrock reorg dropped (the SDK's `orphaned`), published again.
+    /// Publishes of ours a Bedrock reorg orphaned (the SDK's word), published again.
     orphaned: u64,
-    /// Dropped batches whose publish again failed, in publish order: the tick publishes them
+    /// Orphaned batches whose publish again failed, in publish order: the tick publishes them
     /// before any new batch, so their changes (trimmed from `pending_changes` when they were
     /// first published) reach the channel.
     to_republish: Vec<Batch>,
@@ -223,7 +240,9 @@ pub struct Registry {
 impl Registry {
     /// Open the state under `data_dir` (created when missing); a fresh one starts at
     /// `first_lez_block_id`. With `rebuild`, the tree, the reader's state and the adopted
-    /// LEZ blocks are dropped and read again from LEZ, while the Zone channel state is kept.
+    /// LEZ blocks are dropped and read again from LEZ, while the Zone channel state is kept;
+    /// an indexer then judges again the finalized batches the old tree parked, once the new
+    /// tree reaches them.
     pub fn open(
         data_dir: &Path,
         tree_id: [u8; 32],
@@ -246,7 +265,20 @@ impl Registry {
             info!("tree store dropped; the tree is read again from LEZ");
         }
         let final_reader = Reader::open(data_dir, tree_id, first_lez_block_id.saturating_sub(1))?;
-        let files = StateFiles::read(data_dir)?;
+        let mut files = StateFiles::read(data_dir)?;
+        if rebuild && indexer {
+            for entry in &mut files.final_entries {
+                if let Some(error) = &entry.error
+                    && !error.is_retryable()
+                    && let Some(batch) = entry.batch()
+                {
+                    entry.error = Some(BatchIngestError::LezNotRead {
+                        to: batch.to_lez_block_id,
+                    });
+                    files.final_rewrite = true;
+                }
+            }
+        }
         Self::from_parts(final_reader, files, first_lez_block_id, indexer)
     }
 
@@ -278,8 +310,9 @@ impl Registry {
             );
         }
         let mut lez = LezChain::new(final_reader)?;
-        // The adopted LEZ blocks of the last run: the SDK does not echo the entries it already
-        // holds, so the view comes back from the file, its changes pending again below.
+        // The adopted LEZ blocks of the last run: the LEZ reader starts at the LIB on every
+        // start, so the SDK reports them again, minutes later; the file brings them back at
+        // once, their changes pending again below.
         let blocks = files
             .lez_view
             .iter()
@@ -292,15 +325,17 @@ impl Registry {
             .map(|z| hex::decode(&z.view).context("view in zone.json"))
             .transpose()?
             .unwrap_or_default();
-        let stall = files.zone.as_ref().and_then(|z| z.stall.clone());
         let final_written = files.final_entries.len();
         let judge = indexer.then_some(&lez as &dyn Judge);
-        let zone =
-            ZoneChain::restore(first_lez_block_id, files.final_entries, stall, &view, judge)?;
+        let zone = ZoneChain::restore(first_lez_block_id, files.final_entries, &view, judge)?;
+        // A publish of ours is in flight only while the view holds it: `zone.json` may be
+        // behind the final tier by one write.
+        let held: HashSet<[u8; 32]> = zone.view().iter().map(|e| e.msg.into()).collect();
         let own_pending = files.zone.as_ref().map_or(Ok(vec![]), |z| {
             z.own_pending
                 .iter()
-                .map(|h| crate::reader::parse_32(h))
+                .map(|h| parse_32(h, "own_pending msg"))
+                .filter(|msg| msg.as_ref().is_ok_and(|m| held.contains(m)))
                 .collect::<Result<Vec<_>>>()
         })?;
         // The changes applied but not yet in a batch survive a restart with the tree they
@@ -341,7 +376,7 @@ impl Registry {
             written_zone: files.zone_bytes,
             written_lez_view: files.lez_view_bytes,
             final_written,
-            final_rewrite: false,
+            final_rewrite: files.final_rewrite,
             preview: vec![],
             sequencer_block_id: None,
         };
@@ -351,17 +386,19 @@ impl Registry {
         Ok(registry)
     }
 
-    /// Write what changed: the reader's state, `zone.json`, `lez_view.json`, the finalized
-    /// entries appended to `final.jsonl`. A temporary registry writes nothing.
+    /// Write what changed, in the order a crash between two writes leaves recoverable: the
+    /// finalized entries appended to `final.jsonl` (the Zone SDK never reports them again),
+    /// then `zone.json`, then `lez_view.json` and the reader's state (the LEZ channel reports
+    /// the adopted blocks again from the LIB, and `zone.json` keeps the pending changes of a
+    /// finalized block the reader has not saved yet). A temporary registry writes nothing.
     pub fn save(&mut self) -> Result<()> {
-        self.lez.persist()?;
         let Some(dir) = self.state_dir.clone() else {
             return Ok(());
         };
+        self.save_final(&dir)?;
         let zone = ZoneState {
             first_lez_block_id: self.first_lez_block_id,
             view: hex::encode(self.zone.encode_view()),
-            stall: self.zone.stall().cloned(),
             anchor: self.anchor,
             own_pending: self.own_pending.iter().map(hex::encode).collect(),
             orphaned: self.orphaned,
@@ -391,6 +428,12 @@ impl Registry {
             write_sized(&dir.join(LEZ_VIEW_FILE), &bytes)?;
             self.written_lez_view = bytes;
         }
+        self.lez.persist()
+    }
+
+    /// `final.jsonl`: the new entries appended, or the file written whole when an entry it
+    /// holds changed (the judge decided one) or a torn line was dropped on the way in.
+    fn save_final(&mut self, dir: &Path) -> Result<()> {
         let final_entries = self.zone.final_entries();
         let path = dir.join(FINAL_FILE);
         if self.final_rewrite || final_entries.len() < self.final_written {
@@ -530,21 +573,26 @@ impl Registry {
         }
     }
 
-    /// The batches whose root is not what the tree derived from LEZ says at their
-    /// `to_lez_block_id`: statements LEZ has since contradicted. An indexer parks on them.
+    /// The applied batches whose root is not what the tree derived from LEZ says at their
+    /// `to_lez_block_id`: statements LEZ has since contradicted, not corrected yet (a parked or
+    /// superseded batch is judged already). An indexer parks on them once LEZ finality reaches
+    /// them; the sequencer answers with a correction.
     pub fn contradicted(&self) -> Vec<Contradicted> {
+        let superseded = self.zone.superseded();
         let final_batches = self
             .zone
             .final_entries()
             .iter()
+            .filter(|f| f.error.is_none())
             .filter_map(|f| Some((f.msg, f.batch()?)));
         let view_batches = self
             .zone
-            .view()
-            .iter()
-            .filter_map(|e| Some((e.msg.into(), e.batch.clone()?)));
+            .view_outcomes()
+            .filter(|(_, outcome)| outcome.is_ok())
+            .filter_map(|(e, _)| Some((e.msg.into(), e.batch.clone()?)));
         final_batches
             .chain(view_batches)
+            .filter(|(msg, _)| !superseded.contains(msg))
             .filter_map(|(msg, batch)| {
                 let claimed = Tip::from(&batch).root;
                 let derived = self.head().root_at(batch.to_lez_block_id)?;
@@ -558,24 +606,64 @@ impl Registry {
             .collect()
     }
 
+    /// The correction the channel needs, if any: the head tip's root is not the tree's root at
+    /// its block (a Bedrock reorg replaced a LEZ block a batch covered), so a batch from the
+    /// registry's first block restates the tree (every leaf set, on the empty tree) up to the
+    /// head. `None` while the channel's statements hold.
+    pub fn correction_batch(&self) -> Option<Batch> {
+        let tip = self.zone.head_tip()?;
+        if self.head().root_at(tip.to_lez_block_id)? == tip.root {
+            return None;
+        }
+        let head = self.head();
+        Some(Batch {
+            from_lez_block_id: self.first_lez_block_id,
+            to_lez_block_id: head.lez_block_id,
+            changes: head
+                .active_leaves()
+                .iter()
+                .map(|(_, m)| Change::insert(m.leaf_index, m.rate_commitment.to_vec()))
+                .collect(),
+            root_after: head.root().to_vec(),
+        })
+    }
+
     /// The next batch: every LEZ block after the head tip up to the head, with the pending
-    /// changes and the root after them; `None` when the head is already covered.
+    /// changes and the root after them; `None` when the head is already covered. When the
+    /// changes would not fit one inscription, the batch stops at the last LEZ block whose
+    /// changes still fit (whole blocks, at least one) and the next batch continues from there.
     pub fn next_batch(&self) -> Option<Batch> {
+        self.next_batch_within(MAX_INSCRIPTION_BYTES)
+    }
+
+    /// `next_batch` with the inscription size given.
+    fn next_batch_within(&self, max_bytes: usize) -> Option<Batch> {
         let covered_to = self.covered_to();
         let head = self.head();
         if head.lez_block_id <= covered_to {
             return None;
         }
-        Some(Batch {
+        let mut batch = Batch {
             from_lez_block_id: covered_to + 1,
             to_lez_block_id: head.lez_block_id,
-            changes: self
-                .pending_changes
-                .iter()
-                .map(|(_, change)| change.clone())
-                .collect(),
+            changes: vec![],
             root_after: head.root().to_vec(),
-        })
+        };
+        for block in self.pending_changes.chunk_by(|(a, _), (b, _)| a == b) {
+            let block_id = block[0].0;
+            let mut longer = batch.clone();
+            longer
+                .changes
+                .extend(block.iter().map(|(_, change)| change.clone()));
+            if longer.encoded_len() > max_bytes && !batch.changes.is_empty() {
+                // Stop before this block: the batch covers up to the block before it.
+                batch.to_lez_block_id = block_id - 1;
+                batch.root_after = head.root_at(block_id - 1).unwrap_or(*EMPTY_ROOT).to_vec();
+                return Some(batch);
+            }
+            batch = longer;
+        }
+        Some(batch)
     }
 
     /// Whether `batch` would apply on the head of the channel: checked before publishing, so
@@ -608,33 +696,53 @@ impl Registry {
         self.trim_pending();
     }
 
-    /// The whole view at the new tip (`ChannelUpdate::Conflict`); returns the entries that left
-    /// it: the sequencer's own, to publish again (an indexer publishes nothing and counts
+    /// The whole view at the new tip (`ChannelUpdate::Conflict`); returns the entries the reorg
+    /// orphaned: the sequencer's own, to publish again (an indexer publishes nothing and counts
     /// nothing as orphaned).
     pub fn apply_zone_conflict(&mut self, canonical: Vec<ChannelEntry>) -> Vec<ChannelEntry> {
         let judge = self.indexer.then_some(&self.lez as &dyn Judge);
-        let dropped = self.zone.apply_conflict(canonical, judge);
+        let orphaned = self.zone.apply_conflict(canonical, judge);
         if !self.indexer {
-            self.orphaned += dropped.len() as u64;
+            self.orphaned += orphaned.len() as u64;
         }
-        for entry in &dropped {
+        for entry in &orphaned {
             let msg: [u8; 32] = entry.msg.into();
             self.own_pending.retain(|m| *m != msg);
         }
         self.trim_pending();
-        dropped
+        orphaned
     }
 
-    /// A finalized inscription of the channel (the SDK stream or the finality scan).
+    /// A finalized inscription of the channel (the SDK stream or the finality scan). A publish
+    /// of ours the finalized lineage does not hold leaves the view: Bedrock orphaned it without
+    /// a `Conflict`, so it is treated as one (counted, its batch queued to publish again) and
+    /// nothing waits for it any more.
     pub fn apply_zone_finalized(
         &mut self,
         entry: ChannelEntry,
         l1_slot: u64,
     ) -> Option<AcceptOutcome> {
-        let msg: [u8; 32] = entry.msg.into();
         let judge = self.indexer.then_some(&self.lez as &dyn Judge);
+        let ours: Vec<(MsgId, Option<Batch>)> = self
+            .zone
+            .view()
+            .iter()
+            .filter(|e| self.own_pending.contains(&<[u8; 32]>::from(e.msg)))
+            .map(|e| (e.msg, e.batch.clone()))
+            .collect();
         let outcome = self.zone.apply_finalized(entry, l1_slot, judge);
-        self.own_pending.retain(|m| *m != msg);
+        let held: HashSet<[u8; 32]> = self.zone.view().iter().map(|e| e.msg.into()).collect();
+        for (msg, batch) in ours {
+            let msg: [u8; 32] = msg.into();
+            if held.contains(&msg) || self.zone.final_entries().iter().any(|f| f.msg == msg) {
+                continue;
+            }
+            self.orphaned += 1;
+            if let Some(batch) = batch {
+                self.to_republish.push(batch);
+            }
+        }
+        self.own_pending.retain(|m| held.contains(m));
         let tip = self.zone.final_tip();
         self.anchor = Some(ZoneAnchorRecord {
             slot: l1_slot.max(self.anchor.map_or(0, |a| a.slot)),
@@ -661,22 +769,23 @@ impl Registry {
         self.own_pending.last().copied()
     }
 
-    /// How many publishes of ours a Bedrock reorg dropped (published again each time).
+    /// How many publishes of ours a Bedrock reorg orphaned (published again each time).
     pub fn orphaned_count(&self) -> u64 {
         self.orphaned
     }
 
-    /// A dropped batch whose publish again failed: the tick publishes it before any new batch.
+    /// An orphaned batch whose publish again failed: the tick publishes it before any new
+    /// batch.
     pub fn queue_republish(&mut self, batch: Batch) {
         self.to_republish.push(batch);
     }
 
-    /// The oldest dropped batch still to publish again, if any.
+    /// The oldest orphaned batch still to publish again, if any.
     pub fn next_republish(&self) -> Option<Batch> {
         self.to_republish.first().cloned()
     }
 
-    /// The oldest dropped batch is published: out of the queue.
+    /// The oldest orphaned batch is published: out of the queue.
     pub fn republished(&mut self) {
         if !self.to_republish.is_empty() {
             self.to_republish.remove(0);
@@ -810,10 +919,10 @@ pub fn event_id_commitment(event: &RlnEvent) -> &[u8; 32] {
     }
 }
 
-/// `write_atomic`, and a warning when one state file grows past a megabyte: the state is
-/// meant to stay small (bytes per member, per batch, per adopted block).
+/// `write_atomic`, and a warning (at every write) when one state file is past
+/// `STATE_FILE_WARN_BYTES`.
 fn write_sized(path: &Path, bytes: &[u8]) -> Result<()> {
-    if bytes.len() > 1 << 20 {
+    if bytes.len() > STATE_FILE_WARN_BYTES {
         warn!(
             "{} is {} KB: the state should stay small, look at what grows",
             path.display(),
@@ -826,7 +935,10 @@ fn write_sized(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::lez::{ProgramEvent, Registered, RlnEvent};
+    use crate::{
+        lez::{ProgramEvent, Registered, RlnEvent},
+        zone_chain::ReplayTree,
+    };
 
     fn registered(n: u8, leaf_index: u64) -> ProgramEvent {
         let mut id_commitment = [0u8; 32];
@@ -911,7 +1023,9 @@ mod test {
         assert!(heartbeat.changes.is_empty());
         registry.record_publish(msg(2), msg(1), &heartbeat);
         assert_eq!(registry.lineage().len(), 2);
-        // Nothing LEZ contradicts; a batch claiming another root at its block is reported.
+        // Nothing LEZ contradicts; a batch claiming another root at its block does not even
+        // apply (its changes replay to the tip's root): parked in the view, judged, so not
+        // among the contradicted (an applied batch LEZ contradicts is the correction's case).
         assert!(registry.contradicted().is_empty());
         let mut liar = heartbeat.clone();
         liar.root_after = vec![9; 32];
@@ -923,12 +1037,12 @@ mod test {
             parent: msg(2),
             batch: Some(liar),
         }]);
-        let contradicted = registry.contradicted();
-        assert_eq!(contradicted.len(), 1);
-        assert_eq!(contradicted[0].msg, [3; 32]);
-        assert_eq!(contradicted[0].to_lez_block_id, 4);
-        assert_eq!(contradicted[0].claimed, [9; 32]);
-        assert_eq!(contradicted[0].derived, registry.head().root());
+        assert!(matches!(
+            registry.zone.view_outcomes().last().unwrap().1,
+            Err(BatchIngestError::HashMismatch { .. })
+        ));
+        assert!(registry.contradicted().is_empty());
+        assert_eq!(registry.covered_to(), 3);
     }
 
     #[test]
@@ -1340,6 +1454,37 @@ mod test {
             registry.would_apply(&next),
             Err(BatchIngestError::HashMismatch { .. })
         ));
+        // The correction: from the contradicted batch's first block to the head, every leaf
+        // set (0, 1, 2) on the empty tree. It applies, supersedes the wrong batch, and the
+        // channel's statements hold again.
+        let correction = registry.correction_batch().unwrap();
+        assert_eq!(
+            (correction.from_lez_block_id, correction.to_lez_block_id),
+            (1, 3)
+        );
+        assert_eq!(correction.changes.len(), 3);
+        assert_eq!(correction.root_after, registry.head().root().to_vec());
+        assert!(registry.would_apply(&correction).is_ok());
+        assert_eq!(
+            registry.record_publish(msg(2), msg(1), &correction),
+            PublishRecord::Extended
+        );
+        assert_eq!(
+            registry.zone.superseded(),
+            std::collections::HashSet::from([[1; 32]])
+        );
+        assert!(registry.contradicted().is_empty());
+        assert!(registry.correction_batch().is_none());
+        assert_eq!(registry.covered_to(), 3);
+        assert!(registry.pending_changes.is_empty());
+        assert!(registry.next_batch().is_none());
+        // Life goes on: the next block batches as usual.
+        registry
+            .apply_lez_adopted(&block(4, vec![registered(5, 3)]))
+            .unwrap();
+        let next = registry.next_batch().unwrap();
+        assert_eq!((next.from_lez_block_id, next.to_lez_block_id), (4, 4));
+        assert!(registry.would_apply(&next).is_ok());
     }
 
     /// A Bedrock reorg drops two published batches at once: they leave the view in order and
@@ -1404,5 +1549,510 @@ mod test {
             ]
         );
         assert!(registry.contradicted().is_empty());
+    }
+
+    /// A fresh data dir for a test, removed first.
+    fn dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("zone-registry-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn file(dir: &Path, name: &str) -> Vec<u8> {
+        fs::read(dir.join(name)).unwrap()
+    }
+
+    fn entry(n: u8, parent: Option<u8>, batch: &Batch) -> ChannelEntry {
+        ChannelEntry {
+            msg: msg(n),
+            parent: parent.map_or(MsgId::root(), msg),
+            batch: Some(batch.clone()),
+        }
+    }
+
+    /// `save` writes `zone.json` before `reader.json`: a crash between them leaves the reader
+    /// a block behind, with the pending changes of that block in `zone.json` filtered out on
+    /// the way in (`block > final`) and made again when the LIB fill finalizes the block.
+    #[test]
+    fn test_the_pending_changes_of_a_finalized_block_survive_a_crash_before_the_reader_saved() {
+        let dir = dir("crash-reader");
+        {
+            let mut registry = Registry::open(&dir, [0; 32], 1, false, false).unwrap();
+            registry
+                .apply_lez_finalized(&block(1, vec![registered(1, 0)]))
+                .unwrap();
+            let first = registry.next_batch().unwrap();
+            registry.record_publish(msg(1), MsgId::root(), &first);
+            registry.save().unwrap();
+            let reader_before = file(&dir, READER_FILE);
+            registry
+                .apply_lez_finalized(&block(2, vec![registered(2, 1)]))
+                .unwrap();
+            assert_eq!(registry.pending_changes.len(), 1);
+            registry.save().unwrap();
+            registry.close().unwrap();
+            // The crash: zone.json is on disk, reader.json is the one from before.
+            fs::write(dir.join(READER_FILE), reader_before).unwrap();
+        }
+        let mut registry = Registry::open(&dir, [0; 32], 1, false, false).unwrap();
+        assert_eq!(registry.lez.final_reader().lez_block_id, 1);
+        assert!(registry.pending_changes.is_empty());
+        // The LIB fill finalizes block 2 again: its changes are pending again.
+        registry
+            .apply_lez_finalized(&block(2, vec![registered(2, 1)]))
+            .unwrap();
+        registry.apply_lez_adopted(&block(3, vec![])).unwrap();
+        let next = registry.next_batch().unwrap();
+        assert_eq!((next.from_lez_block_id, next.to_lez_block_id), (2, 3));
+        assert_eq!(next.changes.len(), 1);
+        assert!(registry.would_apply(&next).is_ok());
+        registry.close().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `save` appends `final.jsonl` before writing `zone.json`: a crash between them leaves a
+    /// `zone.json` whose view and in-flight list still hold an entry the final tier has. The
+    /// final tier wins: the entry leaves the view and the in-flight list.
+    #[test]
+    fn test_a_zone_json_behind_the_final_tier_defers_to_it() {
+        let dir = dir("crash-zone");
+        {
+            let mut registry = Registry::open(&dir, [0; 32], 1, false, false).unwrap();
+            registry
+                .apply_lez_adopted(&block(1, vec![registered(1, 0)]))
+                .unwrap();
+            let first = registry.next_batch().unwrap();
+            registry.record_publish(msg(1), MsgId::root(), &first);
+            registry.apply_zone_finalized(entry(1, None, &first), 10);
+            registry
+                .apply_lez_adopted(&block(2, vec![registered(2, 1)]))
+                .unwrap();
+            let second = registry.next_batch().unwrap();
+            registry.record_publish(msg(2), msg(1), &second);
+            registry.save().unwrap();
+            let zone_before = file(&dir, ZONE_FILE);
+            registry.apply_zone_finalized(entry(2, Some(1), &second), 20);
+            registry.save().unwrap();
+            registry.close().unwrap();
+            // The crash: final.jsonl holds entry 2, zone.json is the one from before.
+            fs::write(dir.join(ZONE_FILE), zone_before).unwrap();
+        }
+        let registry = Registry::open(&dir, [0; 32], 1, false, false).unwrap();
+        assert_eq!(registry.zone.final_entries().len(), 2);
+        assert_eq!(registry.zone.final_msg(), msg(2));
+        assert!(registry.zone.view().is_empty());
+        assert_eq!(registry.covered_to(), 2);
+        assert!(registry.in_flight().is_none());
+        assert!(registry.next_batch().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A torn last line of `final.jsonl` (a crash while appending) is dropped on the way in and
+    /// the file is written whole at the next save, so nothing is appended onto the torn line.
+    #[test]
+    fn test_a_torn_final_jsonl_line_is_dropped_and_the_file_heals() {
+        let dir = dir("torn");
+        {
+            let mut registry = Registry::open(&dir, [0; 32], 1, false, false).unwrap();
+            registry
+                .apply_lez_adopted(&block(1, vec![registered(1, 0)]))
+                .unwrap();
+            let first = registry.next_batch().unwrap();
+            registry.record_publish(msg(1), MsgId::root(), &first);
+            registry.apply_zone_finalized(entry(1, None, &first), 10);
+            registry.save().unwrap();
+            registry.close().unwrap();
+        }
+        let mut torn = file(&dir, FINAL_FILE);
+        torn.extend_from_slice(b"{\"msg\":\"ab");
+        fs::write(dir.join(FINAL_FILE), torn).unwrap();
+        {
+            let mut registry = Registry::open(&dir, [0; 32], 1, false, false).unwrap();
+            assert_eq!(registry.zone.final_entries().len(), 1);
+            registry
+                .apply_lez_adopted(&block(2, vec![registered(2, 1)]))
+                .unwrap();
+            let second = registry.next_batch().unwrap();
+            registry.record_publish(msg(2), msg(1), &second);
+            registry.apply_zone_finalized(entry(2, Some(1), &second), 20);
+            registry.save().unwrap();
+            registry.close().unwrap();
+        }
+        let registry = Registry::open(&dir, [0; 32], 1, false, false).unwrap();
+        assert_eq!(registry.zone.final_entries().len(), 2);
+        let lines = String::from_utf8(file(&dir, FINAL_FILE)).unwrap();
+        assert_eq!(lines.lines().count(), 2);
+        assert!(
+            lines
+                .lines()
+                .all(|l| l.starts_with('{') && l.ends_with('}'))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The indexer's verdict on a finalized batch it had to wait for reaches the disk: the
+    /// entry is written again without its error, so a restart replays it.
+    #[test]
+    fn test_a_judged_final_entry_is_written_again_on_disk() {
+        let dir = dir("judged");
+        {
+            let mut registry = Registry::open(&dir, [0; 32], 1, false, true).unwrap();
+            registry
+                .apply_lez_finalized(&block(1, vec![registered(1, 0)]))
+                .unwrap();
+            let first = registry.next_batch().unwrap();
+            assert!(matches!(
+                registry.apply_zone_finalized(entry(1, None, &first), 10),
+                Some(AcceptOutcome::Applied(_))
+            ));
+            let heartbeat = Batch {
+                from_lez_block_id: 2,
+                to_lez_block_id: 3,
+                changes: vec![],
+                root_after: registry.head().root().to_vec(),
+            };
+            assert!(matches!(
+                registry.apply_zone_finalized(entry(2, Some(1), &heartbeat), 20),
+                Some(AcceptOutcome::RetryableFailure(_))
+            ));
+            registry.save().unwrap();
+            registry.apply_lez_finalized(&block(2, vec![])).unwrap();
+            registry.apply_lez_finalized(&block(3, vec![])).unwrap();
+            assert_eq!(registry.retry_folds(), 1);
+            registry.save().unwrap();
+            registry.close().unwrap();
+        }
+        let registry = Registry::open(&dir, [0; 32], 1, false, true).unwrap();
+        assert!(registry.zone.final_entries()[1].error.is_none());
+        assert_eq!(registry.zone.final_tip().unwrap().to_lez_block_id, 3);
+        assert!(registry.zone.stall().is_none());
+        assert_eq!(
+            String::from_utf8(file(&dir, FINAL_FILE))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A frozen final tier (a parked batch, one parked after it) and the correction that ends
+    /// the stall come back the same from disk: the stall is derived from the entries, the
+    /// correction replays on the empty tree, the roots exclude the parked and the superseded.
+    #[test]
+    fn test_reopen_restores_a_frozen_final_tier_and_its_correction() {
+        let dir = dir("frozen");
+        let (truth, correction) = {
+            let mut registry = Registry::open(&dir, [0; 32], 1, false, true).unwrap();
+            registry
+                .apply_lez_finalized(&block(1, vec![registered(1, 0)]))
+                .unwrap();
+            registry
+                .apply_lez_finalized(&block(2, vec![registered(2, 1)]))
+                .unwrap();
+            let leaf_0 = registry.head().member_at(0).unwrap().1.rate_commitment;
+            let honest = Batch {
+                from_lez_block_id: 1,
+                to_lez_block_id: 1,
+                changes: vec![Change::insert(0, leaf_0.to_vec())],
+                root_after: registry.head().root_at(1).unwrap().to_vec(),
+            };
+            assert!(matches!(
+                registry.apply_zone_finalized(entry(1, None, &honest), 10),
+                Some(AcceptOutcome::Applied(_))
+            ));
+            // A batch claiming another leaf 1 than LEZ gave: parked; the heartbeat after it too.
+            let mut wrong_tree = ReplayTree::empty();
+            wrong_tree.apply(&honest.changes).unwrap();
+            wrong_tree.apply(&[Change::insert(1, vec![9; 32])]).unwrap();
+            let wrong = Batch {
+                from_lez_block_id: 2,
+                to_lez_block_id: 2,
+                changes: vec![Change::insert(1, vec![9; 32])],
+                root_after: wrong_tree.root().to_vec(),
+            };
+            assert!(matches!(
+                registry.apply_zone_finalized(entry(2, Some(1), &wrong), 20),
+                Some(AcceptOutcome::Parked(
+                    BatchIngestError::DerivationMismatch { .. }
+                ))
+            ));
+            let heartbeat = Batch {
+                from_lez_block_id: 3,
+                to_lez_block_id: 3,
+                changes: vec![],
+                root_after: wrong_tree.root().to_vec(),
+            };
+            assert!(matches!(
+                registry.apply_zone_finalized(entry(3, Some(2), &heartbeat), 30),
+                Some(AcceptOutcome::Parked(_))
+            ));
+            registry.save().unwrap();
+            let truth = registry.head().root();
+            let correction = Batch {
+                from_lez_block_id: 1,
+                to_lez_block_id: 2,
+                changes: registry
+                    .head()
+                    .active_leaves()
+                    .iter()
+                    .map(|(_, m)| Change::insert(m.leaf_index, m.rate_commitment.to_vec()))
+                    .collect(),
+                root_after: truth.to_vec(),
+            };
+            registry.close().unwrap();
+            (truth, correction)
+        };
+        {
+            let mut registry = Registry::open(&dir, [0; 32], 1, false, true).unwrap();
+            let stall = registry.zone.stall().unwrap();
+            assert_eq!(
+                (stall.msg, stall.l1_slot, stall.orphans_since),
+                ([2; 32], 20, 1)
+            );
+            assert_eq!(registry.zone.final_tip().unwrap().to_lez_block_id, 1);
+            assert_eq!(crate::http::roots_of(&registry, 5).len(), 1);
+            assert!(matches!(
+                registry.apply_zone_finalized(entry(4, Some(3), &correction), 40),
+                Some(AcceptOutcome::Applied(_))
+            ));
+            assert!(registry.zone.stall().is_none());
+            registry.save().unwrap();
+            registry.close().unwrap();
+        }
+        let registry = Registry::open(&dir, [0; 32], 1, false, true).unwrap();
+        assert!(registry.zone.stall().is_none());
+        assert_eq!(registry.zone.final_entries().len(), 4);
+        assert_eq!(registry.zone.final_tip().unwrap().root, truth);
+        assert_eq!(registry.zone.superseded(), HashSet::from([[1; 32]]));
+        let roots = crate::http::roots_of(&registry, 5);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].produced_by().msg_id, hex::encode([4; 32]));
+        assert!(registry.contradicted().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `REBUILD_TREE` drops the tree, the reader's state and the adopted LEZ blocks, keeps the
+    /// Zone channel state and its checkpoint, and derives the pending changes again from LEZ for
+    /// the blocks the channel does not cover.
+    #[test]
+    fn test_rebuild_tree_keeps_the_channel_and_derives_the_tree_again() {
+        let dir = dir("rebuild");
+        let root_before = {
+            let mut registry = Registry::open(&dir, [0; 32], 1, false, false).unwrap();
+            registry
+                .apply_lez_finalized(&block(1, vec![registered(1, 0)]))
+                .unwrap();
+            registry
+                .apply_lez_finalized(&block(2, vec![registered(2, 1)]))
+                .unwrap();
+            let first = registry.next_batch().unwrap();
+            registry.record_publish(msg(1), MsgId::root(), &first);
+            registry.apply_zone_finalized(entry(1, None, &first), 10);
+            registry
+                .apply_lez_adopted(&block(3, vec![registered(3, 2)]))
+                .unwrap();
+            registry.set_checkpoint(json!({"lib": 7}));
+            registry.save().unwrap();
+            let root = registry.head().root();
+            registry.close().unwrap();
+            root
+        };
+        let mut registry = Registry::open(&dir, [0; 32], 1, true, false).unwrap();
+        assert_eq!(registry.head().lez_block_id, 0);
+        assert!(!dir.join(LEZ_VIEW_FILE).exists());
+        assert_eq!(registry.zone.final_entries().len(), 1);
+        assert_eq!(registry.covered_to(), 2);
+        assert!(registry.checkpoint().is_some());
+        assert!(registry.pending_changes.is_empty());
+        // LEZ again: the covered blocks add nothing pending, the adopted one does.
+        registry
+            .apply_lez_finalized(&block(1, vec![registered(1, 0)]))
+            .unwrap();
+        registry
+            .apply_lez_finalized(&block(2, vec![registered(2, 1)]))
+            .unwrap();
+        assert!(registry.pending_changes.is_empty());
+        registry
+            .apply_lez_adopted(&block(3, vec![registered(3, 2)]))
+            .unwrap();
+        assert_eq!(registry.pending_changes.len(), 1);
+        assert_eq!(registry.head().root(), root_before);
+        let next = registry.next_batch().unwrap();
+        assert_eq!((next.from_lez_block_id, next.to_lez_block_id), (3, 3));
+        assert!(registry.would_apply(&next).is_ok());
+        registry.close().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An indexer whose old tree parked a batch (a decoder that skipped a transaction, say)
+    /// judges it again after `REBUILD_TREE`: the verdict becomes a wait, the new tree decides.
+    #[test]
+    fn test_rebuild_tree_on_an_indexer_judges_the_parked_batches_again() {
+        let dir = dir("rejudge");
+        let honest = {
+            let mut sequencer = Registry::open_temporary(1, false).unwrap();
+            sequencer
+                .apply_lez_adopted(&block(1, vec![registered(1, 0)]))
+                .unwrap();
+            sequencer.next_batch().unwrap()
+        };
+        {
+            // The old tree read block 1 wrong (another registration): the honest batch parks.
+            let mut registry = Registry::open(&dir, [0; 32], 1, false, true).unwrap();
+            registry
+                .apply_lez_finalized(&block(1, vec![registered(9, 0)]))
+                .unwrap();
+            assert!(matches!(
+                registry.apply_zone_finalized(entry(1, None, &honest), 10),
+                Some(AcceptOutcome::Parked(
+                    BatchIngestError::DerivationMismatch { .. }
+                ))
+            ));
+            registry.save().unwrap();
+            registry.close().unwrap();
+        }
+        {
+            let mut registry = Registry::open(&dir, [0; 32], 1, true, true).unwrap();
+            assert!(registry.zone.final_entries()[0].is_waiting());
+            assert!(registry.zone.stall().is_none());
+            registry
+                .apply_lez_finalized(&block(1, vec![registered(1, 0)]))
+                .unwrap();
+            assert_eq!(registry.retry_folds(), 1);
+            assert!(registry.zone.final_entries()[0].error.is_none());
+            assert_eq!(registry.zone.final_tip().unwrap().to_lez_block_id, 1);
+            registry.save().unwrap();
+            registry.close().unwrap();
+        }
+        // The store's lock is held until the registry is dropped (sled retries for hours).
+        let registry = Registry::open(&dir, [0; 32], 1, false, true).unwrap();
+        assert!(registry.zone.final_entries()[0].error.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Finality on a lineage that does not hold our publishes (no `Conflict` came): they leave
+    /// the view, nothing waits for them, and their batches are queued to publish again like
+    /// orphaned ones.
+    #[test]
+    fn test_finality_on_another_lineage_orphans_the_publishes_in_flight() {
+        let mut registry = Registry::open_temporary(1, false).unwrap();
+        registry
+            .apply_lez_adopted(&block(1, vec![registered(1, 0)]))
+            .unwrap();
+        let first = registry.next_batch().unwrap();
+        registry.record_publish(msg(1), MsgId::root(), &first);
+        registry
+            .apply_lez_adopted(&block(2, vec![registered(2, 1)]))
+            .unwrap();
+        let second = registry.next_batch().unwrap();
+        registry.record_publish(msg(2), msg(1), &second);
+        assert_eq!(registry.in_flight(), Some([2; 32]));
+        // Entry 7 on the root carries the first batch and finalizes: our entries are gone.
+        assert!(matches!(
+            registry.apply_zone_finalized(entry(7, None, &first), 10),
+            Some(AcceptOutcome::Applied(_))
+        ));
+        assert!(registry.zone.view().is_empty());
+        assert_eq!(registry.zone.final_msg(), msg(7));
+        assert!(registry.in_flight().is_none());
+        assert_eq!(registry.orphaned_count(), 2);
+        assert_eq!(registry.covered_to(), 1);
+        // Both go back to the queue in order; the first is covered by entry 7 already and
+        // fails to apply (the tick drops it as any orphaned batch that no longer applies).
+        assert_eq!(registry.next_republish(), Some(first.clone()));
+        registry.republished();
+        assert_eq!(registry.next_republish(), Some(second.clone()));
+        assert!(registry.would_apply(&second).is_ok());
+    }
+
+    /// The anchor: seeded once at the slot the SDK starts from, moved forward only, untouched
+    /// by an entry delivered again (the stream, then the finality scan).
+    #[test]
+    fn test_the_anchor_is_seeded_once_and_moves_forward_only() {
+        let mut registry = Registry::open_temporary(1, false).unwrap();
+        registry.scanned_to(5);
+        assert!(registry.anchor().is_none());
+        registry.seed_anchor(100);
+        registry.seed_anchor(200);
+        let seeded = registry.anchor().unwrap();
+        assert_eq!(
+            (seeded.slot, seeded.to_lez_block_id, seeded.root),
+            (100, 0, *EMPTY_ROOT)
+        );
+        registry
+            .apply_lez_adopted(&block(1, vec![registered(1, 0)]))
+            .unwrap();
+        let first = registry.next_batch().unwrap();
+        registry.record_publish(msg(1), MsgId::root(), &first);
+        registry.apply_zone_finalized(entry(1, None, &first), 150);
+        let moved = registry.anchor().unwrap();
+        assert_eq!((moved.slot, moved.to_lez_block_id), (150, 1));
+        assert_eq!(moved.root, Tip::from(&first).root);
+        assert_eq!(
+            registry.apply_zone_finalized(entry(1, None, &first), 150),
+            Some(AcceptOutcome::AlreadyApplied)
+        );
+        assert_eq!(registry.anchor(), Some(moved));
+        registry.scanned_to(120);
+        assert_eq!(registry.anchor().unwrap().slot, 150);
+        registry.scanned_to(300);
+        assert_eq!(registry.anchor().unwrap().slot, 300);
+        // A batchless entry has no outcome, twice.
+        let bare = ChannelEntry::new(msg(2), msg(1), &[]);
+        assert_eq!(registry.apply_zone_finalized(bare.clone(), 310), None);
+        assert_eq!(registry.apply_zone_finalized(bare, 310), None);
+    }
+
+    /// Corners: a channel tip that is not ours lands nothing; a checkpoint that is not an object
+    /// is kept as it is; a canonical lineage listing an entry twice holds it once; the next
+    /// batch stops where its changes stop fitting one inscription.
+    #[test]
+    fn test_registry_corners() {
+        let mut registry = Registry::open_temporary(1, false).unwrap();
+        registry
+            .apply_lez_adopted(&block(1, vec![registered(1, 0)]))
+            .unwrap();
+        let first = registry.next_batch().unwrap();
+        registry.record_publish(msg(1), MsgId::root(), &first);
+        assert!(registry.mark_adopted_up_to([9; 32]).is_empty());
+        assert_eq!(registry.in_flight(), Some([1; 32]));
+        registry.set_checkpoint(json!(5));
+        assert_eq!(registry.checkpoint(), Some(&json!(5)));
+        let twice = vec![entry(1, None, &first), entry(1, None, &first)];
+        assert!(registry.apply_zone_conflict(twice).is_empty());
+        assert_eq!(registry.zone.view().len(), 1);
+        // Three registrations in block 2, one in block 3, an inscription that holds two
+        // changes: the batch covers block 2 whole (at least one block, over the size), the next
+        // one block 3; a real inscription holds both.
+        registry
+            .apply_lez_adopted(&block(
+                2,
+                vec![registered(2, 1), registered(3, 2), registered(4, 3)],
+            ))
+            .unwrap();
+        registry
+            .apply_lez_adopted(&block(3, vec![registered(5, 4)]))
+            .unwrap();
+        let two_changes = Batch {
+            from_lez_block_id: 2,
+            to_lez_block_id: 3,
+            changes: vec![
+                Change::insert(1, vec![0; 32]),
+                Change::insert(2, vec![0; 32]),
+            ],
+            root_after: vec![0; 32],
+        }
+        .encoded_len();
+        let cut = registry.next_batch_within(two_changes).unwrap();
+        assert_eq!((cut.from_lez_block_id, cut.to_lez_block_id), (2, 2));
+        assert_eq!(cut.changes.len(), 3);
+        assert_eq!(cut.root_after, registry.head().root_at(2).unwrap().to_vec());
+        assert!(registry.would_apply(&cut).is_ok());
+        let whole = registry.next_batch().unwrap();
+        assert_eq!((whole.from_lez_block_id, whole.to_lez_block_id), (2, 3));
+        assert_eq!(whole.changes.len(), 4);
+        assert!(whole.encoded_len() <= MAX_INSCRIPTION_BYTES);
+        assert!(registry.would_apply(&whole).is_ok());
     }
 }

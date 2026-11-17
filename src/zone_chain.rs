@@ -7,10 +7,17 @@
 //! (`from_lez_block_id` continues it), its changes must replay to its `root_after`, and the
 //! judge (the indexer's own tree derived from LEZ) must agree with that root. A batch that
 //! fails parks: the tip freezes and every later entry parks after it, the LEZ semantics.
+//!
+//! A correction (RFC "Zone Sequencer") is a batch that starts at the registry's first LEZ
+//! block again while the channel has a tip: the sequencer says the channel's statements were
+//! wrong (a Bedrock reorg replaced a LEZ block it had batched) and restates the tree, its
+//! changes being every leaf set, replayed on the empty tree, which is what a batch covering the
+//! whole registry means. It applies under the same checks (replay, judge), moves a frozen tip
+//! too, and supersedes every batch before it: their roots are not valid any more.
 
 use std::collections::HashSet;
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow, bail};
 use borsh::{BorshDeserialize, BorshSerialize};
 use lb_core::mantle::ops::channel::MsgId;
 use prost::Message as _;
@@ -21,7 +28,7 @@ use zerokit_utils::merkle_tree::{OptimalMerkleConfig, OptimalMerkleTree, Zerokit
 
 use crate::{
     batch::{Batch, Change, Kind},
-    reader::{TREE_DEPTH, fr_from_bytes_le, fr_to_bytes_le},
+    reader::{ProofPath, TREE_DEPTH, fr_from_bytes_le, fr_to_bytes_le, proof_path_at, short},
 };
 
 /// One inscription on the channel's message lineage.
@@ -68,7 +75,7 @@ impl From<&Batch> for Tip {
 }
 
 /// What recording one of our own publishes did.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PublishRecord {
     /// The entry is in the view and its batch entered the head.
     Extended,
@@ -129,7 +136,7 @@ pub struct StallReason {
     pub msg: [u8; 32],
     pub l1_slot: u64,
     pub error: BatchIngestError,
-    /// Later finalized batches that could not apply since (orphans, the tip being frozen).
+    /// Later finalized batches that could not apply since (parked after it, the tip being frozen).
     pub orphans_since: u64,
 }
 
@@ -140,8 +147,15 @@ pub trait Judge {
     fn root_at(&self, to_lez_block_id: u64) -> Option<[u8; 32]>;
 }
 
-/// `tree` after `batch` when it chains on `tip` (the first batch on `first_lez_block_id`) and
-/// the judge, if any, agrees.
+/// Whether `batch` corrects a channel whose tip is `tip`: it starts at the registry's first
+/// block again.
+pub fn is_correction(first_lez_block_id: u64, tip: Option<&Tip>, batch: &Batch) -> bool {
+    tip.is_some() && batch.from_lez_block_id == first_lez_block_id
+}
+
+/// `tree` after `batch` when it chains on `tip` (the first batch on `first_lez_block_id`), or
+/// the tree `batch` restates when it is a correction (replayed on the empty tree; it may not
+/// end before the tip), and the judge, if any, agrees.
 fn apply_batch(
     first_lez_block_id: u64,
     tip: Option<&Tip>,
@@ -150,14 +164,28 @@ fn apply_batch(
     judge: Option<&dyn Judge>,
 ) -> Result<ReplayTree, BatchIngestError> {
     let expected = tip.map_or(first_lez_block_id, |tip| tip.to_lez_block_id + 1);
-    if batch.from_lez_block_id != expected {
+    let (from, to) = (batch.from_lez_block_id, batch.to_lez_block_id);
+    let correction = is_correction(first_lez_block_id, tip, batch);
+    // A gap, a start inside the covered span that is not a correction, a span that ends before
+    // it starts or before the tip.
+    if (from != expected && !correction) || to < from || to + 1 < expected {
         return Err(BatchIngestError::UnexpectedBlockId {
             expected,
-            got: batch.from_lez_block_id,
+            got: from,
         });
     }
+    if batch.root_after.len() != 32 {
+        return Err(BatchIngestError::Deserialize(format!(
+            "root_after is {} bytes, not 32",
+            batch.root_after.len()
+        )));
+    }
     let claimed = Tip::from(batch).root;
-    let mut next = tree.clone();
+    let mut next = if correction {
+        ReplayTree::empty()
+    } else {
+        tree.clone()
+    };
     next.apply(&batch.changes)
         .map_err(|e| BatchIngestError::Deserialize(format!("{e:#}")))?;
     let computed = next.root();
@@ -186,11 +214,13 @@ fn apply_batch(
     Ok(next)
 }
 
-/// The tree the batches replay to: in memory, rebuilt from the final tier on start.
+/// The tree the batches replay to: in memory, replayed from the final tier on start. The tree
+/// at the newest applied batch is the one a Module proves against (its root is a valid root).
 #[derive(Clone)]
 pub struct ReplayTree(OptimalMerkleTree<PoseidonHash>);
 
 impl ReplayTree {
+    /// The empty tree, what every registry starts from.
     pub fn empty() -> Self {
         Self(
             OptimalMerkleTree::<PoseidonHash>::new(
@@ -216,7 +246,7 @@ impl ReplayTree {
                         .as_slice()
                         .try_into()
                         .context("a leaf that is not 32 bytes")?;
-                    let leaf = fr_from_bytes_le(&bytes).map_err(|e| anyhow::anyhow!(e))?;
+                    let leaf = fr_from_bytes_le(&bytes)?;
                     self.0
                         .set(insert.leaf_index as usize, leaf)
                         .with_context(|| format!("insert leaf {}", insert.leaf_index))?;
@@ -225,10 +255,16 @@ impl ReplayTree {
                     .0
                     .delete(remove.leaf_index as usize)
                     .with_context(|| format!("remove leaf {}", remove.leaf_index))?,
-                None => anyhow::bail!("a change has no kind"),
+                None => bail!("a change has no kind"),
             }
         }
         Ok(())
+    }
+
+    /// The Merkle proof path of the leaf at `leaf_index` at this tree's root, if the leaf is
+    /// set (RLN-API form).
+    pub fn proof_path(&self, leaf_index: u64) -> Option<ProofPath> {
+        proof_path_at(&self.0, leaf_index)
     }
 }
 
@@ -316,34 +352,49 @@ impl ZoneChain {
         }
     }
 
-    /// State restored from a persisted final tier (the entries replay in order, the first
-    /// parked one freezes the tip) and the persisted view.
+    /// State restored from a persisted final tier (the entries replay in order with the outcome
+    /// they were judged with: an applied batch moves the tip, the first parked one freezes it
+    /// as the stall, the ones parked after it count, a later applied one, a correction, ends the
+    /// stall) and the persisted view.
     pub fn restore(
         first_lez_block_id: u64,
         final_entries: Vec<FinalEntry>,
-        stall: Option<StallReason>,
         view: &[u8],
         judge: Option<&dyn Judge>,
     ) -> Result<Self> {
         let mut chain = Self::new(first_lez_block_id);
         for entry in final_entries {
-            if entry.error.is_none()
-                && let Some(batch) = entry.batch()
-            {
-                chain.final_state = apply_batch(
-                    first_lez_block_id,
-                    chain.final_tip.as_ref(),
-                    &batch,
-                    &chain.final_state,
-                    None,
-                )
-                .map_err(|e| anyhow::anyhow!("final batch msg {}: {e}", hex::encode(entry.msg)))?;
-                chain.final_tip = Some(Tip::from(&batch));
+            if let Some(batch) = entry.batch() {
+                match &entry.error {
+                    None => {
+                        chain.final_state = apply_batch(
+                            first_lez_block_id,
+                            chain.final_tip.as_ref(),
+                            &batch,
+                            &chain.final_state,
+                            None,
+                        )
+                        .map_err(|e| anyhow!("final batch msg {}: {e}", short(&entry.msg)))?;
+                        chain.final_tip = Some(Tip::from(&batch));
+                        chain.stall = None;
+                    }
+                    Some(error) if error.is_retryable() => {}
+                    Some(error) => match &mut chain.stall {
+                        Some(stall) => stall.orphans_since += 1,
+                        None => {
+                            chain.stall = Some(StallReason {
+                                msg: entry.msg,
+                                l1_slot: entry.l1_slot,
+                                error: error.clone(),
+                                orphans_since: 0,
+                            });
+                        }
+                    },
+                }
             }
             chain.final_msg = MsgId::from(entry.msg);
             chain.final_entries.push(entry);
         }
-        chain.stall = stall;
         if !view.is_empty() {
             chain.restore_view(view, judge)?;
         }
@@ -384,13 +435,43 @@ impl ZoneChain {
             .map_or(self.final_tip.as_ref(), |fold| fold.tip.as_ref())
     }
 
-    /// The root the head's replay is at.
-    #[cfg(test)]
-    pub fn head_root(&self) -> [u8; 32] {
+    /// The tree at the head tip: the final state folded over the view, the tree of the newest
+    /// applied batch, whose root is the newest valid root.
+    pub fn head_state(&self) -> &ReplayTree {
         self.folds
             .last()
             .map_or(&self.final_state, |fold| &fold.state)
-            .root()
+    }
+
+    /// The root the head's replay is at.
+    #[cfg(test)]
+    pub fn head_root(&self) -> [u8; 32] {
+        self.head_state().root()
+    }
+
+    /// The entries whose batch a later correction re-covered: applied once, their roots are not
+    /// valid any more (final tier first, then the view, lineage order).
+    pub fn superseded(&self) -> HashSet<[u8; 32]> {
+        let final_batches = self
+            .final_entries
+            .iter()
+            .filter(|f| f.error.is_none())
+            .filter_map(|f| Some((f.msg, f.batch()?)));
+        let view_batches = self
+            .view_outcomes()
+            .filter(|(_, outcome)| outcome.is_ok())
+            .filter_map(|(e, _)| Some((e.msg.into(), e.batch.clone()?)));
+        let mut applied: Vec<([u8; 32], Batch)> = vec![];
+        let mut superseded = HashSet::new();
+        for (msg, batch) in final_batches.chain(view_batches) {
+            for (held, earlier) in &applied {
+                if earlier.to_lez_block_id >= batch.from_lez_block_id {
+                    superseded.insert(*held);
+                }
+            }
+            applied.push((msg, batch));
+        }
+        superseded
     }
 
     /// Parent the next inscription must chain on: the view's last entry.
@@ -408,42 +489,39 @@ impl ZoneChain {
         })
     }
 
-    /// The view and `final_msg` in their persisted form. A skipped entry is stored without
-    /// its batch: it folds the same either way.
+    /// The view and `final_msg` in their persisted form, every entry with its batch, so the
+    /// restored view folds to the same outcomes (a parked entry keeps its cause, a
+    /// contradicted one is still seen).
     pub fn encode_view(&self) -> Vec<u8> {
         let stored = StoredView {
             final_msg: self.final_msg.into(),
             entries: self
                 .view
                 .iter()
-                .zip(&self.folds)
-                .map(|(entry, fold)| StoredEntry {
+                .map(|entry| StoredEntry {
                     msg: entry.msg.into(),
                     parent: entry.parent.into(),
-                    batch: entry
-                        .batch
-                        .as_ref()
-                        .filter(|_| {
-                            fold.outcome.is_ok()
-                                || fold
-                                    .outcome
-                                    .as_ref()
-                                    .is_err_and(BatchIngestError::is_retryable)
-                        })
-                        .map(Batch::encode_to_vec),
+                    batch: entry.batch.as_ref().map(Batch::encode_to_vec),
                 })
                 .collect(),
         };
         borsh::to_vec(&stored).expect("view serializes")
     }
 
-    /// Installs a persisted view on the restored final tier and folds it.
+    /// Installs a persisted view on the restored final tier and folds it. The final tier is
+    /// the authority on what is final: a persisted view written before the final tier moved
+    /// (the files are written in that order) keeps its `final_msg` only while the tier holds
+    /// no entry, and loses the entries the tier holds.
     pub fn restore_view(&mut self, bytes: &[u8], judge: Option<&dyn Judge>) -> Result<()> {
         let stored = StoredView::try_from_slice(bytes).context("the persisted channel view")?;
-        self.final_msg = MsgId::from(stored.final_msg);
+        if self.final_entries.is_empty() {
+            self.final_msg = MsgId::from(stored.final_msg);
+        }
+        let final_msgs: HashSet<[u8; 32]> = self.final_entries.iter().map(|f| f.msg).collect();
         self.view = stored
             .entries
             .into_iter()
+            .filter(|entry| !final_msgs.contains(&entry.msg))
             .map(|entry| ChannelEntry {
                 msg: MsgId::from(entry.msg),
                 parent: MsgId::from(entry.parent),
@@ -464,9 +542,9 @@ impl ZoneChain {
             if entry.parent != self.pin() {
                 warn!(
                     "adopted channel entry {} chains on {}, not on the pin {}",
-                    short(&entry.msg),
-                    short(&entry.parent),
-                    short(&self.pin())
+                    short(&entry.msg.into()),
+                    short(&entry.parent.into()),
+                    short(&self.pin().into())
                 );
             }
             self.push(entry, judge);
@@ -569,9 +647,9 @@ impl ZoneChain {
         if entry.parent != self.final_msg {
             warn!(
                 "finalized entry {} chains on {}, not on the final entry {}",
-                short(&entry.msg),
-                short(&entry.parent),
-                short(&self.final_msg)
+                short(&entry.msg.into()),
+                short(&entry.parent.into()),
+                short(&self.final_msg.into())
             );
         }
         let outcome = entry
@@ -614,21 +692,28 @@ impl ZoneChain {
         l1_slot: u64,
         judge: Option<&dyn Judge>,
     ) -> AcceptOutcome {
-        if let Some(stall) = &mut self.stall {
-            stall.orphans_since += 1;
-            return AcceptOutcome::Parked(BatchIngestError::UnexpectedBlockId {
-                expected: self
-                    .final_tip
-                    .as_ref()
-                    .map_or(self.first_lez_block_id, |t| t.to_lez_block_id + 1),
-                got: batch.from_lez_block_id,
-            });
-        }
         if self.final_entries.iter().any(FinalEntry::is_waiting) {
             return AcceptOutcome::RetryableFailure(BatchIngestError::LezNotRead {
                 to: batch.to_lez_block_id,
             });
         }
+        match self.apply_to_final(batch, entry.msg.into(), l1_slot, judge) {
+            Ok(changes) => AcceptOutcome::Applied(changes),
+            Err(error) if error.is_retryable() => AcceptOutcome::RetryableFailure(error),
+            Err(error) => AcceptOutcome::Parked(error),
+        }
+    }
+
+    /// One batch onto the final tier. A failure that is not the judge's wait freezes the tip
+    /// (the stall, or one more batch parked after it); a batch that applies on a frozen tip is a
+    /// correction, and the stall is over.
+    fn apply_to_final(
+        &mut self,
+        batch: &Batch,
+        msg: [u8; 32],
+        l1_slot: u64,
+        judge: Option<&dyn Judge>,
+    ) -> Result<Vec<Change>, BatchIngestError> {
         match apply_batch(
             self.first_lez_block_id,
             self.final_tip.as_ref(),
@@ -639,17 +724,23 @@ impl ZoneChain {
             Ok(state) => {
                 self.final_state = state;
                 self.final_tip = Some(Tip::from(batch));
-                AcceptOutcome::Applied(batch.changes.clone())
+                self.stall = None;
+                Ok(batch.changes.clone())
             }
-            Err(error) if error.is_retryable() => AcceptOutcome::RetryableFailure(error),
+            Err(error) if error.is_retryable() => Err(error),
             Err(error) => {
-                self.stall = Some(StallReason {
-                    msg: entry.msg.into(),
-                    l1_slot,
-                    error: error.clone(),
-                    orphans_since: 0,
-                });
-                AcceptOutcome::Parked(error)
+                match &mut self.stall {
+                    Some(stall) => stall.orphans_since += 1,
+                    None => {
+                        self.stall = Some(StallReason {
+                            msg,
+                            l1_slot,
+                            error: error.clone(),
+                            orphans_since: 0,
+                        });
+                    }
+                }
+                Err(error)
             }
         }
     }
@@ -665,27 +756,14 @@ impl ZoneChain {
             let Some(batch) = self.final_entries[i].batch() else {
                 continue;
             };
-            match apply_batch(
-                self.first_lez_block_id,
-                self.final_tip.as_ref(),
-                &batch,
-                &self.final_state,
-                judge,
-            ) {
-                Ok(state) => {
-                    self.final_state = state;
-                    self.final_tip = Some(Tip::from(&batch));
+            let (msg, l1_slot) = (self.final_entries[i].msg, self.final_entries[i].l1_slot);
+            match self.apply_to_final(&batch, msg, l1_slot, judge) {
+                Ok(_) => {
                     self.final_entries[i].error = None;
                     decided += 1;
                 }
                 Err(error) if error.is_retryable() => break,
                 Err(error) => {
-                    self.stall = Some(StallReason {
-                        msg: self.final_entries[i].msg,
-                        l1_slot: self.final_entries[i].l1_slot,
-                        error: error.clone(),
-                        orphans_since: 0,
-                    });
                     self.final_entries[i].error = Some(error);
                     decided += 1;
                     break;
@@ -753,12 +831,14 @@ impl ZoneChain {
                 (&fold.state, fold.tip.as_ref())
             });
         // Behind an entry the judge has still to decide nothing can be judged: the tip it would
-        // chain on is not confirmed yet (as the final tier waits in `apply_final_batch`).
-        let waiting = self.folds.last().is_some_and(|fold| {
-            fold.outcome
-                .as_ref()
-                .is_err_and(BatchIngestError::is_retryable)
-        });
+        // chain on is not confirmed yet (a waiting final entry, as in `apply_final_batch`, or a
+        // waiting fold before it).
+        let waiting = self.final_entries.iter().any(FinalEntry::is_waiting)
+            || self.folds.last().is_some_and(|fold| {
+                fold.outcome
+                    .as_ref()
+                    .is_err_and(BatchIngestError::is_retryable)
+            });
         let outcome = match &entry.batch {
             Some(batch) if waiting => Err(BatchIngestError::LezNotRead {
                 to: batch.to_lez_block_id,
@@ -782,10 +862,6 @@ impl ZoneChain {
             },
         }
     }
-}
-
-fn short(msg: &MsgId) -> String {
-    hex::encode(&<[u8; 32]>::from(*msg)[..4])
 }
 
 #[cfg(test)]
@@ -905,7 +981,7 @@ mod test {
         );
 
         // Restore from the final tier alone.
-        let again = ZoneChain::restore(1, chain.final_entries().to_vec(), None, &[], None).unwrap();
+        let again = ZoneChain::restore(1, chain.final_entries().to_vec(), &[], None).unwrap();
         assert_eq!(again.final_tip(), chain.final_tip());
         assert_eq!(again.head_root(), chain.head_root());
     }
@@ -1013,11 +1089,21 @@ mod test {
         assert_eq!(chain.final_tip().unwrap().to_lez_block_id, 2);
         assert!(chain.final_entries()[1].is_waiting());
         assert!(chain.stall().is_none());
+        // Behind a waiting final entry the view waits too: its tip is not confirmed.
+        assert!(matches!(
+            chain.view_outcomes().next().unwrap().1,
+            Err(BatchIngestError::LezNotRead { .. })
+        ));
         oracle.read_to = 6;
-        assert_eq!(chain.retry_folds(Some(&oracle)), 1);
+        // The judge decides the final entry and, folding the view again, the wrong one.
+        assert_eq!(chain.retry_folds(Some(&oracle)), 2);
         assert_eq!(chain.final_tip().unwrap().to_lez_block_id, 4);
         assert!(!chain.final_entries()[1].is_waiting());
-        // Entry 3 parks the final tier, 4 counts as an orphan.
+        assert!(matches!(
+            chain.view_outcomes().next().unwrap().1,
+            Err(BatchIngestError::HashMismatch { .. })
+        ));
+        // Entry 3 parks the final tier, 4 parks after it.
         let parked = chain.apply_finalized(entry(3, 2, Some(wrong)), 200, Some(&oracle));
         assert!(matches!(
             parked,
@@ -1091,6 +1177,226 @@ mod test {
         assert_eq!(chain.final_msg(), msg(1));
     }
 
+    /// A correction (a batch starting at or before the tip) restates the tree on the empty
+    /// tree: on the final tier it moves a tip frozen by a parked batch (the judge decides it as
+    /// any batch); in the view it supersedes the applied batches whose span it re-covers.
+    #[test]
+    fn test_a_correction_moves_a_frozen_tip_and_supersedes_the_batches_it_re_covers() {
+        let empty = ReplayTree::empty();
+        let b1 = batch(1, 1, vec![Change::insert(0, leaf(1))], &empty);
+        let mut one = empty.clone();
+        one.apply(&b1.changes).unwrap();
+        // The sequencer batched leaf 1 = leaf(2) from a LEZ block a Bedrock reorg replaced;
+        // the canonical block 2 registered leaf(3) there.
+        let wrong = batch(2, 2, vec![Change::insert(1, leaf(2))], &one);
+        let mut truth = one.clone();
+        truth.apply(&[Change::insert(1, leaf(3))]).unwrap();
+        let oracle = Oracle {
+            roots: vec![(1, one.root()), (2, truth.root())],
+            read_to: 10,
+        };
+        // The indexer's final tier: the wrong batch parks, the heartbeat after it orphans.
+        let mut chain = ZoneChain::new(1);
+        assert!(matches!(
+            chain.apply_finalized(entry(1, 0, Some(b1.clone())), 10, Some(&oracle)),
+            Some(AcceptOutcome::Applied(_))
+        ));
+        assert!(matches!(
+            chain.apply_finalized(entry(2, 1, Some(wrong.clone())), 20, Some(&oracle)),
+            Some(AcceptOutcome::Parked(
+                BatchIngestError::DerivationMismatch { .. }
+            ))
+        ));
+        let heartbeat = batch(3, 3, vec![], &truth);
+        assert!(matches!(
+            chain.apply_finalized(entry(3, 2, Some(heartbeat)), 30, Some(&oracle)),
+            Some(AcceptOutcome::Parked(_))
+        ));
+        assert_eq!(chain.stall().unwrap().orphans_since, 1);
+        assert_eq!(chain.final_tip().unwrap().to_lez_block_id, 1);
+        // The correction: every leaf set, from the first block to 3, on the empty tree.
+        let correction = batch(
+            1,
+            3,
+            vec![Change::insert(0, leaf(1)), Change::insert(1, leaf(3))],
+            &empty,
+        );
+        assert_eq!(correction.root_after, truth.root().to_vec());
+        assert!(is_correction(1, chain.final_tip(), &correction));
+        assert!(matches!(
+            chain.apply_finalized(entry(4, 3, Some(correction.clone())), 40, Some(&oracle)),
+            Some(AcceptOutcome::Applied(_))
+        ));
+        assert!(chain.stall().is_none());
+        assert_eq!(chain.final_tip().unwrap().to_lez_block_id, 3);
+        assert_eq!(chain.final_tip().unwrap().root, truth.root());
+        // The parked ones stay parked (never valid), the first batch is superseded; the tier
+        // continues after the correction.
+        assert!(chain.final_entries()[1].error.is_some());
+        assert!(chain.final_entries()[2].error.is_some());
+        assert_eq!(chain.superseded(), HashSet::from([[1; 32]]));
+        let b4 = batch(4, 4, vec![Change::insert(2, leaf(4))], &truth);
+        let mut oracle = oracle;
+        oracle.roots.push((4, Tip::from(&b4).root));
+        assert!(matches!(
+            chain.apply_finalized(entry(5, 4, Some(b4)), 50, Some(&oracle)),
+            Some(AcceptOutcome::Applied(_))
+        ));
+        // A correction that lies parks like any batch.
+        let mut liar = correction.clone();
+        liar.root_after = vec![7; 32];
+        let mut judged = ZoneChain::new(1);
+        judged.apply_finalized(entry(1, 0, Some(b1.clone())), 10, Some(&oracle));
+        assert!(matches!(
+            judged.apply_finalized(entry(2, 1, Some(liar)), 20, Some(&oracle)),
+            Some(AcceptOutcome::Parked(BatchIngestError::HashMismatch { .. }))
+        ));
+        // The sequencer's own view (no judge): the wrong batch applied; the correction
+        // supersedes everything before it, the head is the restated tree, and a correction may
+        // not end before the tip.
+        let mut view = ZoneChain::new(1);
+        view.record_publish(entry(1, 0, Some(b1)), None);
+        assert_eq!(
+            view.record_publish(entry(2, 1, Some(wrong)), None),
+            PublishRecord::Extended
+        );
+        assert_eq!(view.head_root(), wrong_root(&one));
+        let short = batch(1, 1, vec![Change::insert(0, leaf(1))], &empty);
+        assert_eq!(
+            view.record_publish(entry(3, 2, Some(short)), None),
+            PublishRecord::Skipped
+        );
+        assert_eq!(
+            view.record_publish(entry(4, 3, Some(correction)), None),
+            PublishRecord::Extended
+        );
+        assert_eq!(view.head_root(), truth.root());
+        assert_eq!(view.head_tip().unwrap().to_lez_block_id, 3);
+        assert_eq!(view.superseded(), HashSet::from([[1; 32], [2; 32]]));
+        // A batch starting inside the covered span that is not a correction parks.
+        let inside = batch(2, 4, vec![], &truth);
+        assert_eq!(
+            view.record_publish(entry(5, 4, Some(inside)), None),
+            PublishRecord::Skipped
+        );
+    }
+
+    /// The root the wrong batch of the test above claims.
+    fn wrong_root(one: &ReplayTree) -> [u8; 32] {
+        let mut tree = one.clone();
+        tree.apply(&[Change::insert(1, leaf(2))]).unwrap();
+        tree.root()
+    }
+
+    /// Corners of the view: a parked entry keeps its batch in the persisted view, so a restart
+    /// folds it to the same cause; a short `root_after` is a deserialization failure; an entry
+    /// the SDK reports again is held once; finalizing the third of three held entries
+    /// finalizes all three with that slot; a correction needs a tip.
+    #[test]
+    fn test_view_corners() {
+        let empty = ReplayTree::empty();
+        let b1 = batch(1, 1, vec![Change::insert(0, leaf(1))], &empty);
+        let mut one = empty.clone();
+        one.apply(&b1.changes).unwrap();
+        let mut wrong = batch(2, 2, vec![], &one);
+        wrong.root_after = vec![9; 32];
+        let late = batch(3, 3, vec![], &one);
+        let mut chain = ZoneChain::new(1);
+        chain.apply_extension(
+            vec![
+                entry(1, 0, Some(b1.clone())),
+                entry(2, 1, Some(wrong)),
+                entry(3, 2, Some(late)),
+            ],
+            None,
+        );
+        let outcomes = |chain: &ZoneChain| -> Vec<Option<String>> {
+            chain
+                .view_outcomes()
+                .map(|(_, o)| o.as_ref().err().map(ToString::to_string))
+                .collect()
+        };
+        let before = outcomes(&chain);
+        assert!(before[0].is_none());
+        assert!(before[1].as_deref().unwrap().starts_with("Hash mismatch"));
+        assert!(
+            before[2]
+                .as_deref()
+                .unwrap()
+                .starts_with("Unexpected block id: expected 2")
+        );
+        let mut restored = ZoneChain::new(1);
+        restored.restore_view(&chain.encode_view(), None).unwrap();
+        assert_eq!(outcomes(&restored), before);
+        assert!(restored.view()[1].batch.is_some());
+        assert_eq!(restored.head_tip(), chain.head_tip());
+        // A short root is a deserialization failure, not a hash mismatch.
+        let mut short_root = batch(2, 2, vec![], &one);
+        short_root.root_after = vec![1, 2, 3];
+        let mut fresh = ZoneChain::new(1);
+        fresh.record_publish(entry(1, 0, Some(b1.clone())), None);
+        assert_eq!(
+            fresh.record_publish(entry(2, 1, Some(short_root)), None),
+            PublishRecord::Skipped
+        );
+        assert!(matches!(
+            fresh.view_outcomes().nth(1).unwrap().1,
+            Err(BatchIngestError::Deserialize(_))
+        ));
+        // Held entries reported again are held once.
+        fresh.apply_extension(vec![entry(1, 0, Some(b1.clone()))], None);
+        assert_eq!(fresh.view().len(), 2);
+        // Three held entries, the third finalized: all three are final, at that slot.
+        let mut held = ZoneChain::new(1);
+        let b2 = batch(2, 2, vec![], &one);
+        let b3 = batch(3, 3, vec![], &one);
+        held.apply_extension(
+            vec![
+                entry(1, 0, Some(b1.clone())),
+                entry(2, 1, Some(b2)),
+                entry(3, 2, Some(b3.clone())),
+            ],
+            None,
+        );
+        assert!(matches!(
+            held.apply_finalized(entry(3, 2, Some(b3)), 50, None),
+            Some(AcceptOutcome::Applied(_))
+        ));
+        assert_eq!(held.final_entries().len(), 3);
+        assert!(held.final_entries().iter().all(|f| f.l1_slot == 50));
+        assert!(held.view().is_empty());
+        assert_eq!(held.final_tip().unwrap().to_lez_block_id, 3);
+        // No tip, no correction: the first batch is a first batch.
+        assert!(!is_correction(1, None, &b1));
+    }
+
+    /// A correction in the view behind a final tier the judge has still to decide waits with
+    /// it, and applies once the judge decides (counted with the final decision).
+    #[test]
+    fn test_a_correction_waits_behind_a_waiting_final_tier() {
+        let empty = ReplayTree::empty();
+        let b1 = batch(1, 1, vec![Change::insert(0, leaf(1))], &empty);
+        let mut oracle = Oracle {
+            roots: vec![(1, Tip::from(&b1).root)],
+            read_to: 0,
+        };
+        let mut chain = ZoneChain::new(1);
+        assert!(matches!(
+            chain.apply_finalized(entry(1, 0, Some(b1.clone())), 10, Some(&oracle)),
+            Some(AcceptOutcome::RetryableFailure(_))
+        ));
+        chain.apply_extension(vec![entry(2, 1, Some(b1.clone()))], Some(&oracle));
+        assert!(matches!(
+            chain.view_outcomes().next().unwrap().1,
+            Err(BatchIngestError::LezNotRead { to: 1 })
+        ));
+        oracle.read_to = 1;
+        assert_eq!(chain.retry_folds(Some(&oracle)), 2);
+        assert!(chain.final_entries()[0].error.is_none());
+        assert!(chain.view_outcomes().next().unwrap().1.is_ok());
+        assert_eq!(chain.superseded(), HashSet::from([[1; 32]]));
+    }
+
     /// The first batch starts at the program's deployment block, not at LEZ block 1 (the
     /// testnet program: 49431); one starting anywhere else parks.
     #[test]
@@ -1103,16 +1409,24 @@ mod test {
             PublishRecord::Extended
         );
         assert_eq!(chain.head_tip().unwrap().to_lez_block_id, 49_500);
-        // The same batch again, chained on the first: it does not continue the tip.
+        // The same batch again, chained on the first: a correction restating the same tree; it
+        // applies and supersedes the first.
         assert_eq!(
             chain.record_publish(entry(2, 1, Some(b1.clone())), None),
+            PublishRecord::Extended
+        );
+        assert_eq!(chain.superseded(), HashSet::from([[1; 32]]));
+        // A batch skipping a block parks.
+        let b3 = batch(49_502, 49_502, vec![], &empty);
+        assert_eq!(
+            chain.record_publish(entry(3, 2, Some(b3)), None),
             PublishRecord::Skipped
         );
         assert!(matches!(
-            chain.view_outcomes().nth(1).unwrap().1,
+            chain.view_outcomes().nth(2).unwrap().1,
             Err(BatchIngestError::UnexpectedBlockId {
                 expected: 49_501,
-                got: 49_431
+                got: 49_502
             })
         ));
         // A chain that expects block 1 parks the testnet's first batch.

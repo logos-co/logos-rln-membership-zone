@@ -23,23 +23,21 @@ use crate::{
     batch::Batch,
     http::Shared,
     lez::{self, LezSequencer},
+    reader::short,
     registry::{BedrockStatus, Registry},
-    zone_chain::{AcceptOutcome, ChannelEntry, PublishRecord},
+    zone_chain::{AcceptOutcome, ChannelEntry, PublishRecord, Tip},
 };
 
 /// Seconds between two finality scans (`reconcile_finality`).
 pub const FINALITY_SCAN_SEC: u64 = 300;
-/// L1 slots per `immutable_blocks` page of the finality scan.
+/// Bedrock slots per `immutable_blocks` page (the finality scan, the LEZ inscription scan).
 pub const FINALITY_SCAN_PAGE: u64 = 100;
 
+/// Seconds since the Unix epoch, for the heartbeat.
 pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-}
-
-pub fn short(msg: &[u8; 32]) -> String {
-    hex::encode(&msg[..4])
 }
 
 /// A channel entry from an inscription the SDK reports.
@@ -63,6 +61,15 @@ pub fn set_checkpoint(registry: &Shared, checkpoint: &SequencerCheckpoint) -> Re
 pub struct ZoneChannel {
     pub node_url: Url,
     pub id: ChannelId,
+}
+
+/// One `BlocksProcessed` event of the Zone SDK on the Zone channel, with the channel tip the
+/// SDK's view holds at that point.
+pub struct ZoneBlocks<'a> {
+    pub tip: [u8; 32],
+    pub checkpoint: &'a SequencerCheckpoint,
+    pub channel_update: &'a ChannelUpdate,
+    pub finalized: &'a [FinalizedTx],
 }
 
 /// What the node holds for a channel (`GET /channel/:id`), the fields this check reads.
@@ -145,7 +152,7 @@ pub fn check_channel_on_chain(
     let Some(at) = entries.iter().position(|(msg, _)| hex::encode(msg) == tip) else {
         match entries.last() {
             Some((newest, _)) => bail!(
-                "channel tip on chain is {}.., our newest batch is {}..: the Zone channel state \
+                "channel tip on chain is {}.., our newest batch is {}: the Zone channel state \
                  does not match the channel (data from another run was lost); restore it or pick \
                  another CHANNEL_NAME",
                 &tip[..8],
@@ -172,11 +179,12 @@ pub fn check_channel_on_chain(
         .find(|(_, status)| *status != BedrockStatus::Pending)
     {
         bail!(
-            "channel tip on chain is {}.., but our batch {}.. after it is {status:?} here: the \
-             Zone channel state does not match the channel (data from another run?); restore it \
-             or pick another CHANNEL_NAME",
+            "channel tip on chain is {}.., but our batch {} after it is {} here: the Zone \
+             channel state does not match the channel (data from another run?); restore it or \
+             pick another CHANNEL_NAME",
             &tip[..8],
-            short(landed)
+            short(landed),
+            format!("{status:?}").to_lowercase()
         );
     }
     info!(
@@ -203,26 +211,26 @@ pub fn report_finalized(entry: &ChannelEntry, l1_slot: u64, outcome: Option<&Acc
     });
     match outcome {
         Some(AcceptOutcome::Applied(_)) => info!(
-            "batch {range} msg {} finalized at L1 slot {l1_slot}: applied, root {}..",
+            "batch {range} msg {} finalized on Bedrock (slot {l1_slot}): applied, root {}",
             short(&msg),
             entry
                 .batch
                 .as_ref()
-                .map(|b| hex::encode(&b.root_after[..4]))
+                .map(|b| short(&Tip::from(b).root))
                 .unwrap_or_default()
         ),
         Some(AcceptOutcome::Parked(e)) => warn!(
-            "batch {range} msg {} finalized at L1 slot {l1_slot}: parked, {e}; the final tier \
-             is frozen here",
+            "batch {range} msg {} finalized on Bedrock (slot {l1_slot}): parked, {e}; the final \
+             tier is frozen here",
             short(&msg)
         ),
         Some(AcceptOutcome::RetryableFailure(e)) => info!(
-            "batch {range} msg {} finalized at L1 slot {l1_slot}: {e}",
+            "batch {range} msg {} finalized on Bedrock (slot {l1_slot}): {e}",
             short(&msg)
         ),
         Some(AcceptOutcome::AlreadyApplied) => {}
         None => info!(
-            "entry msg {} finalized at L1 slot {l1_slot}: {range}",
+            "entry msg {} finalized on Bedrock (slot {l1_slot}): {range}",
             short(&msg)
         ),
     }
@@ -279,20 +287,24 @@ pub async fn reconcile_finality(
 }
 
 /// One `BlocksProcessed` event of the Zone SDK: the channel tip holds our batches up to `tip`,
-/// the view moved (`channel_update`: an extension, or a conflict whose dropped batches of ours
-/// are published again) and Bedrock finality reached the `finalized` entries, which go into
-/// the final tier. A conflict the node does not confirm (its channel tip is still our newest
-/// entry) is ignored: the SDK also reports a pending entry it could not see mined as orphaned,
-/// and publishing it again would fork our own channel.
+/// the view moved (`channel_update`: an extension, or a conflict whose orphaned batches of
+/// ours are published again) and Bedrock finality reached the `finalized` entries, which go
+/// into the final tier. A conflict the node does not confirm (its channel tip is still our
+/// newest entry) is ignored: the SDK also reports a pending entry it could not see mined as
+/// orphaned, and publishing it again would fork our own channel.
 pub async fn on_blocks_processed(
     zone_sdk: &mut ZoneSequencer<NodeHttpClient>,
     registry: &Shared,
     channel: &ZoneChannel,
-    tip: [u8; 32],
-    checkpoint: &SequencerCheckpoint,
-    channel_update: &ChannelUpdate,
-    finalized: &[FinalizedTx],
+    processed: ZoneBlocks<'_>,
+    lineage_gap: &mut Option<[u8; 32]>,
 ) -> Result<()> {
+    let ZoneBlocks {
+        tip,
+        checkpoint,
+        channel_update,
+        finalized,
+    } = processed;
     set_checkpoint(registry, checkpoint)?;
     // The channel tip is one of our batches: it and every pending publish before it are in a
     // Bedrock block (an inscription we published is not echoed in `adopted` on a plain chain
@@ -302,10 +314,7 @@ pub async fn on_blocks_processed(
         .expect("registry lock")
         .mark_adopted_up_to(tip)
     {
-        info!(
-            "batch msg {} adopted in a Bedrock block (channel tip)",
-            short(&msg)
-        );
+        info!("batch msg {} adopted on Bedrock (channel tip)", short(&msg));
     }
     match channel_update {
         ChannelUpdate::Extension { adopted } => {
@@ -316,7 +325,7 @@ pub async fn on_blocks_processed(
                 .collect();
             for entry in &entries {
                 info!(
-                    "channel entry msg {} adopted in a Bedrock block",
+                    "channel entry msg {} adopted on Bedrock",
                     short(&entry.msg.into())
                 );
             }
@@ -324,7 +333,7 @@ pub async fn on_blocks_processed(
                 .write()
                 .expect("registry lock")
                 .apply_zone_extension(entries);
-            warn_lineage_gap(registry);
+            warn_lineage_gap(registry, lineage_gap);
         }
         ChannelUpdate::Conflict { .. } => {
             let newest_held: Option<String> = registry
@@ -350,24 +359,24 @@ pub async fn on_blocks_processed(
                     .filter_map(|tx| tx.inscription())
                     .map(entry_of)
                     .collect();
-                let (dropped, publishes) = {
+                let (orphaned, publishes) = {
                     let mut registry = registry.write().expect("registry lock");
-                    let dropped = registry.apply_zone_conflict(canonical);
-                    (dropped, !registry.is_indexer())
+                    let orphaned = registry.apply_zone_conflict(canonical);
+                    (orphaned, !registry.is_indexer())
                 };
-                warn_lineage_gap(registry);
-                // A reorg dropped the sequencer's batches: it publishes the same payloads
+                warn_lineage_gap(registry, lineage_gap);
+                // A reorg orphaned the sequencer's batches: it publishes the same payloads
                 // again, in order (a message id commits to the payload, the parent and the
                 // signer, so the message is the same one when its parent is unchanged, a new
                 // one otherwise). An indexer publishes nothing.
-                for entry in dropped {
+                for entry in orphaned {
                     let Some(batch) = entry.batch else { continue };
                     if publishes {
                         republish(zone_sdk, registry, entry.msg.into(), &batch).await?;
                     } else {
                         info!(
-                            "batch [{}..{}] msg {} left the view in a reorg; the sequencer \
-                             publishes it again",
+                            "batch [{}..{}] msg {} orphaned by a reorg; the sequencer publishes \
+                             it again",
                             batch.from_lez_block_id,
                             batch.to_lez_block_id,
                             short(&entry.msg.into())
@@ -395,20 +404,33 @@ pub async fn on_blocks_processed(
     registry.write().expect("registry lock").save()
 }
 
-/// Said once per channel update that left the view with a gap in its lineage.
-pub fn warn_lineage_gap(registry: &Shared) {
-    if let Some(gap) = registry
+/// Said once per gap in the view's lineage (`last_said` remembers the entry warned about), and
+/// once more when the gap is gone.
+pub fn warn_lineage_gap(registry: &Shared, last_said: &mut Option<[u8; 32]>) {
+    let gap = registry
         .read()
         .expect("registry lock")
         .zone
         .check_for_gaps_in_lineage()
-    {
-        warn!(
-            "channel entry msg {} chains on {}, which the view does not hold: the \
-             lineage has a gap",
-            short(&gap.msg.into()),
-            short(&gap.parent.into())
-        );
+        .map(|gap| (gap.msg.into(), gap.parent.into()));
+    match (gap, *last_said) {
+        (Some((msg, parent)), said) if said != Some(msg) => {
+            warn!(
+                "channel entry msg {} chains on {}, which the view does not hold: the lineage \
+                 has a gap",
+                short(&msg),
+                short(&parent)
+            );
+            *last_said = Some(msg);
+        }
+        (None, Some(msg)) => {
+            info!(
+                "the lineage gap before channel entry msg {} is gone",
+                short(&msg)
+            );
+            *last_said = None;
+        }
+        _ => {}
     }
 }
 
@@ -435,12 +457,12 @@ pub async fn republish(
                 record
             };
             info!(
-                "batch [{}..{}] msg {} orphaned by a reorg, published again as msg {} \
-                 ({record:?})",
+                "batch [{}..{}] msg {} orphaned by a reorg, published again as msg {}{}",
                 batch.from_lez_block_id,
                 batch.to_lez_block_id,
                 short(&orphaned),
-                short(&info.this_msg.into())
+                short(&info.this_msg.into()),
+                describe_record(record)
             );
         }
         Err(e) => {
@@ -459,12 +481,26 @@ pub async fn republish(
     Ok(())
 }
 
-/// What the tick remembers between runs, to say things once: how many batches LEZ contradicted
-/// at the last warning, whether the last preview refresh failed.
+/// What the loop remembers between events, to say things once: how many batches LEZ
+/// contradicted at the last warning, whether the last preview refresh failed, whether the
+/// last publish failed (the batch did not fit, or the SDK refused it), the lineage gap warned
+/// about.
 #[derive(Default)]
 pub struct TickCounters {
     pub contradicted: usize,
     pub preview_failed: bool,
+    pub publish_failed: bool,
+    pub lineage_gap: Option<[u8; 32]>,
+}
+
+/// `PublishRecord` for a log line: nothing for the usual `Extended`, the record otherwise.
+fn describe_record(record: PublishRecord) -> String {
+    match record {
+        PublishRecord::Extended => String::new(),
+        PublishRecord::Skipped => " (skipped: it does not apply on our head)".into(),
+        PublishRecord::AlreadyInView => " (already in the view)".into(),
+        PublishRecord::Stale => " (stale: the pin moved)".into(),
+    }
 }
 
 /// The LEZ blocks the LEZ Sequencer produced beyond the head, not on Bedrock yet, read into the
@@ -515,9 +551,11 @@ pub async fn refresh_preview(source: &LezSequencer, registry: &Shared, failed: &
 /// One tick. Both modes refresh the preview of the LEZ blocks the LEZ Sequencer produced
 /// beyond the head (not on Bedrock yet). The indexer judges what it could not judge before
 /// (the finalized tree moved). The sequencer checks its own statements against the tree, then
-/// publishes one batch, with at most one in flight: a dropped batch whose publish again
-/// failed first, else a new one covering the adopted LEZ blocks not covered yet when changes
-/// wait or the heartbeat is due. `Err` only for the tree store.
+/// publishes one batch, with at most one in flight: an orphaned batch whose publish again
+/// failed first, else a correction when LEZ contradicts the channel, else a new batch covering
+/// the adopted LEZ blocks not covered yet when changes wait or the heartbeat is due. `Err` for
+/// the store, and for a batch that would not apply on our own head (fatal before anything
+/// reaches Bedrock).
 pub async fn on_tick(
     zone_sdk: &mut ZoneSequencer<NodeHttpClient>,
     registry: &Shared,
@@ -546,6 +584,21 @@ pub async fn on_tick(
         }
         if let Some(batch) = registry.next_republish() {
             (true, Some(batch))
+        } else if let Some(batch) = registry.correction_batch() {
+            // LEZ contradicts the channel (a Bedrock reorg replaced a LEZ block a batch of
+            // ours covered): the correction restates the tree from the first wrong batch on.
+            let tip = registry.zone.head_tip().expect("a tip to correct");
+            warn!(
+                "the channel's root {} at LEZ block {} is not the tree's {}: correction batch \
+                 [{}..{}] restates the tree ({} leaves), every root before it is superseded",
+                short(&tip.root),
+                tip.to_lez_block_id,
+                short(&registry.head().root()),
+                batch.from_lez_block_id,
+                batch.to_lez_block_id,
+                batch.changes.len()
+            );
+            (false, Some(batch))
         } else {
             let due = registry.lineage().is_empty()
                 || !registry.pending_changes.is_empty()
@@ -554,7 +607,14 @@ pub async fn on_tick(
         }
     };
     let Some(batch) = batch else { return Ok(()) };
-    let published = publish_batch(zone_sdk, registry, &batch, last_publish_unix).await?;
+    let published = publish_batch(
+        zone_sdk,
+        registry,
+        &batch,
+        last_publish_unix,
+        &mut counters.publish_failed,
+    )
+    .await?;
     if queued && published {
         let mut registry = registry.write().expect("registry lock");
         registry.republished();
@@ -573,8 +633,8 @@ pub fn warn_contradicted(registry: &Registry, contradicted_count: &mut usize) {
     *contradicted_count = contradicted.len();
     for e in contradicted {
         warn!(
-            "batch msg {} claims root {}.. at LEZ block {}, LEZ now gives {}..: an \
-             indexer parks on it and every later batch",
+            "batch msg {} claims root {} at LEZ block {}, LEZ now gives {}: an indexer parks \
+             on it and every later batch",
             short(&e.msg),
             short(&e.claimed),
             e.to_lez_block_id,
@@ -585,13 +645,15 @@ pub fn warn_contradicted(registry: &Registry, contradicted_count: &mut usize) {
 
 /// Publish the next batch: recorded as in flight and saved with the checkpoint on success, so
 /// a restart knows it; `last_publish_unix` restarts the heartbeat. A batch too large for one
-/// inscription or a refusal by the SDK is logged and tried again next poll (`Ok(false)`). A
-/// batch that would not apply on our own head is a bug: fatal before anything reaches Bedrock.
+/// inscription or a refusal by the SDK is tried again next poll (`Ok(false)`), said once
+/// (`failed`) until a publish goes through. A batch that would not apply on our own head is
+/// a bug: fatal before anything reaches Bedrock.
 pub async fn publish_batch(
     zone_sdk: &mut ZoneSequencer<NodeHttpClient>,
     registry: &Shared,
     batch: &Batch,
     last_publish_unix: &mut u64,
+    failed: &mut bool,
 ) -> Result<bool> {
     if let Err(e) = registry.read().expect("registry lock").would_apply(batch) {
         bail!(
@@ -604,10 +666,14 @@ pub async fn publish_batch(
     let inscription = match Inscription::try_from(batch.encode_to_vec()) {
         Ok(inscription) => inscription,
         Err(e) => {
-            warn!(
-                "batch [{}..{}] does not fit one inscription: {e:?}",
-                batch.from_lez_block_id, batch.to_lez_block_id
-            );
+            if !*failed {
+                warn!(
+                    "batch [{}..{}] does not fit one inscription: {e:?}; said once, tried \
+                     again every poll",
+                    batch.from_lez_block_id, batch.to_lez_block_id
+                );
+            }
+            *failed = true;
             return Ok(false);
         }
     };
@@ -622,24 +688,21 @@ pub async fn publish_batch(
                 record
             };
             *last_publish_unix = now_unix();
+            *failed = false;
             let described: Vec<_> = batch.changes.iter().map(|c| c.describe()).collect();
             info!(
-                "batch [{}..{}] published as msg {} on {}: root {}.., {}{}",
+                "batch [{}..{}] published as msg {} on {}: root {}, {}{}",
                 batch.from_lez_block_id,
                 batch.to_lez_block_id,
                 short(&info.this_msg.into()),
                 short(&info.parent_msg.into()),
-                hex::encode(&batch.root_after[..4]),
+                short(&Tip::from(batch).root),
                 if described.is_empty() {
                     "no changes".into()
                 } else {
                     described.join("; ")
                 },
-                if record == PublishRecord::Extended {
-                    "".into()
-                } else {
-                    format!(" ({record:?})")
-                }
+                describe_record(record)
             );
             // Checked above; a disagreement here means the head moved under the publish.
             if record == PublishRecord::Skipped {
@@ -660,11 +723,17 @@ pub async fn publish_batch(
             Ok(true)
         }
         Err(SeqError::Unavailable { reason }) => {
-            info!("not ready to publish ({reason}), retry next poll");
+            if !*failed {
+                info!("not ready to publish ({reason}); said once, tried again every poll");
+            }
+            *failed = true;
             Ok(false)
         }
         Err(e) => {
-            warn!("publish failed: {e}");
+            if !*failed {
+                warn!("publish failed: {e}; said once, tried again every poll");
+            }
+            *failed = true;
             Ok(false)
         }
     }
@@ -736,5 +805,43 @@ mod test {
         assert!(
             check_channel_on_chain(&on_chain([1; 32]), &[8; 32], &store(&[[1; 32]]), true).is_err()
         );
+        // A channel on chain while the data dir holds no batch; uppercase hex is accepted.
+        let empty: Shared = Arc::new(RwLock::new(Registry::open_temporary(1, false).unwrap()));
+        let refused = check_channel_on_chain(&on_chain([1; 32]), &[7; 32], &empty, true)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("holds no batch"));
+        let upper = ChannelOnChain {
+            accredited_keys: vec![hex::encode_upper([7; 32])],
+            tip_message: hex::encode_upper([2; 32]),
+        };
+        check_channel_on_chain(&upper, &[7; 32], &store(&[[2; 32]]), true).unwrap();
+    }
+
+    /// The lineage gap is said once per gap (the entry remembered), and once more when it is
+    /// gone.
+    #[test]
+    fn test_the_lineage_gap_is_said_once() {
+        let registry = store(&[[1; 32]]);
+        let mut said = None;
+        warn_lineage_gap(&registry, &mut said);
+        assert_eq!(said, None);
+        // An entry chained on something the view does not hold.
+        let batch = registry.read().unwrap().zone.view()[1].batch.clone();
+        registry
+            .write()
+            .unwrap()
+            .apply_zone_extension(vec![ChannelEntry {
+                msg: MsgId::from([5; 32]),
+                parent: MsgId::from([4; 32]),
+                batch,
+            }]);
+        warn_lineage_gap(&registry, &mut said);
+        assert_eq!(said, Some([5; 32]));
+        warn_lineage_gap(&registry, &mut said);
+        assert_eq!(said, Some([5; 32]));
+        registry.write().unwrap().apply_zone_conflict(vec![]);
+        warn_lineage_gap(&registry, &mut said);
+        assert_eq!(said, None);
     }
 }

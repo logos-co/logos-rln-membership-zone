@@ -254,3 +254,57 @@ async fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// The Zone's `/roots` answer as read here: extra keys are ignored, a root counts once a
+    /// batch carries it, finalized when asked.
+    #[test]
+    fn test_root_entries_count_by_bedrock_status() {
+        let window: Roots = serde_json::from_str(
+            r#"{"head": {"lez_block_id": 9, "root": "aa", "lez_timestamp_ms": 1},
+                "roots": [
+                  {"root": "r1", "from_lez_block_id": 3, "to_lez_block_id": 4,
+                   "batches": [{"bedrock_status": "pending", "msg_id": "m1"}]},
+                  {"root": "r2", "to_lez_block_id": 2,
+                   "batches": [{"bedrock_status": "finalized", "l1_slot": 7}]},
+                  {"root": "r3", "to_lez_block_id": 1, "batches": []}
+                ]}"#,
+        )
+        .unwrap();
+        assert_eq!(window.head.lez_block_id, 9);
+        assert_eq!(
+            window
+                .roots
+                .iter()
+                .map(|e| e.counts(false))
+                .collect::<Vec<_>>(),
+            vec![true, true, false]
+        );
+        assert_eq!(
+            window
+                .roots
+                .iter()
+                .map(|e| e.counts(true))
+                .collect::<Vec<_>>(),
+            vec![false, true, false]
+        );
+        assert_eq!(window.roots[0].describe(), "in a batch, pending on Bedrock");
+        assert_eq!(window.roots[1].describe(), "finalized on Bedrock");
+        assert_eq!(window.roots[2].describe(), "in no batch");
+    }
+
+    /// Field elements in hex: `0x` allowed, wrong length and a value past the modulus refused,
+    /// and the round trip exact.
+    #[test]
+    fn test_fr_hex_round_trips_and_refuses_bad_input() {
+        let one = fr_from_hex(&format!("0x01{}", "00".repeat(31)), "x").unwrap();
+        assert_eq!(one, Fr::from(1u64));
+        assert_eq!(fr_to_hex(&one), format!("01{}", "00".repeat(31)));
+        assert!(fr_from_hex(&"00".repeat(31), "x").is_err());
+        assert!(fr_from_hex(&"ff".repeat(32), "x").is_err());
+        assert!(fr_from_hex("zz", "x").is_err());
+    }
+}

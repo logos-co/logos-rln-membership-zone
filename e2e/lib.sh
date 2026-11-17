@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# e2e/lib.sh: shared by the e2e scripts. Source it after reading a networks env file.
+# e2e/lib.sh: shared by the e2e scripts (bash only). Source it after reading a network env file.
 #
 # Needs: curl, jq, python3. State and secrets live under E2E_STATE (default
 # e2e/state/<NETWORK>, gitignored): the payer wallet, state.json.
@@ -9,13 +9,18 @@ set -euo pipefail
 say() { printf '%s\n' "$*" >&2; }
 die() { say "error: $*"; exit 1; }
 
-E2E_STATE="${E2E_STATE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/state/${NETWORK:?NETWORK unset}}"
+# This directory and the repository root.
+E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+REPO_DIR="$(cd "$E2E_DIR/.." && pwd)"
+
+E2E_STATE="${E2E_STATE:-$E2E_DIR/state/${NETWORK:?NETWORK unset}}"
 STATE_JSON="$E2E_STATE/state.json"
 PAYER_WALLET="$E2E_STATE/payer-wallet"
 mkdir -p "$E2E_STATE"
 chmod 700 "$E2E_STATE"
 [ -f "$STATE_JSON" ] || echo '{}' > "$STATE_JSON"
 
+# state.json key/value: state_get <k>, state_set <k> <v>, state_del <k>.
 state_get() { jq -r --arg k "$1" '.[$k] // empty' "$STATE_JSON"; }
 state_set() {
     jq --arg k "$1" --arg v "$2" '.[$k] = $v' "$STATE_JSON" > "$STATE_JSON.tmp" \
@@ -49,6 +54,7 @@ membership_pick() {
 }
 
 # ---- chain reads ---------------------------------------------------------------------------
+# The LEZ JSON-RPC, the Bedrock node's HTTP API, the zone's HTTP API.
 
 lez_rpc() {
     curl -sS -m 30 -X POST -H 'content-type: application/json' \
@@ -60,8 +66,8 @@ bedrock_info() { bedrock "http://$BEDROCK_HTTP/cryptarchia/info" | jq '.cryptarc
 bedrock_wallet() { bedrock "http://$BEDROCK_HTTP/wallet/$1/balance"; }
 zone() { curl -sS -m 30 "http://$ZONE_HTTP$1"; }
 
-# L1 slots since the LEZ channel's newest inscription (its tip on the node): under ~200 LEZ
-# inscribes as usual; thousands means LEZ produces blocks the zone cannot see on Bedrock yet.
+# Bedrock slots since the LEZ channel's newest inscription (its tip on the node): under ~200
+# LEZ inscribes as usual; thousands means LEZ produces blocks the zone cannot see on Bedrock yet.
 lez_l1_lag() {
     local now tip
     now=$(bedrock_info | jq -r '.slot')
@@ -76,11 +82,12 @@ membership_status() {
     local answer="$1" lag
     lag=$(lez_l1_lag)
     printf '%s' "$answer" | jq -r --argjson lag "$lag" '
-        if .active == true then "on Bedrock: active, registered in LEZ block \(.registered_at_lez_block_id) (tx \(.registered_tx_hash[0:8])..)"
+        if .active == true and .proof != null then "on Bedrock: active, registered in LEZ block \(.registered_at_lez_block_id) (tx \(.registered_tx_hash[0:8])..), in a batch (root \(.proof.root[0:8])..)"
+        elif .active == true then "on Bedrock: active, registered in LEZ block \(.registered_at_lez_block_id) (tx \(.registered_tx_hash[0:8])..), no batch carries it yet"
         elif .removed != null then "on Bedrock: removed (\(.removed)) in LEZ block \(.removed_at_lez_block_id)"
-        elif .lez_preview != null then "in LEZ block \(.lez_preview.lez_block_id) (\(.lez_preview.event), tx \(.lez_preview.tx_hash[0:8])..), NOT on Bedrock yet; LEZ last inscribed \($lag) L1 slots ago"
-        else "not seen by the zone; LEZ last inscribed \($lag) L1 slots ago" end' 2>/dev/null \
-        || echo "not seen by the zone; LEZ last inscribed $lag L1 slots ago"
+        elif .lez_preview != null then "in LEZ block \(.lez_preview.lez_block_id) (\(.lez_preview.event), tx \(.lez_preview.tx_hash[0:8])..), NOT on Bedrock yet; LEZ last inscribed \($lag) Bedrock slots ago"
+        else "not seen by the zone; LEZ last inscribed \($lag) Bedrock slots ago" end' 2>/dev/null \
+        || echo "not seen by the zone; LEZ last inscribed $lag Bedrock slots ago"
 }
 
 # ---- a root on Bedrock ---------------------------------------------------------------------
@@ -137,12 +144,11 @@ lez_rln_bin() {
 
 # A zone binary (`generate_proof`, `verify_proof`), debug build first, release second.
 zone_bin() {
-    local name="$1" repo candidate
-    repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-    for candidate in "$repo/target/debug/$name" "$repo/target/release/$name"; do
+    local name="$1" candidate
+    for candidate in "$REPO_DIR/target/debug/$name" "$REPO_DIR/target/release/$name"; do
         [ -x "$candidate" ] && { echo "$candidate"; return 0; }
     done
-    die "no $name under $repo/target: cargo build --bins"
+    die "no $name under $REPO_DIR/target: cargo build --bins"
 }
 
 # The environment the lez-rln binaries read: wallet, payer, registry.

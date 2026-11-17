@@ -10,6 +10,7 @@
 # roots (every root a batch carries). A proof over another message must then fail: same
 # roots, wrong signal.
 
+set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${1:?usage: proof.sh <network.env> [leaf_index]}"
 # shellcheck source=/dev/null
@@ -29,13 +30,15 @@ say "fetching the Zone's path for leaf $leaf_index"
 ZONE_MERKLE_PROOF=$(zone "/merkle_proof/$id_commitment") || die "the zone does not know $id_commitment"
 export ZONE_MERKLE_PROOF
 [ "$(printf '%s' "$ZONE_MERKLE_PROOF" | jq -r '.active')" = "true" ] || die "leaf $leaf_index is not active"
-root=$(printf '%s' "$ZONE_MERKLE_PROOF" | jq -r '.head.root')
+[ "$(printf '%s' "$ZONE_MERKLE_PROOF" | jq -r '.proof != null')" = "true" ] \
+    || die "no batch carries leaf $leaf_index yet (no proof path): $(membership_status "$ZONE_MERKLE_PROOF")"
+root=$(printf '%s' "$ZONE_MERKLE_PROOF" | jq -r '.proof.root')
 
-# The path is over the root at the LEZ head; the verifier below trusts a root only once a
-# batch carries it, so a root the sequencer has just computed is waited for here.
-say "the path is over root $root; waiting until a batch carries it (verify_proof trusts those roots)"
+# The path is made at the newest valid root, the root of the newest batch that applied, so
+# the verifier below (which trusts a root once a batch carries it) holds it already.
+say "the path is over root $root, carried by a batch to LEZ block $(printf '%s' "$ZONE_MERKLE_PROOF" | jq -r '.proof.to_lez_block_id')"
 root_wait_published '.root == $r' --arg r "$root" > /dev/null \
-    || die "no batch carried root $root within 30 minutes; the proof would be refused"
+    || die "the zone's /roots does not list root $root; the proof would be refused"
 
 say "proving membership of leaf $leaf_index"
 RLN_IDENTITY_SECRET="$identity_secret" RLN_ID_COMMITMENT="$id_commitment" \

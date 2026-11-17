@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::reader::{fr_from_bytes_le, fr_to_bytes_le};
+use crate::reader::{fr_from_bytes_le, fr_to_bytes_le, parse_32, short};
 
 /// `MAX_BLOCK_RANGE_LEN` of the LEZ Sequencer: the most blocks one `getBlockRange` returns.
 pub const MAX_BLOCK_RANGE_LEN: u64 = 1024;
@@ -44,9 +44,9 @@ impl ProgramEvent {
     /// For logs: `Registered(tx ab12cd34..)`.
     pub fn describe(&self) -> String {
         format!(
-            "{}(tx {}..)",
+            "{}(tx {})",
             selector_name(&self.event),
-            hex::encode(&self.tx_hash[..4])
+            short(&self.tx_hash)
         )
     }
 }
@@ -140,7 +140,7 @@ impl Block {
                     .ok_or_else(|| anyhow!("stored event with an unknown selector"))?
                     .context("stored event")?;
                 Ok(ProgramEvent {
-                    tx_hash: crate::reader::parse_32(&stored.tx_hash)?,
+                    tx_hash: parse_32(&stored.tx_hash, "stored event tx_hash")?,
                     event,
                 })
             })
@@ -148,10 +148,11 @@ impl Block {
         Ok(Self {
             header: BlockHeader {
                 block_id: stored.block_id,
-                prev_block_hash: common::HashType(crate::reader::parse_32(
+                prev_block_hash: common::HashType(parse_32(
                     &stored.prev_block_hash,
+                    "stored block prev_block_hash",
                 )?),
-                hash: common::HashType(crate::reader::parse_32(&stored.hash)?),
+                hash: common::HashType(parse_32(&stored.hash, "stored block hash")?),
                 timestamp: stored.timestamp,
             },
             events,
@@ -249,8 +250,9 @@ impl LezSequencer {
             let end = to.min(start + range - 1);
             let encoded: Vec<String> = match self.rpc("getBlockRange", json!([start, end])).await {
                 Ok(encoded) => encoded,
-                Err(e) if range > 1 && e.to_string().contains("\"code\":-32008") => {
-                    range /= 2;
+                Err(e) if end > start && e.to_string().contains("\"code\":-32008") => {
+                    // Halve what was asked, not the cap: a short tail is not asked again whole.
+                    range = (end - start).div_ceil(2);
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -366,8 +368,7 @@ impl LezSequencer {
                 identity_secret,
                 ..
             } => {
-                let secret = fr_from_bytes_le(&identity_secret)
-                    .map_err(|e| anyhow!("identity_secret: {e}"))?;
+                let secret = fr_from_bytes_le(&identity_secret).context("identity_secret")?;
                 let derived = fr_to_bytes_le(&Hasher::<PoseidonHash>::hash_single(secret));
                 if derived != id_commitment {
                     bail!(
@@ -395,6 +396,51 @@ impl LezSequencer {
                 id_commitment,
             }),
         }))
+    }
+}
+
+/// LEZ blocks for the tests of other modules: a chain of empty blocks in LEZ's own borsh.
+#[cfg(test)]
+pub(crate) mod test_blocks {
+    use common::{
+        HashType,
+        block::{BedrockStatus, Block as LezBlock, BlockBody, BlockHeader, HashableBlockData},
+    };
+
+    /// Block `block_id` of a chain of empty blocks from block 1 (prev hash zero), each hash
+    /// computed as LEZ does; `tampered` gives block `block_id` another timestamp, so the block
+    /// after it no longer chains on it.
+    pub(crate) fn chained_block(block_id: u64, tampered: bool) -> Vec<u8> {
+        let mut prev = HashType([0; 32]);
+        for id in 1..block_id {
+            prev = HashableBlockData {
+                block_id: id,
+                prev_block_hash: prev,
+                timestamp: 1_000 * id,
+                transactions: vec![],
+            }
+            .compute_hash();
+        }
+        let timestamp = 1_000 * block_id + u64::from(tampered);
+        let data = HashableBlockData {
+            block_id,
+            prev_block_hash: prev,
+            timestamp,
+            transactions: vec![],
+        };
+        let block = LezBlock {
+            header: BlockHeader {
+                block_id,
+                prev_block_hash: prev,
+                hash: data.compute_hash(),
+                timestamp,
+            },
+            body: BlockBody {
+                transactions: vec![],
+            },
+            bedrock_status: BedrockStatus::Pending,
+        };
+        borsh::to_vec(&block).unwrap()
     }
 }
 
@@ -709,6 +755,72 @@ mod test {
             1_792_597_876_639 + 2_592_000_000 + 604_800_000
         );
         assert_eq!(*leaf_index, 0);
+    }
+
+    /// `lez_view.json` keeps the adopted blocks in the program's own wire form: every event
+    /// kind round-trips with its transaction hash, and a stored event the program's layouts do
+    /// not know is refused.
+    #[test]
+    fn test_a_stored_block_round_trips_every_event() {
+        let id = [5u8; 32];
+        let events = vec![
+            ProgramEvent {
+                tx_hash: [1; 32],
+                event: RlnEvent::Registered(Registered {
+                    tree_id: TREE,
+                    id_commitment: id,
+                    rate_limit: 100,
+                    expiry_timestamp_ms: 9_000,
+                    leaf_index: 3,
+                }),
+            },
+            ProgramEvent {
+                tx_hash: [2; 32],
+                event: RlnEvent::Extended(Extended {
+                    tree_id: TREE,
+                    id_commitment: id,
+                    expiry_timestamp_ms: 10_000,
+                }),
+            },
+            ProgramEvent {
+                tx_hash: [3; 32],
+                event: RlnEvent::Slashed(Slashed {
+                    tree_id: TREE,
+                    id_commitment: id,
+                }),
+            },
+            ProgramEvent {
+                tx_hash: [4; 32],
+                event: RlnEvent::Erased(Erased {
+                    tree_id: TREE,
+                    id_commitment: id,
+                }),
+            },
+        ];
+        let block = Block {
+            header: BlockHeader {
+                block_id: 42,
+                prev_block_hash: HashType([8; 32]),
+                hash: HashType([9; 32]),
+                timestamp: 123_456,
+            },
+            events: events.clone(),
+            private_transaction_count: 3,
+        };
+        let stored = block.to_stored();
+        let back = Block::from_stored(&stored).unwrap();
+        assert_eq!(back.block_id(), 42);
+        assert_eq!(back.prev_block_hash(), [8; 32]);
+        assert_eq!(back.hash(), [9; 32]);
+        assert_eq!(back.timestamp_ms(), 123_456);
+        assert_eq!(back.events, events);
+        assert_eq!(back.private_transaction_count, 3);
+        let mut unknown = stored.clone();
+        unknown.events[0].selector = "00".repeat(8);
+        assert!(Block::from_stored(&unknown).is_err());
+        let mut garbage = stored;
+        garbage.events[0].selector = "zz".into();
+        assert!(Block::from_stored(&garbage).is_err());
     }
 
     const BLOCK_50056: &str = "iMMAAAAAAABZhMkDiBFQefGZ7yzYj0cPBeEsaLOs++4lMW1TJiFl+qByf/Q+2TfS0jWzHtIGqjiBU+rjIipAwqGe5a/WQW8iIBgqX6EBAAADAAAAAPBIA5RFB2d7t5snthzQrW7qgZKPKBVwNH4t9iSUlRBqBQAAAKDd99hEF9cqCOvklZ2NQgjRxFPjzUQx7fRvD4BhkbCu8EgDlEUHZ3u3mye2HNCtbuqBko8oFXA0fi32JJSVEGrqYNmkMWEGw7bOAPerVg97ZjuPL1ygw6TubO4Lpg25nwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAalJnme5xzjOU5XpgOaQuUf1FXvZU2aumquwEo+HVks0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAC9MRVovQ2xvY2tQcm9ncmFtQWNjb3VudC8wMDAwMDUwGVig/GIyp8fm3q4azY1sQqMsvgATFdUcGC/uReCwMpxgqS3Ugdrc0Z4maEa/C/exlYedBgaBAe6KBfUhcJKmOPBIA5RFB2d7t5snthzQrW7qgZKPKBVwNH4t9iSUlRBqAQAAAAAAAAAAAAAAAAAAAAAAAABxAAAAAUey3k8ICA504tS+/+jl6H5wndWYYZybMitk8nVpebTPqHj4tVT6ve3OcgoYXEkrENG4MAIo04TaTIAuLSAn+yZkAAAAAAAAAJ/fKF+hAQAAECcAAAAAAAAAAAAAAAAAAACNJwCAOgkAAAAAAAAAAAAB6mDZpDFhBsO2zgD3q1YPe2Y7jy9coMOk7mzuC6YNuZ+AhB4AAAAAAAAAAAAAAAAAAMgCCAAAAAAAAAAAAAAAAAEAAAB/KBMTcIgm6gU+LFxOhbl3QeN2Sv6l+TcLoyuNqgSjN0hncnoHxrioqFe7umL+bG3LZE4tOBv7C6yavnZatJN5/DsPyPnWwuZyNyGyUKqM5Y9Qi45aDJUmXNmXM4+0r5EAFb2gtaXWMpX0kzR2aj0aes3op7YaztKtfjNMVXNEPfIEAAAAWGJBEKsBRrEh46GSS5a1QFI1VuJL1cfAflKr+l/rr4sVvaC1pdYylfSTNHZqPRp6zeinthrO0q1+M0xVc0Q98n8aXp3JgWudVUWv3G1IexPUosaP4ro7HRU2ALOVpbjEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAByJOq24C+LN9hBsWO+uLAUcKQuc4dezM/Nchgr4bE7XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAasoMxKiRfFSYI+7p9qPiW4yVFVRIFBRvlZdpP2a6uY4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBAAAAAAPNAAAAAAAAkwIAAAAAAACwfAYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHIhAAAAAAAAAAAAAAAAAAAAAAAAAAAZWKD8YjKnx+berhrNjWxCoyy+ABMV1RwYL+5F4LAynAMAAAAvTEVaL0Nsb2NrUHJvZ3JhbUFjY291bnQvMDAwMDAwMRlYoPxiMqfH5t6uGs2NbEKjLL4AExXVHBgv7kXgsDKcL0xFWi9DbG9ja1Byb2dyYW1BY2NvdW50LzAwMDAwMTAZWKD8YjKnx+berhrNjWxCoyy+ABMV1RwYL+5F4LAynC9MRVovQ2xvY2tQcm9ncmFtQWNjb3VudC8wMDAwMDUwGVig/GIyp8fm3q4azY1sQqMsvgATFdUcGC/uReCwMpwAAAAAEAAAACAYKl+hAQAAiMMAAAAAAAAAAAAAAAI=";

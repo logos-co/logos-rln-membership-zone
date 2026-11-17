@@ -12,6 +12,7 @@
 # dropped transaction nothing), so a timeout after a charge is not a failure: the zone shows
 # the slash once the LEZ block is adopted on Bedrock, minutes later.
 
+set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${1:?usage: slash.sh <network.env> [leaf_index]}"
 # shellcheck source=/dev/null

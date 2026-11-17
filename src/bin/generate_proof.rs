@@ -61,24 +61,20 @@ struct Args {
 /// The Zone's `/merkle_proof/{id}` answer, the fields the proof needs.
 #[derive(Deserialize)]
 struct Membership {
-    leaf_index: u64,
+    /// `null` for a membership only the LEZ Sequencer's preview knows.
+    leaf_index: Option<u64>,
     active: bool,
-    head: Head,
     proof: Option<ProofPath>,
 }
 
-/// Where the Zone's tree is: the LEZ block and the root there.
-#[derive(Deserialize)]
-struct Head {
-    lez_block_id: u64,
-    root: String,
-}
-
+/// The path at the newest valid root: the root of the newest applied batch and its LEZ block.
 #[derive(Deserialize)]
 struct ProofPath {
     rate_commitment: String,
     path_elements: Vec<String>,
     identity_path_index: Vec<u8>,
+    root: String,
+    to_lez_block_id: u64,
 }
 
 /// What `generate_proof` writes and `verify_proof` reads: the proof, its public values and the
@@ -149,15 +145,17 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("{url}: unexpected answer"))?
         }
     };
-    if !membership.active {
+    let Some(leaf_index) = membership.leaf_index else {
         bail!(
-            "leaf {} is not active, nothing to prove",
-            membership.leaf_index
+            "the membership is not on Bedrock yet (the LEZ Sequencer's preview knows it), nothing to prove"
         );
+    };
+    if !membership.active {
+        bail!("leaf {leaf_index} is not active, nothing to prove");
     }
-    let path = membership
-        .proof
-        .ok_or_else(|| anyhow!("the membership is active but carries no proof path"))?;
+    let path = membership.proof.ok_or_else(|| {
+        anyhow!("leaf {leaf_index} is active but no batch carries it yet: no valid root to prove against, try again in a minute")
+    })?;
 
     let user_message_limit = Fr::from(args.user_message_limit);
     let rate_commitment = Hasher::<PoseidonHash>::hash_pair(id_commitment, user_message_limit);
@@ -194,11 +192,11 @@ async fn main() -> Result<()> {
         .zkey(default_zkey_single().clone())
         .build();
     let (proof, values) = rln.generate_proof(&witness).context("generate the proof")?;
-    if fr_to_hex(&values.root()) != membership.head.root {
+    if fr_to_hex(&values.root()) != path.root {
         bail!(
             "the proof's root {} is not the Zone's root {}: the path does not match the tree",
             fr_to_hex(&values.root()),
-            membership.head.root
+            path.root
         );
     }
 
@@ -217,9 +215,9 @@ async fn main() -> Result<()> {
         message_id: args.message_id,
         user_message_limit: args.user_message_limit,
         id_commitment: args.id_commitment,
-        leaf_index: membership.leaf_index,
-        zone_root: membership.head.root,
-        zone_lez_block_id: membership.head.lez_block_id,
+        leaf_index,
+        zone_root: path.root,
+        zone_lez_block_id: path.to_lez_block_id,
         proof: hex::encode(proof_bytes),
         proof_values: hex::encode(values_bytes),
     };
@@ -238,4 +236,39 @@ async fn main() -> Result<()> {
     );
     println!("PROOF_FILE={}", args.out.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// The Zone's `/merkle_proof` answers as read here: a member a batch carries, with its
+    /// path at the newest valid root; an active member no batch carries yet (no path); and a
+    /// membership only the LEZ Sequencer's preview knows (no leaf index).
+    #[test]
+    fn test_membership_parses_every_answer() {
+        let carried: Membership = serde_json::from_str(
+            r#"{"id_commitment": "aa", "leaf_index": 3, "rate_limit": 100, "active": true,
+                "removed": null, "expiry_timestamp_ms": 5, "head": {"lez_block_id": 9},
+                "proof": {"rate_commitment": "bb", "path_elements": ["cc", "dd"],
+                          "identity_path_index": [0, 1], "root": "ee", "to_lez_block_id": 8},
+                "lez_preview": null}"#,
+        )
+        .unwrap();
+        assert_eq!(carried.leaf_index, Some(3));
+        assert!(carried.active);
+        let path = carried.proof.unwrap();
+        assert_eq!((path.root.as_str(), path.to_lez_block_id), ("ee", 8));
+        assert_eq!(path.identity_path_index, vec![0, 1]);
+        let waiting: Membership =
+            serde_json::from_str(r#"{"leaf_index": 4, "active": true, "proof": null}"#).unwrap();
+        assert!(waiting.active && waiting.proof.is_none());
+        let previewed: Membership = serde_json::from_str(
+            r#"{"leaf_index": null, "active": false, "proof": null,
+                "lez_preview": {"lez_block_id": 12, "event": "x", "tx_hash": "ff"}}"#,
+        )
+        .unwrap();
+        assert_eq!(previewed.leaf_index, None);
+        assert!(!previewed.active);
+    }
 }

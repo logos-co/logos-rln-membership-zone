@@ -51,10 +51,12 @@ use crate::{
     http::{AppState, Shared},
     lez::LezSequencer,
     lez_sync::{apply_lez_finalized, lez_checkpoint_at_lib, on_lez_blocks_processed},
+    reader::{parse_32, short},
     registry::Registry,
     zone_sync::{
-        FINALITY_SCAN_SEC, TickCounters, ZoneChannel, channel_on_chain, check_channel_on_chain,
-        checkpoint_at_lib, now_unix, on_blocks_processed, on_tick, reconcile_finality, short,
+        FINALITY_SCAN_SEC, TickCounters, ZoneBlocks, ZoneChannel, channel_on_chain,
+        check_channel_on_chain, checkpoint_at_lib, now_unix, on_blocks_processed, on_tick,
+        reconcile_finality,
     },
 };
 
@@ -98,7 +100,7 @@ struct Args {
     /// transaction in a congested mempool. The Zone SDK default is 12.
     #[arg(long, default_value_t = 12, env = "PRIORITY_FEE_PERCENT")]
     priority_fee_percent: u64,
-    /// Key and tree store live here.
+    /// Key, tree store and state files live here.
     #[arg(long, default_value = "data", env = "DATA_DIR")]
     data_dir: PathBuf,
     /// HTTP API bind address.
@@ -167,10 +169,15 @@ fn parse_funding_pk(hex_str: &str) -> Result<ZkPublicKey> {
     ))
 }
 
-fn parse_32(hex_str: &str, what: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(hex_str.trim().trim_start_matches("0x"))
-        .with_context(|| format!("{what} is not hex"))?;
-    <[u8; 32]>::try_from(bytes).map_err(|_| anyhow!("{what} must be 32 bytes"))
+/// The funding of a reader of a channel it is not accredited on: it never publishes, so it
+/// never pays; the funding key is a name to the SDK.
+fn unfunded() -> Result<FundingConfig> {
+    Ok(FundingConfig {
+        funding_pk: parse_funding_pk(&"00".repeat(32))?,
+        change_pk: None,
+        max_tx_fee: GasCost::new(0),
+        priority_fee_percent: 0,
+    })
 }
 
 /// A key that signs nothing: the Zone SDK wants one per instance, a reader of a channel it is
@@ -273,7 +280,7 @@ async fn main() -> Result<()> {
     };
     let funding_pk = match (&args.funding_pk, indexer) {
         (Some(pk), _) => parse_funding_pk(pk)?,
-        (None, true) => parse_funding_pk(&"00".repeat(32))?,
+        (None, true) => unfunded()?.funding_pk,
         (None, false) => bail!("FUNDING_PK is required to run the sequencer"),
     };
     let funding = FundingConfig {
@@ -365,12 +372,7 @@ async fn main() -> Result<()> {
         lez_channel_id,
         reader_key(),
         node.clone(),
-        SequencerConfig::new(FundingConfig {
-            funding_pk: parse_funding_pk(&"00".repeat(32))?,
-            change_pk: None,
-            max_tx_fee: GasCost::new(0),
-            priority_fee_percent: 0,
-        }),
+        SequencerConfig::new(unfunded()?),
         Some(lez_checkpoint),
     );
 
@@ -419,7 +421,7 @@ async fn main() -> Result<()> {
         );
         if let Some(stall) = registry.zone.stall() {
             warn!(
-                "the final tier is frozen at batch msg {} (L1 slot {}): {}; {} \
+                "the final tier is frozen at batch msg {} (Bedrock slot {}): {}; {} \
                  batch(es) parked after it",
                 short(&stall.msg),
                 stall.l1_slot,
@@ -453,8 +455,8 @@ async fn main() -> Result<()> {
     // The store is closed whatever ends the loop: Ctrl-C, or an error out of an arm.
     let outcome: Result<()> = async {
         loop {
-            // rustfmt does not reach into `select!`: every arm is one call, the work is in the
-            // `on_*` functions above.
+            // rustfmt does not reach into `select!`: every arm is one call, the work is in
+            // `zone_sync::on_*` and `lez_sync::on_*`.
             tokio::select! {
                 event = zone_sdk.next_event() => match event {
                     Event::Ready => {
@@ -469,10 +471,8 @@ async fn main() -> Result<()> {
                             &mut zone_sdk,
                             &registry,
                             &zone_channel,
-                            tip,
-                            &checkpoint,
-                            &channel_update,
-                            &finalized,
+                            ZoneBlocks { tip, checkpoint: &checkpoint, channel_update: &channel_update, finalized: &finalized },
+                            &mut counters.lineage_gap,
                         )
                         .await?;
                     }

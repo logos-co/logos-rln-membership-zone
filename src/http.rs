@@ -1,12 +1,15 @@
 //! The HTTP API a Module's node reads (its registry access): the valid roots with the batches
-//! that carry them, the Merkle proof path of a leaf at the tree of the LEZ head, a membership's
-//! state. 32-byte values are hex, little-endian (RLN-API Appendix B). Every answer carries
-//! `head`: `lez_block_id` and `lez_timestamp_ms`, the LEZ block the tree is at, and the tree's
-//! `root` there. Where a batch stands on Bedrock is its `bedrock_status`, the Zone SDK's word:
-//! `pending` (published, no Bedrock block yet), `adopted` (in a block on the current branch),
-//! `finalized` (with the `l1_slot`). Only the batches that applied are served; the first that
-//! did not is the `stall` in `/` (LEZ `StallReason`). Every key is always present: a value
-//! that does not apply is `null`, never absent.
+//! that carry them, the Merkle proof path of a leaf at the newest valid root (the tree of the
+//! newest applied batch, so a validator holds the root the proof is made against), a
+//! membership's state as the LEZ head knows it. 32-byte values are hex, little-endian
+//! (RLN-API Appendix B). Every answer carries `head`: `lez_block_id` and `lez_timestamp_ms`,
+//! the LEZ block the tree is at, and the tree's `root` there (ahead of the batches while
+//! changes wait). Where a batch stands on Bedrock is its `bedrock_status`, the Zone SDK's
+//! word: `pending` (published, no Bedrock block yet), `adopted` (in a block on the current
+//! branch), `finalized` (with the `l1_slot`). Only the batches that applied and no correction
+//! superseded are served as roots; the first that did not apply is the `stall` in `/` (LEZ
+//! `StallReason`). Every key is always present: a value that does not apply is `null`, never
+//! absent.
 
 use std::sync::{Arc, RwLock};
 
@@ -22,10 +25,12 @@ use serde_json::{Value, json};
 use crate::{
     batch::{Batch, Change, Kind},
     lez::{self, ProgramEvent, RlnEvent},
-    registry::{BedrockStatus, Registry},
+    reader::Member,
+    registry::{BedrockStatus, Registry, event_id_commitment},
     zone_chain::{BatchIngestError, Tip},
 };
 
+/// The registry behind the API and the sync loops, one writer at a time.
 pub type Shared = Arc<RwLock<Registry>>;
 
 /// One tree change a batch carried, as the API shows it.
@@ -37,6 +42,7 @@ pub struct ChangeRecord {
     pub rate_commitment: Option<String>,
 }
 
+/// The two tree operations, as the API names them.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeKind {
@@ -77,6 +83,8 @@ pub struct EntryView {
     pub bedrock_status: BedrockStatus,
     /// The L1 slot of the block that finalized it; `null` before.
     pub l1_slot: Option<u64>,
+    /// A later correction re-covered its span: its root is not valid any more.
+    pub superseded: bool,
     /// Why its batch did not apply, when it did not (retryable: not judged yet).
     #[serde(skip)]
     pub error: Option<BatchIngestError>,
@@ -89,6 +97,7 @@ impl EntryView {
         batch: Option<&Batch>,
         bedrock_status: BedrockStatus,
         l1_slot: Option<u64>,
+        superseded: bool,
         error: Option<&BatchIngestError>,
     ) -> Self {
         Self {
@@ -105,19 +114,22 @@ impl EntryView {
             }),
             bedrock_status,
             l1_slot,
+            superseded,
             // An entry without a batch has nothing to apply and nothing to park on.
             error: error.filter(|_| batch.is_some()).cloned(),
         }
     }
 
-    /// Whether the entry carries a batch the fold applied (LEZ `AcceptOutcome::Applied`).
+    /// Whether the entry carries a batch the fold applied (LEZ `AcceptOutcome::Applied`) that
+    /// no correction superseded: its root is valid.
     pub fn applied(&self) -> bool {
-        self.root.is_some() && self.error.is_none()
+        self.root.is_some() && self.error.is_none() && !self.superseded
     }
 }
 
 /// Every entry of the channel, final tier first then the view, as the API shows them.
 pub fn entries(registry: &Registry) -> Vec<EntryView> {
+    let superseded = registry.zone.superseded();
     let mut out: Vec<EntryView> = registry
         .zone
         .final_entries()
@@ -129,6 +141,7 @@ pub fn entries(registry: &Registry) -> Vec<EntryView> {
                 f.batch().as_ref(),
                 BedrockStatus::Finalized,
                 Some(f.l1_slot),
+                superseded.contains(&f.msg),
                 f.error.as_ref(),
             )
         })
@@ -146,6 +159,7 @@ pub fn entries(registry: &Registry) -> Vec<EntryView> {
             entry.batch.as_ref(),
             status,
             None,
+            superseded.contains(&msg),
             outcome.as_ref().err(),
         ));
     }
@@ -287,6 +301,7 @@ async fn summary(State(state): State<AppState>) -> Json<Value> {
                 .map(|n| n.saturating_sub(registry.head().lez_block_id)),
         },
         "orphaned_count": registry.orphaned_count(),
+        "superseded_count": registry.zone.superseded().len(),
         "newest_published": root_ref(newest(&registry, false)),
         "newest_finalized": root_ref(newest(&registry, true)),
         "endpoints": [
@@ -328,10 +343,12 @@ fn lez_preview(found: Option<(u64, &ProgramEvent)>) -> Value {
 }
 
 /// A membership by its leaf index (decimal) or its identity commitment (64 hex): whether it
-/// is `active` (its leaf is in the tree) or why it was `removed`, and while active the Merkle
-/// proof path at the head's root, with the newest roots a batch carried to Bedrock for a
-/// validator to compare. `lez_preview` says what the LEZ Sequencer holds about it ahead of
-/// Bedrock; a membership only the preview knows answers with `active` false and no `proof`.
+/// is `active` (its leaf is in the LEZ head's tree) or why it was `removed`, and the Merkle
+/// proof path at the newest valid root (`proof.root`, the root of the newest applied batch,
+/// with its `to_lez_block_id`) while that tree holds the leaf: a proof made from it verifies
+/// against `/roots` at once. An active membership no batch carries yet has no `proof`.
+/// `lez_preview` says what the LEZ Sequencer holds about it ahead of Bedrock; a membership
+/// only the preview knows answers with `active` false and no `proof`.
 async fn merkle_proof(
     State(state): State<AppState>,
     Path(leaf): Path<String>,
@@ -364,22 +381,28 @@ async fn merkle_proof(
         let Some((_, event)) = preview else {
             return Err(error(StatusCode::NOT_FOUND, "no such membership"));
         };
-        let leaf_index = match &event.event {
-            RlnEvent::Registered(r) => Some(r.leaf_index),
-            _ => None,
+        let (leaf_index, rate_limit, expiry) = match &event.event {
+            RlnEvent::Registered(r) => (
+                Some(r.leaf_index),
+                Some(r.rate_limit),
+                Some(r.expiry_timestamp_ms),
+            ),
+            RlnEvent::Extended(e) => (None, None, Some(e.expiry_timestamp_ms)),
+            _ => (None, None, None),
         };
         return Ok(with_head(
             &registry,
             json!({
-                "id_commitment": hex::encode(crate::registry::event_id_commitment(&event.event)),
+                "id_commitment": hex::encode(event_id_commitment(&event.event)),
                 "leaf_index": leaf_index,
+                "rate_limit": rate_limit,
                 "active": false,
                 "registered_at_lez_block_id": null,
                 "registered_tx_hash": null,
                 "removed": null,
                 "removed_at_lez_block_id": null,
                 "removed_tx_hash": null,
-                "expiry_timestamp_ms": null,
+                "expiry_timestamp_ms": expiry,
                 "newest_published": root_ref(newest(&registry, false)),
                 "newest_finalized": root_ref(newest(&registry, true)),
                 "proof": null,
@@ -387,18 +410,29 @@ async fn merkle_proof(
             }),
         ));
     };
-    let proof = registry.head().proof_path(member.leaf_index).map(|path| {
-        json!({
-            "rate_commitment": hex::encode(path.rate_commitment),
-            "path_elements": path.path_elements.iter().map(hex::encode).collect::<Vec<_>>(),
-            "identity_path_index": path.identity_path_index,
-        })
-    });
+    // The path at the newest valid root: the tree of the newest applied batch, while it holds
+    // this leaf and the LEZ head says the membership is active (a removal no batch carries yet
+    // takes the proof away at once).
+    let proof = registry
+        .zone
+        .head_state()
+        .proof_path(member.leaf_index)
+        .filter(|path| member.active && path.rate_commitment == member.rate_commitment)
+        .map(|path| {
+            json!({
+                "rate_commitment": hex::encode(path.rate_commitment),
+                "path_elements": path.path_elements.iter().map(hex::encode).collect::<Vec<_>>(),
+                "identity_path_index": path.identity_path_index,
+                "root": hex::encode(registry.zone.head_state().root()),
+                "to_lez_block_id": registry.covered_to(),
+            })
+        });
     Ok(with_head(
         &registry,
         json!({
             "id_commitment": hex::encode(id_commitment),
             "leaf_index": member.leaf_index,
+            "rate_limit": member.rate_limit,
             "active": member.active,
             "registered_at_lez_block_id": member.registered_at_lez_block_id,
             "registered_tx_hash": hex::encode(member.registered_tx_hash),
@@ -415,41 +449,36 @@ async fn merkle_proof(
 }
 
 /// Every membership at the LEZ head: the active leaves with their expiry, the removed ones
-/// with why (`expired`, `slashed`, `erased`).
+/// with why (`expired`, `slashed`, `erased`), the same keys per membership.
 async fn leaves(State(state): State<AppState>) -> Json<Value> {
     let registry = state.registry.read().expect("registry lock");
+    let leaf = |id: [u8; 32], m: &Member| {
+        json!({
+            "leaf_index": m.leaf_index,
+            "id_commitment": hex::encode(id),
+            "rate_limit": m.rate_limit,
+            "registered_at_lez_block_id": m.registered_at_lez_block_id,
+            "registered_tx_hash": hex::encode(m.registered_tx_hash),
+            "expiry_timestamp_ms": m.expiry_timestamp_ms,
+            "expires_in_ms": m
+                .active
+                .then(|| m.expiry_timestamp_ms.saturating_sub(registry.head().lez_timestamp_ms)),
+            "removed": m.removed,
+            "removed_at_lez_block_id": m.removed_at_lez_block_id,
+            "removed_tx_hash": m.removed_tx_hash.map(hex::encode),
+        })
+    };
     let active: Vec<Value> = registry
         .head()
         .active_leaves()
         .into_iter()
-        .map(|(id, m)| {
-            json!({
-                "leaf_index": m.leaf_index,
-                "id_commitment": hex::encode(id),
-                "registered_at_lez_block_id": m.registered_at_lez_block_id,
-                "registered_tx_hash": hex::encode(m.registered_tx_hash),
-                "expiry_timestamp_ms": m.expiry_timestamp_ms,
-                "expires_in_ms": m
-                    .expiry_timestamp_ms
-                    .saturating_sub(registry.head().lez_timestamp_ms),
-            })
-        })
+        .map(|(id, m)| leaf(id, &m))
         .collect();
     let removed: Vec<Value> = registry
         .head()
         .removed_leaves()
         .into_iter()
-        .map(|(id, m)| {
-            json!({
-                "leaf_index": m.leaf_index,
-                "id_commitment": hex::encode(id),
-                "registered_at_lez_block_id": m.registered_at_lez_block_id,
-                "registered_tx_hash": hex::encode(m.registered_tx_hash),
-                "removed": m.removed,
-                "removed_at_lez_block_id": m.removed_at_lez_block_id,
-                "removed_tx_hash": m.removed_tx_hash.map(hex::encode),
-            })
-        })
+        .map(|(id, m)| leaf(id, &m))
         .collect();
     with_head(
         &registry,
@@ -530,6 +559,312 @@ mod test {
             lez_source: "test".into(),
             mode: "sequencer".into(),
         }
+    }
+
+    /// A LEZ reorg contradicts the in-flight heartbeat over block 3 (the canonical block 3
+    /// registers a leaf); the correction supersedes it: the API drops its root from `/roots`
+    /// and marks the entry.
+    #[test]
+    fn test_a_superseded_batch_leaves_the_roots() {
+        let state = state();
+        let mut registry = state.registry.write().unwrap();
+        registry.apply_lez_conflict().unwrap();
+        registry
+            .apply_lez_adopted(&block(1, vec![registered(1, 0)]))
+            .unwrap();
+        registry.apply_lez_adopted(&block(2, vec![])).unwrap();
+        registry
+            .apply_lez_adopted(&block(3, vec![registered(9, 1)]))
+            .unwrap();
+        let contradicted = registry.contradicted();
+        assert_eq!(contradicted.len(), 1);
+        assert_eq!(contradicted[0].msg, [3; 32]);
+        let correction = registry.correction_batch().unwrap();
+        assert_eq!(
+            (correction.from_lez_block_id, correction.to_lez_block_id),
+            (1, 3)
+        );
+        assert_eq!(correction.changes.len(), 2);
+        registry.record_publish(MsgId::from([4; 32]), MsgId::from([3; 32]), &correction);
+        // Every batch before the correction is superseded, finalized or not.
+        let all = entries(&registry);
+        assert_eq!(all.len(), 4);
+        assert_eq!(
+            all.iter().map(|e| e.superseded).collect::<Vec<_>>(),
+            vec![true, true, true, false]
+        );
+        assert!(!all[0].applied());
+        let roots = roots_of(&registry, 5);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].produced_by().msg_id, hex::encode([4; 32]));
+        assert_eq!(
+            roots[0].produced_by().root,
+            Some(hex::encode(registry.head().root()))
+        );
+        assert_eq!(
+            newest(&registry, false).unwrap().msg_id,
+            hex::encode([4; 32])
+        );
+        assert!(registry.contradicted().is_empty());
+    }
+
+    /// The proof path is at the newest valid root: a member a batch carries has one (with that
+    /// batch's root and block), a member the LEZ head knows but no batch carries yet has none
+    /// until the next batch, and a removed member has none but names what removed it.
+    #[tokio::test]
+    async fn test_the_proof_path_is_at_the_newest_valid_root() {
+        let state = state();
+        let Json(carried) = merkle_proof(State(state.clone()), Path("0".into()))
+            .await
+            .unwrap();
+        let first_root = {
+            let registry = state.registry.read().unwrap();
+            hex::encode(registry.head().root_at(1).unwrap())
+        };
+        assert_eq!(carried["proof"]["root"], json!(first_root));
+        assert_eq!(carried["proof"]["to_lez_block_id"], 3);
+        assert_eq!(carried["rate_limit"], 100);
+        // Leaf 1 registered in block 4, adopted on Bedrock, no batch yet.
+        state
+            .registry
+            .write()
+            .unwrap()
+            .apply_lez_adopted(&block(4, vec![registered(2, 1)]))
+            .unwrap();
+        let Json(waiting) = merkle_proof(State(state.clone()), Path("1".into()))
+            .await
+            .unwrap();
+        assert_eq!(waiting["active"], true);
+        assert!(waiting["proof"].is_null());
+        assert_eq!(waiting["head"]["lez_block_id"], 4);
+        {
+            let mut registry = state.registry.write().unwrap();
+            registry.mark_adopted_up_to([3; 32]);
+            let batch = registry.next_batch().unwrap();
+            registry.record_publish(MsgId::from([4; 32]), MsgId::from([3; 32]), &batch);
+        }
+        let Json(batched) = merkle_proof(State(state.clone()), Path("1".into()))
+            .await
+            .unwrap();
+        let head_root = {
+            let registry = state.registry.read().unwrap();
+            hex::encode(registry.head().root())
+        };
+        assert_eq!(batched["proof"]["root"], json!(head_root));
+        assert_eq!(batched["proof"]["to_lez_block_id"], 4);
+        assert_eq!(
+            batched["proof"]["path_elements"].as_array().unwrap().len(),
+            20
+        );
+        // Slashed in block 5: removed, no proof, the transaction named; /leaves agrees.
+        state
+            .registry
+            .write()
+            .unwrap()
+            .apply_lez_adopted(&block(
+                5,
+                vec![ProgramEvent {
+                    tx_hash: [7; 32],
+                    event: RlnEvent::Slashed(crate::lez::Slashed {
+                        tree_id: [0; 32],
+                        id_commitment: {
+                            let mut id = [0u8; 32];
+                            id[0] = 2;
+                            id
+                        },
+                    }),
+                }],
+            ))
+            .unwrap();
+        let Json(removed) = merkle_proof(State(state.clone()), Path("1".into()))
+            .await
+            .unwrap();
+        assert_eq!(removed["active"], false);
+        assert_eq!(removed["removed"], json!("slashed"));
+        assert_eq!(removed["removed_tx_hash"], json!("07".repeat(32)));
+        assert_eq!(removed["removed_at_lez_block_id"], 5);
+        assert!(removed["proof"].is_null());
+        let Json(all) = leaves(State(state.clone())).await;
+        assert_eq!(all["active"].as_array().unwrap().len(), 1);
+        assert_eq!(all["removed"][0]["removed_tx_hash"], json!("07".repeat(32)));
+        assert!(all["removed"][0]["expires_in_ms"].is_null());
+        assert_eq!(all["active"][0]["rate_limit"], 100);
+    }
+
+    /// The roots window: newest first, truncated, a root the tree comes back to is a new run
+    /// (not merged with the run that first made it), and the producing batch's changes show
+    /// the removal a validator reads its policy off.
+    #[test]
+    fn test_roots_window_truncates_and_a_returning_root_is_a_new_run() {
+        let mut registry = Registry::open_temporary(1, false).unwrap();
+        let publish = |registry: &mut Registry, n: u8| {
+            let batch = registry.next_batch().unwrap();
+            let parent = if n == 1 {
+                MsgId::root()
+            } else {
+                MsgId::from([n - 1; 32])
+            };
+            registry.record_publish(MsgId::from([n; 32]), parent, &batch);
+        };
+        registry
+            .apply_lez_adopted(&block(1, vec![registered(1, 0)]))
+            .unwrap();
+        publish(&mut registry, 1);
+        let root_a = hex::encode(registry.head().root());
+        registry
+            .apply_lez_adopted(&block(
+                2,
+                vec![ProgramEvent {
+                    tx_hash: [7; 32],
+                    event: RlnEvent::Slashed(crate::lez::Slashed {
+                        tree_id: [0; 32],
+                        id_commitment: {
+                            let mut id = [0u8; 32];
+                            id[0] = 1;
+                            id
+                        },
+                    }),
+                }],
+            ))
+            .unwrap();
+        publish(&mut registry, 2);
+        // The same commitment registers again at leaf 0 (its membership ended): root A again.
+        registry
+            .apply_lez_adopted(&block(3, vec![registered(1, 0)]))
+            .unwrap();
+        publish(&mut registry, 3);
+        assert_eq!(hex::encode(registry.head().root()), root_a);
+        let all = roots_of(&registry, 5);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].produced_by().msg_id, hex::encode([3; 32]));
+        assert_eq!(all[0].entries.len(), 1);
+        assert_eq!(all[1].produced_by().changes[0].kind, ChangeKind::Remove);
+        assert_eq!(all[2].produced_by().msg_id, hex::encode([1; 32]));
+        let two = roots_of(&registry, 2);
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].produced_by().root, Some(root_a));
+    }
+
+    /// `/` serves the indexer's stall with its cause and counts, and the batches a correction
+    /// superseded; a membership only the preview knows through an event that is not a
+    /// registration answers without a leaf index.
+    #[tokio::test]
+    async fn test_summary_serves_the_stall_and_the_preview_a_slash() {
+        let mut registry = Registry::open_temporary(1, true).unwrap();
+        registry
+            .apply_lez_finalized(&block(1, vec![registered(1, 0)]))
+            .unwrap();
+        let honest = registry.next_batch().unwrap();
+        registry.apply_zone_finalized(
+            ChannelEntry {
+                msg: MsgId::from([1; 32]),
+                parent: MsgId::root(),
+                batch: Some(honest.clone()),
+            },
+            10,
+        );
+        let mut wrong = honest.clone();
+        wrong.from_lez_block_id = 2;
+        wrong.to_lez_block_id = 2;
+        wrong.changes = vec![Change::insert(1, vec![9; 32])];
+        let mut wrong_tree = crate::zone_chain::ReplayTree::empty();
+        wrong_tree.apply(&honest.changes).unwrap();
+        wrong_tree.apply(&wrong.changes).unwrap();
+        wrong.root_after = wrong_tree.root().to_vec();
+        registry.apply_lez_finalized(&block(2, vec![])).unwrap();
+        registry.apply_zone_finalized(
+            ChannelEntry {
+                msg: MsgId::from([2; 32]),
+                parent: MsgId::from([1; 32]),
+                batch: Some(wrong.clone()),
+            },
+            20,
+        );
+        let mut heartbeat = wrong.clone();
+        heartbeat.from_lez_block_id = 3;
+        heartbeat.to_lez_block_id = 3;
+        heartbeat.changes = vec![];
+        registry.apply_zone_finalized(
+            ChannelEntry {
+                msg: MsgId::from([3; 32]),
+                parent: MsgId::from([2; 32]),
+                batch: Some(heartbeat),
+            },
+            30,
+        );
+        // Only the preview knows commitment 9, through a slash.
+        registry.extend_preview(
+            vec![block(
+                4,
+                vec![ProgramEvent {
+                    tx_hash: [5; 32],
+                    event: RlnEvent::Slashed(crate::lez::Slashed {
+                        tree_id: [0; 32],
+                        id_commitment: [9; 32],
+                    }),
+                }],
+            )],
+            4,
+        );
+        let state = AppState {
+            registry: Arc::new(RwLock::new(registry)),
+            channel_id: "aa".repeat(32),
+            lez_source: "test".into(),
+            mode: "indexer".into(),
+        };
+        let Json(overview) = summary(State(state.clone())).await;
+        assert_eq!(overview["mode"], json!("indexer"));
+        assert_eq!(
+            overview["stall"]["error"]["kind"],
+            json!("derivation_mismatch")
+        );
+        assert_eq!(overview["stall"]["orphans_since"], 1);
+        assert_eq!(overview["stall"]["l1_slot"], 20);
+        assert_eq!(overview["batch_count"], 1);
+        assert_eq!(overview["superseded_count"], 0);
+        let Json(roots) = roots(State(state.clone()), Path(5)).await;
+        assert_eq!(roots["roots"].as_array().unwrap().len(), 1);
+        let Json(previewed) = merkle_proof(State(state.clone()), Path(hex::encode([9; 32])))
+            .await
+            .unwrap();
+        assert_eq!(previewed["active"], false);
+        assert!(previewed["leaf_index"].is_null());
+        assert!(previewed["rate_limit"].is_null());
+        assert_eq!(
+            previewed["lez_preview"]["event"],
+            json!(crate::lez::Slashed::SELECTOR_NAME)
+        );
+        // The correction ends the stall and supersedes the first batch.
+        let correction = {
+            let registry = state.registry.read().unwrap();
+            Batch {
+                from_lez_block_id: 1,
+                to_lez_block_id: 2,
+                changes: registry
+                    .head()
+                    .active_leaves()
+                    .iter()
+                    .map(|(_, m)| Change::insert(m.leaf_index, m.rate_commitment.to_vec()))
+                    .collect(),
+                root_after: registry.head().root().to_vec(),
+            }
+        };
+        state.registry.write().unwrap().apply_zone_finalized(
+            ChannelEntry {
+                msg: MsgId::from([4; 32]),
+                parent: MsgId::from([3; 32]),
+                batch: Some(correction),
+            },
+            40,
+        );
+        let Json(after) = summary(State(state.clone())).await;
+        assert!(after["stall"].is_null());
+        assert_eq!(after["superseded_count"], 1);
+        assert_eq!(after["batch_count"], 1);
+        assert_eq!(
+            after["newest_finalized"]["root"],
+            json!(hex::encode(state.registry.read().unwrap().head().root()))
+        );
     }
 
     #[test]
