@@ -53,7 +53,7 @@ use crate::{
     lez_sync::{apply_lez_finalized, lez_checkpoint_at_lib, on_lez_blocks_processed},
     registry::Registry,
     zone_sync::{
-        FINALITY_SCAN_SEC, ZoneChannel, channel_on_chain, check_channel_on_chain,
+        FINALITY_SCAN_SEC, TickCounters, ZoneChannel, channel_on_chain, check_channel_on_chain,
         checkpoint_at_lib, now_unix, on_blocks_processed, on_tick, reconcile_finality, short,
     },
 };
@@ -442,8 +442,7 @@ async fn main() -> Result<()> {
     };
     let mut ready = false;
     let mut lez_ready = false;
-    // Batches LEZ has contradicted, as last reported (warned once per change).
-    let mut contradicted_count = 0;
+    let mut counters = TickCounters::default();
     let channel_view = sdk.subscribe_channel_view();
     let mut last_publish_unix = now_unix();
     let mut tick = tokio::time::interval(Duration::from_secs(args.poll_sec.max(1)));
@@ -501,8 +500,9 @@ async fn main() -> Result<()> {
                     on_tick(
                         &mut sdk,
                         &registry,
+                        &source,
                         args.heartbeat_sec,
-                        &mut contradicted_count,
+                        &mut counters,
                         &mut last_publish_unix,
                     )
                     .await?;

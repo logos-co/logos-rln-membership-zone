@@ -38,14 +38,18 @@ fi
 after=$(lez_balance "$LEZ_RLN_PAYER")
 say "payer balance $before -> $after: the slash cost $((before - after)) atomic (fee)"
 
-say "waiting for the zone to remove leaf $leaf_index (the LEZ block must be adopted on Bedrock first)"
-for _ in $(seq 1 120); do
-    membership=$(zone "/merkle_proof/$id_commitment") || die "the zone lost $id_commitment"
-    [ "$(printf '%s' "$membership" | jq -r '.active')" = "false" ] && break
+say "waiting for the zone to remove leaf $leaf_index: the LEZ block must be adopted on Bedrock first"
+for i in $(seq 1 120); do
+    answer=$(zone "/merkle_proof/$id_commitment") || die "the zone lost $id_commitment"
+    if [ "$(printf '%s' "$answer" | jq -r '.active')" = "false" ]; then
+        membership="$answer"
+        break
+    fi
     membership=""
+    [ $((i % 6)) -eq 0 ] && say "  $((i / 6)) min: $(membership_status "$answer")"
     sleep 10
 done
-[ -n "$membership" ] || die "the zone did not apply the slash within 20 minutes: it did not land (or LEZ is down)"
+[ -n "$membership" ] || die "the zone did not apply the slash within 20 minutes: $(membership_status "$answer")"
 [ "$(printf '%s' "$membership" | jq -r '.removed')" = "slashed" ] \
     || die "removed is $(printf '%s' "$membership" | jq -r '.removed'), not slashed"
 [ "$(printf '%s' "$membership" | jq -r '.proof')" = "null" ] || die "a removed membership still has a proof"

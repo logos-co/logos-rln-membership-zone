@@ -22,6 +22,7 @@ use tracing::{info, warn};
 use crate::{
     batch::Batch,
     http::Shared,
+    lez::{self, LezSequencer},
     registry::{BedrockStatus, Registry},
     zone_chain::{AcceptOutcome, ChannelEntry, PublishRecord},
 };
@@ -444,17 +445,73 @@ pub async fn republish(
     Ok(())
 }
 
-/// One tick. The indexer judges what it could not judge before (the finalized tree moved).
-/// The sequencer checks its own statements against the tree, then publishes one batch
-/// covering the adopted LEZ blocks not covered yet when changes wait or the heartbeat is due,
-/// with at most one batch in flight. `Err` only for the tree store.
+/// What the tick remembers between runs, to say things once: how many batches LEZ contradicted
+/// at the last warning, whether the last preview refresh failed.
+#[derive(Default)]
+pub struct TickCounters {
+    pub contradicted: usize,
+    pub preview_failed: bool,
+}
+
+/// The LEZ blocks the LEZ Sequencer produced beyond the head, not on Bedrock yet, read into the
+/// preview (`getLastBlockId`, then the blocks the preview lacks). Logged when they carry events
+/// of the program: what LEZ holds, before Bedrock confirms it. A failure is said once, and the
+/// recovery too.
+pub async fn refresh_preview(source: &LezSequencer, registry: &Shared, failed: &mut bool) {
+    let outcome: Result<()> = async {
+        let last = source.last_block_id().await?;
+        let from = registry.read().expect("registry lock").preview_next();
+        let blocks = if last >= from {
+            source.blocks(from, last).await?
+        } else {
+            vec![]
+        };
+        for block in &blocks {
+            if !block.events.is_empty() {
+                info!(
+                    "LEZ block {} produced by the LEZ Sequencer, not on Bedrock yet: {}",
+                    block.block_id(),
+                    lez::describe_events(&block.events)
+                );
+            }
+        }
+        registry
+            .write()
+            .expect("registry lock")
+            .extend_preview(blocks, last);
+        Ok(())
+    }
+    .await;
+    match outcome {
+        Ok(()) => {
+            if *failed {
+                info!("the LEZ Sequencer answers again");
+            }
+            *failed = false;
+        }
+        Err(e) => {
+            if !*failed {
+                warn!("LEZ Sequencer preview not read: {e}; said once until it answers again");
+            }
+            *failed = true;
+        }
+    }
+}
+
+/// One tick. Both modes refresh the preview of the LEZ blocks the LEZ Sequencer produced
+/// beyond the head (not on Bedrock yet). The indexer judges what it could not judge before
+/// (the finalized tree moved). The sequencer checks its own statements against the tree, then
+/// publishes one batch covering the adopted LEZ blocks not covered yet when changes wait or
+/// the heartbeat is due, with at most one batch in flight. `Err` only for the tree store.
 pub async fn on_tick(
     sdk: &mut ZoneSequencer<NodeHttpClient>,
     registry: &Shared,
+    source: &LezSequencer,
     heartbeat_sec: u64,
-    contradicted_count: &mut usize,
+    counters: &mut TickCounters,
     last_publish_unix: &mut u64,
 ) -> Result<()> {
+    refresh_preview(source, registry, &mut counters.preview_failed).await;
     if registry.read().expect("registry lock").is_indexer() {
         let decided = registry.write().expect("registry lock").retry_folds();
         if decided > 0 {
@@ -463,7 +520,10 @@ pub async fn on_tick(
         }
         return Ok(());
     }
-    warn_contradicted(&registry.read().expect("registry lock"), contradicted_count);
+    warn_contradicted(
+        &registry.read().expect("registry lock"),
+        &mut counters.contradicted,
+    );
     let batch = {
         let registry = registry.read().expect("registry lock");
         if registry.in_flight().is_some() {

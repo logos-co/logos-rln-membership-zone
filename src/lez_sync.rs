@@ -129,6 +129,21 @@ pub async fn apply_lez_finalized(
     registry: &Shared,
     block: &Block,
 ) -> Result<()> {
+    if !block.events.is_empty()
+        && registry
+            .read()
+            .expect("registry lock")
+            .lez
+            .final_reader()
+            .lez_block_id
+            < block.block_id()
+    {
+        info!(
+            "LEZ block {} finalized on Bedrock: {}",
+            block.block_id(),
+            lez::describe_events(&block.events)
+        );
+    }
     let gap = registry
         .write()
         .expect("registry lock")
@@ -233,11 +248,10 @@ pub async fn on_lez_blocks_processed(
                 .filter_map(decode)
             {
                 if !block.events.is_empty() {
-                    let names: Vec<_> = block.events.iter().map(lez::selector_name).collect();
                     info!(
-                        "LEZ block {} adopted: events {}",
+                        "LEZ block {} adopted on Bedrock: {}",
                         block.block_id(),
-                        names.join(", ")
+                        lez::describe_events(&block.events)
                     );
                 }
                 if let Err(e) = adopt_lez_block(source, registry, &block).await {

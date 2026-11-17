@@ -23,7 +23,7 @@ use tracing::{info, warn};
 
 use crate::{
     batch::{Batch, Change},
-    lez::{Block, StoredBlock},
+    lez::{Block, ProgramEvent, RlnEvent, StoredBlock},
     lez_chain::{Adopted, Finalized, LezChain},
     reader::{BlockIngestError, EMPTY_ROOT, READER_FILE, Reader, TREE_DIR, write_atomic},
     zone_chain::{
@@ -204,6 +204,12 @@ pub struct Registry {
     /// (the judge decided one) so the file is written whole again.
     final_written: usize,
     final_rewrite: bool,
+    /// LEZ blocks the LEZ Sequencer produced beyond the head, not on Bedrock yet, ascending:
+    /// a preview for the API and the log, never batched, never persisted. Trimmed as the
+    /// head moves.
+    preview: Vec<Block>,
+    /// The newest block the LEZ Sequencer said it holds (`getLastBlockId`), when asked.
+    sequencer_block_id: Option<u64>,
 }
 
 impl Registry {
@@ -318,6 +324,8 @@ impl Registry {
             written_lez_view: files.lez_view_bytes,
             final_written,
             final_rewrite: false,
+            preview: vec![],
+            sequencer_block_id: None,
         };
         for (block_id, changes) in restored_view {
             registry.add_pending(block_id, changes);
@@ -681,6 +689,56 @@ impl Registry {
         self.own_pending.contains(msg)
     }
 
+    /// The newest block the LEZ Sequencer holds, as last asked; `None` before the first answer.
+    pub fn sequencer_block_id(&self) -> Option<u64> {
+        self.sequencer_block_id
+    }
+
+    /// The first LEZ block the preview lacks: after the newest held, else after the head.
+    pub fn preview_next(&self) -> u64 {
+        self.preview
+            .last()
+            .map_or(self.head().lez_block_id, Block::block_id)
+            + 1
+    }
+
+    /// Blocks the LEZ Sequencer produced beyond the head (ascending, continuing the preview),
+    /// and the newest block it holds. Blocks the head has reached are dropped.
+    pub fn extend_preview(&mut self, blocks: Vec<Block>, sequencer_block_id: u64) {
+        self.preview.extend(blocks);
+        self.sequencer_block_id = Some(sequencer_block_id);
+        self.trim_preview();
+    }
+
+    /// Drop the preview blocks the head has reached (adopted on Bedrock, or passed).
+    pub fn trim_preview(&mut self) {
+        let head = self.head().lez_block_id;
+        self.preview.retain(|block| block.block_id() > head);
+    }
+
+    /// The newest preview event about `id_commitment`: `(lez_block_id, event)`.
+    pub fn preview_for_id(&self, id_commitment: &[u8; 32]) -> Option<(u64, &ProgramEvent)> {
+        self.preview_find(|event| event_id_commitment(event) == id_commitment)
+    }
+
+    /// The newest preview `Registered` at `leaf_index`: `(lez_block_id, event)`.
+    pub fn preview_for_leaf(&self, leaf_index: u64) -> Option<(u64, &ProgramEvent)> {
+        self.preview_find(
+            |event| matches!(event, RlnEvent::Registered(r) if r.leaf_index == leaf_index),
+        )
+    }
+
+    fn preview_find(&self, keep: impl Fn(&RlnEvent) -> bool) -> Option<(u64, &ProgramEvent)> {
+        self.preview.iter().rev().find_map(|block| {
+            block
+                .events
+                .iter()
+                .rev()
+                .find(|event| keep(&event.event))
+                .map(|event| (block.block_id(), event))
+        })
+    }
+
     /// Every entry of the channel in lineage order, final tier first then the view, with where
     /// it stands on Bedrock.
     pub fn lineage(&self) -> Vec<([u8; 32], BedrockStatus)> {
@@ -702,6 +760,16 @@ impl Registry {
     }
 }
 
+/// The identity commitment an event is about.
+pub fn event_id_commitment(event: &RlnEvent) -> &[u8; 32] {
+    match event {
+        RlnEvent::Registered(e) => &e.id_commitment,
+        RlnEvent::Extended(e) => &e.id_commitment,
+        RlnEvent::Slashed(e) => &e.id_commitment,
+        RlnEvent::Erased(e) => &e.id_commitment,
+    }
+}
+
 /// `write_atomic`, and a warning when one state file grows past a megabyte: the state is
 /// meant to stay small (bytes per member, per batch, per adopted block).
 fn write_sized(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -718,21 +786,21 @@ fn write_sized(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::lez::{Registered, RlnEvent};
+    use crate::lez::{ProgramEvent, Registered, RlnEvent};
 
-    fn registered(n: u8, leaf_index: u64) -> RlnEvent {
+    fn registered(n: u8, leaf_index: u64) -> ProgramEvent {
         let mut id_commitment = [0u8; 32];
         id_commitment[0] = n;
-        RlnEvent::Registered(Registered {
+        ProgramEvent::from(RlnEvent::Registered(Registered {
             tree_id: [0; 32],
             id_commitment,
             rate_limit: 100,
             expiry_timestamp_ms: 9_000,
             leaf_index,
-        })
+        }))
     }
 
-    fn block(block_id: u64, events: Vec<RlnEvent>) -> Block {
+    fn block(block_id: u64, events: Vec<ProgramEvent>) -> Block {
         Block {
             header: crate::lez::BlockHeader {
                 block_id,
@@ -1034,7 +1102,7 @@ mod test {
     }
 
     /// Block `block_id` with hash `hash` chaining on hash `prev`.
-    fn chained(block_id: u64, prev: u8, hash: u8, events: Vec<RlnEvent>) -> Block {
+    fn chained(block_id: u64, prev: u8, hash: u8, events: Vec<ProgramEvent>) -> Block {
         let mut b = block(block_id, events);
         b.header.prev_block_hash = common::HashType([prev; 32]);
         b.header.hash = common::HashType([hash; 32]);
@@ -1088,5 +1156,54 @@ mod test {
         assert!(Registry::open(&dir, [0; 32], 11, false, false).is_err());
         assert!(Registry::open(&dir, [0; 32], 10, false, false).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The preview holds the LEZ blocks produced beyond the head, answers by commitment and
+    /// by leaf, and lets go of a block once the head reaches it.
+    #[test]
+    fn test_the_preview_follows_the_head() {
+        let mut registry = Registry::open_temporary(1, false).unwrap();
+        registry.apply_lez_adopted(&block(1, vec![])).unwrap();
+        assert_eq!(registry.preview_next(), 2);
+        assert_eq!(registry.sequencer_block_id(), None);
+        let mut slashed = ProgramEvent::from(RlnEvent::Slashed(crate::lez::Slashed {
+            tree_id: [0; 32],
+            id_commitment: {
+                let mut id = [0u8; 32];
+                id[0] = 1;
+                id
+            },
+        }));
+        slashed.tx_hash = [9; 32];
+        registry.extend_preview(
+            vec![
+                block(2, vec![registered(1, 0)]),
+                block(3, vec![]),
+                block(4, vec![slashed]),
+            ],
+            5,
+        );
+        assert_eq!(registry.sequencer_block_id(), Some(5));
+        assert_eq!(registry.preview_next(), 5);
+        let (at, event) = registry.preview_for_leaf(0).unwrap();
+        assert_eq!(at, 2);
+        assert!(matches!(event.event, RlnEvent::Registered(_)));
+        // By commitment: the newest event wins.
+        let id = {
+            let mut id = [0u8; 32];
+            id[0] = 1;
+            id
+        };
+        let (at, event) = registry.preview_for_id(&id).unwrap();
+        assert_eq!((at, event.tx_hash), (4, [9; 32]));
+        assert!(registry.preview_for_leaf(3).is_none());
+        // The head reaches block 2: that block leaves the preview, the later ones stay.
+        registry
+            .apply_lez_adopted(&block(2, vec![registered(1, 0)]))
+            .unwrap();
+        registry.trim_preview();
+        assert_eq!(registry.preview_for_leaf(0), None);
+        assert_eq!(registry.preview_for_id(&id).map(|(at, _)| at), Some(4));
+        assert_eq!(registry.preview_next(), 5);
     }
 }

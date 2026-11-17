@@ -34,16 +34,18 @@ identity_secret=$(printf '%s\n' "$out" | sed -n 's/^IDENTITY_SECRET_HASH=//p')
 # On record for slash.sh and proof.sh.
 membership_set "$leaf_index" "$id_commitment" "$identity_secret"
 
-say "waiting for the zone to apply leaf $leaf_index"
-for _ in $(seq 1 120); do
-    if membership=$(zone "/merkle_proof/$id_commitment" 2>/dev/null) \
-        && [ "$(printf '%s' "$membership" | jq -r '.active')" = "true" ]; then
+say "waiting for the zone to apply leaf $leaf_index: the LEZ block must be adopted on Bedrock first"
+for i in $(seq 1 120); do
+    answer=$(zone "/merkle_proof/$id_commitment" 2>/dev/null) || answer=""
+    if [ "$(printf '%s' "$answer" | jq -r '.active' 2>/dev/null)" = "true" ]; then
+        membership="$answer"
         break
     fi
     membership=""
+    [ $((i % 6)) -eq 0 ] && say "  $((i / 6)) min: $(membership_status "$answer")"
     sleep 10
 done
-[ -n "$membership" ] || die "the zone did not apply the registration within 20 minutes (the LEZ block must be adopted on Bedrock first)"
+[ -n "$membership" ] || die "the zone did not apply the registration within 20 minutes: $(membership_status "$answer")"
 [ "$(printf '%s' "$membership" | jq -r '.leaf_index')" = "$leaf_index" ] \
     || die "leaf index mismatch: claimed $leaf_index, zone $(printf '%s' "$membership" | jq -r '.leaf_index')"
 [ "$(printf '%s' "$membership" | jq -r '.proof.path_elements | length')" = "20" ] \

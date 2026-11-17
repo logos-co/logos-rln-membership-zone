@@ -277,13 +277,19 @@ reads its policy off the producing batch's `changes`: the roots from the newest 
 newest that removes a leaf are the ones no removed member can still prove under; older roots
 in the window still hold that leaf.
 
-`/merkle_proof` answers 404 for an unknown leaf index or identity commitment. The answer
-carries the membership (`leaf_index`, `id_commitment`, `active`, `registered_at_lez_block_id`,
-`removed`, `removed_at_lez_block_id`, the LEZ blocks of its registration and of the event or
-expiry that removed it, `expiry_timestamp_ms`; `/leaves` carries the same per membership),
-`newest_published` and `newest_finalized` (for a validator to compare with `head.root`), and
-`proof` (`rate_commitment`, `path_elements`, `identity_path_index`, the `RLNMerkleProof` of
-Zerokit) while the membership is active, `null` otherwise.
+`/merkle_proof` answers 404 for a leaf index or identity commitment neither the tree nor the
+LEZ Sequencer knows. The answer carries the membership (`leaf_index`, `id_commitment`,
+`active`, `registered_at_lez_block_id` and `registered_tx_hash`, `removed`,
+`removed_at_lez_block_id` and `removed_tx_hash`: the LEZ blocks and transactions of its
+registration and of the event that removed it, `null` for an expiry, `expiry_timestamp_ms`;
+`/leaves` carries the same per membership), `newest_published` and `newest_finalized` (for a
+validator to compare with `head.root`), `proof` (`rate_commitment`, `path_elements`,
+`identity_path_index`, the `RLNMerkleProof` of Zerokit) while the membership is active, `null`
+otherwise, and `lez_preview`: the newest event about it in a LEZ block the LEZ Sequencer
+produced but Bedrock has not adopted yet (`lez_block_id`, `event` as the program names it,
+`rln_registration::Registered` say, `tx_hash`), `null` when none. A membership only the preview knows answers with `active` false, no `proof` and the
+preview: the registration is in LEZ, not on Bedrock yet (minutes as a rule; hours when LEZ
+stops inscribing, see `lez.not_on_bedrock` in `/`). Nothing from the preview is ever batched.
 
 ## 4. LEZ source: the LEZ channel on Bedrock, and the public LEZ Sequencer for history
 
@@ -357,7 +363,9 @@ curl -s -X POST https://testnet.lez.logos.co -H 'content-type: application/json'
   -d '{"jsonrpc":"2.0","id":1,"method":"getLastBlockId","params":[]}'   # the LEZ Sequencer's latest closed block
 curl -s -X POST https://testnet.lez.logos.co -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"getChannelId","params":[]}'     # 0101...01, the LEZ channel
-curl -s localhost:3000/ | jq .lez     # adopted_block_id (the head), finalized_block_id, adopted_block_count
+curl -s localhost:3000/ | jq .lez     # adopted_block_id (the head), finalized_block_id, adopted_block_count,
+                                      # sequencer_block_id (the LEZ Sequencer's newest), not_on_bedrock (the gap:
+                                      # LEZ blocks produced and not adopted yet; hundreds = LEZ stopped inscribing)
 ```
 
 ## 5. LEZ source: your own LEZ sequencer (follower)

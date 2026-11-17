@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 
 use crate::{
     batch::{Batch, Change, Kind},
+    lez::{self, ProgramEvent, RlnEvent},
     registry::{BedrockStatus, Registry},
     zone_chain::{BatchIngestError, Tip},
 };
@@ -280,6 +281,10 @@ async fn summary(State(state): State<AppState>) -> Json<Value> {
             "adopted_block_id": registry.head().lez_block_id,
             "adopted_block_count": registry.lez.view().len(),
             "finalized_block_id": registry.lez.final_reader().lez_block_id,
+            "sequencer_block_id": registry.sequencer_block_id(),
+            "not_on_bedrock": registry
+                .sequencer_block_id()
+                .map(|n| n.saturating_sub(registry.head().lez_block_id)),
         },
         "orphaned_count": registry.orphaned_count(),
         "newest_published": root_ref(newest(&registry, false)),
@@ -307,17 +312,36 @@ async fn roots(State(state): State<AppState>, Path(window_size): Path<usize>) ->
     with_head(&registry, json!({ "roots": roots }))
 }
 
+/// What the LEZ Sequencer holds about a membership ahead of Bedrock, as the API shows it: the
+/// newest event about it in a LEZ block not on Bedrock yet (`null` when none). A preview: it
+/// becomes the membership's state once Bedrock adopts that block, which may take minutes, or
+/// hours when LEZ stops inscribing.
+fn lez_preview(found: Option<(u64, &ProgramEvent)>) -> Value {
+    match found {
+        Some((lez_block_id, event)) => json!({
+            "lez_block_id": lez_block_id,
+            "event": lez::selector_name(&event.event),
+            "tx_hash": hex::encode(event.tx_hash),
+        }),
+        None => Value::Null,
+    }
+}
+
 /// A membership by its leaf index (decimal) or its identity commitment (64 hex): whether it
 /// is `active` (its leaf is in the tree) or why it was `removed`, and while active the Merkle
 /// proof path at the head's root, with the newest roots a batch carried to Bedrock for a
-/// validator to compare.
+/// validator to compare. `lez_preview` says what the LEZ Sequencer holds about it ahead of
+/// Bedrock; a membership only the preview knows answers with `active` false and no `proof`.
 async fn merkle_proof(
     State(state): State<AppState>,
     Path(leaf): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let registry = state.registry.read().expect("registry lock");
-    let found = if let Ok(leaf_index) = leaf.parse::<u64>() {
-        registry.head().member_at(leaf_index)
+    let (found, preview) = if let Ok(leaf_index) = leaf.parse::<u64>() {
+        (
+            registry.head().member_at(leaf_index),
+            registry.preview_for_leaf(leaf_index),
+        )
     } else {
         let bytes = hex::decode(leaf.trim_start_matches("0x"))
             .ok()
@@ -328,13 +352,40 @@ async fn merkle_proof(
                 "give a leaf index or an id_commitment of 32 bytes in hex",
             ));
         };
-        registry
-            .head()
-            .member(&id_commitment)
-            .map(|m| (id_commitment, m))
+        (
+            registry
+                .head()
+                .member(&id_commitment)
+                .map(|m| (id_commitment, m)),
+            registry.preview_for_id(&id_commitment),
+        )
     };
     let Some((id_commitment, member)) = found else {
-        return Err(error(StatusCode::NOT_FOUND, "no such membership"));
+        let Some((_, event)) = preview else {
+            return Err(error(StatusCode::NOT_FOUND, "no such membership"));
+        };
+        let leaf_index = match &event.event {
+            RlnEvent::Registered(r) => Some(r.leaf_index),
+            _ => None,
+        };
+        return Ok(with_head(
+            &registry,
+            json!({
+                "id_commitment": hex::encode(crate::registry::event_id_commitment(&event.event)),
+                "leaf_index": leaf_index,
+                "active": false,
+                "registered_at_lez_block_id": null,
+                "registered_tx_hash": null,
+                "removed": null,
+                "removed_at_lez_block_id": null,
+                "removed_tx_hash": null,
+                "expiry_timestamp_ms": null,
+                "newest_published": root_ref(newest(&registry, false)),
+                "newest_finalized": root_ref(newest(&registry, true)),
+                "proof": null,
+                "lez_preview": lez_preview(preview),
+            }),
+        ));
     };
     let proof = registry.head().proof_path(member.leaf_index).map(|path| {
         json!({
@@ -350,12 +401,15 @@ async fn merkle_proof(
             "leaf_index": member.leaf_index,
             "active": member.active,
             "registered_at_lez_block_id": member.registered_at_lez_block_id,
+            "registered_tx_hash": hex::encode(member.registered_tx_hash),
             "removed": member.removed,
             "removed_at_lez_block_id": member.removed_at_lez_block_id,
+            "removed_tx_hash": member.removed_tx_hash.map(hex::encode),
             "expiry_timestamp_ms": member.expiry_timestamp_ms,
             "newest_published": root_ref(newest(&registry, false)),
             "newest_finalized": root_ref(newest(&registry, true)),
             "proof": proof,
+            "lez_preview": lez_preview(preview),
         }),
     ))
 }
@@ -373,6 +427,7 @@ async fn leaves(State(state): State<AppState>) -> Json<Value> {
                 "leaf_index": m.leaf_index,
                 "id_commitment": hex::encode(id),
                 "registered_at_lez_block_id": m.registered_at_lez_block_id,
+                "registered_tx_hash": hex::encode(m.registered_tx_hash),
                 "expiry_timestamp_ms": m.expiry_timestamp_ms,
                 "expires_in_ms": m
                     .expiry_timestamp_ms
@@ -389,8 +444,10 @@ async fn leaves(State(state): State<AppState>) -> Json<Value> {
                 "leaf_index": m.leaf_index,
                 "id_commitment": hex::encode(id),
                 "registered_at_lez_block_id": m.registered_at_lez_block_id,
+                "registered_tx_hash": hex::encode(m.registered_tx_hash),
                 "removed": m.removed,
                 "removed_at_lez_block_id": m.removed_at_lez_block_id,
+                "removed_tx_hash": m.removed_tx_hash.map(hex::encode),
             })
         })
         .collect();
@@ -413,11 +470,11 @@ mod test {
 
     use super::*;
     use crate::{
-        lez::{Block, BlockHeader, Registered, RlnEvent},
+        lez::{Block, BlockHeader, ProgramEvent, Registered, RlnEvent},
         zone_chain::ChannelEntry,
     };
 
-    fn block(block_id: u64, events: Vec<RlnEvent>) -> Block {
+    fn block(block_id: u64, events: Vec<ProgramEvent>) -> Block {
         Block {
             header: BlockHeader {
                 block_id,
@@ -430,16 +487,16 @@ mod test {
         }
     }
 
-    fn registered(n: u8, leaf_index: u64) -> RlnEvent {
+    fn registered(n: u8, leaf_index: u64) -> ProgramEvent {
         let mut id_commitment = [0u8; 32];
         id_commitment[0] = n;
-        RlnEvent::Registered(Registered {
+        ProgramEvent::from(RlnEvent::Registered(Registered {
             tree_id: [0; 32],
             id_commitment,
             rate_limit: 100,
             expiry_timestamp_ms: u64::MAX,
             leaf_index,
-        })
+        }))
     }
 
     /// A sequencer that registered leaf 0 in LEZ block 1, published it (finalized on Bedrock
@@ -512,21 +569,21 @@ mod test {
     #[tokio::test]
     async fn test_the_handlers_answer_from_the_head() {
         let state = state();
-        let Json(summary) = summary(State(state.clone())).await;
-        assert_eq!(summary["batch_count"], 3);
-        assert_eq!(summary["in_flight"], json!(hex::encode([3; 32])));
-        assert_eq!(summary["lez"]["adopted_block_id"], 3);
-        assert_eq!(summary["lez"]["finalized_block_id"], 0);
-        assert_eq!(summary["tree"]["active_leaf_count"], 1);
-        assert!(summary["stall"].is_null());
-        assert_eq!(summary["head"]["lez_block_id"], 3);
-        assert_eq!(summary["newest_finalized"]["to_lez_block_id"], 1);
+        let Json(overview) = summary(State(state.clone())).await;
+        assert_eq!(overview["batch_count"], 3);
+        assert_eq!(overview["in_flight"], json!(hex::encode([3; 32])));
+        assert_eq!(overview["lez"]["adopted_block_id"], 3);
+        assert_eq!(overview["lez"]["finalized_block_id"], 0);
+        assert_eq!(overview["tree"]["active_leaf_count"], 1);
+        assert!(overview["stall"].is_null());
+        assert_eq!(overview["head"]["lez_block_id"], 3);
+        assert_eq!(overview["newest_finalized"]["to_lez_block_id"], 1);
 
         let Json(roots) = roots(State(state.clone()), Path(5)).await;
         assert_eq!(roots["roots"].as_array().unwrap().len(), 1);
         assert_eq!(roots["roots"][0]["from_lez_block_id"], 1);
         assert_eq!(roots["roots"][0]["to_lez_block_id"], 3);
-        assert_eq!(roots["roots"][0]["root"], summary["head"]["root"]);
+        assert_eq!(roots["roots"][0]["root"], overview["head"]["root"]);
         assert_eq!(
             roots["roots"][0]["batches"][0]["bedrock_status"],
             "finalized"
@@ -549,6 +606,8 @@ mod test {
         );
         let Json(by_id) = merkle_proof(State(state.clone()), Path(id)).await.unwrap();
         assert_eq!(by_id["leaf_index"], 0);
+        assert!(by_id["lez_preview"].is_null());
+        assert_eq!(by_id["registered_tx_hash"], json!("00".repeat(32)));
         let (code, _) = merkle_proof(State(state.clone()), Path("7".into()))
             .await
             .unwrap_err();
@@ -558,8 +617,33 @@ mod test {
             .unwrap_err();
         assert_eq!(code, StatusCode::BAD_REQUEST);
 
-        let Json(leaves) = leaves(State(state)).await;
+        let Json(leaves) = leaves(State(state.clone())).await;
         assert_eq!(leaves["active"].as_array().unwrap().len(), 1);
         assert_eq!(leaves["removed"].as_array().unwrap().len(), 0);
+
+        // The LEZ Sequencer produced block 4 with leaf 7 registered, not on Bedrock yet: the
+        // membership answers from the preview alone, the summary shows the gap.
+        let mut event = registered(7, 7);
+        event.tx_hash = [5; 32];
+        state
+            .registry
+            .write()
+            .unwrap()
+            .extend_preview(vec![block(4, vec![event])], 6);
+        let Json(previewed) = merkle_proof(State(state.clone()), Path("7".into()))
+            .await
+            .unwrap();
+        assert_eq!(previewed["active"], false);
+        assert!(previewed["proof"].is_null());
+        assert_eq!(previewed["leaf_index"], 7);
+        assert_eq!(previewed["lez_preview"]["lez_block_id"], 4);
+        assert_eq!(
+            previewed["lez_preview"]["event"],
+            crate::lez::Registered::SELECTOR_NAME
+        );
+        assert_eq!(previewed["lez_preview"]["tx_hash"], json!("05".repeat(32)));
+        let Json(overview) = summary(State(state)).await;
+        assert_eq!(overview["lez"]["sequencer_block_id"], 6);
+        assert_eq!(overview["lez"]["not_on_bedrock"], 3);
     }
 }

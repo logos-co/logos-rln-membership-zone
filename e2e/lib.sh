@@ -60,6 +60,29 @@ bedrock_info() { bedrock "http://$BEDROCK_HTTP/cryptarchia/info" | jq '.cryptarc
 bedrock_wallet() { bedrock "http://$BEDROCK_HTTP/wallet/$1/balance"; }
 zone() { curl -sS -m 30 "http://$ZONE_HTTP$1"; }
 
+# L1 slots since the LEZ channel's newest inscription (its tip on the node): under ~200 LEZ
+# inscribes as usual; thousands means LEZ produces blocks the zone cannot see on Bedrock yet.
+lez_l1_lag() {
+    local now tip
+    now=$(bedrock_info | jq -r '.slot')
+    tip=$(bedrock "http://$BEDROCK_HTTP/channel/$LEZ_CHANNEL_ID" | jq -r '.tip_slot // 0')
+    echo $((now - tip))
+}
+
+# One line on where a membership stands, from the zone's /merkle_proof answer: on Bedrock
+# (active or removed), or only in a LEZ block the LEZ Sequencer produced (`lez_preview`), or
+# unknown; always with how long LEZ has not inscribed.
+membership_status() {
+    local answer="$1" lag
+    lag=$(lez_l1_lag)
+    printf '%s' "$answer" | jq -r --argjson lag "$lag" '
+        if .active == true then "on Bedrock: active, registered in LEZ block \(.registered_at_lez_block_id) (tx \(.registered_tx_hash[0:8])..)"
+        elif .removed != null then "on Bedrock: removed (\(.removed)) in LEZ block \(.removed_at_lez_block_id)"
+        elif .lez_preview != null then "in LEZ block \(.lez_preview.lez_block_id) (\(.lez_preview.event), tx \(.lez_preview.tx_hash[0:8])..), NOT on Bedrock yet; LEZ last inscribed \($lag) L1 slots ago"
+        else "not seen by the zone; LEZ last inscribed \($lag) L1 slots ago" end' 2>/dev/null \
+        || echo "not seen by the zone; LEZ last inscribed $lag L1 slots ago"
+}
+
 # ---- a root on Bedrock ---------------------------------------------------------------------
 # A root the zone computes is at `head.root` until a batch carries it; `/roots` lists the
 # roots batches carry, each batch with its `bedrock_status` (the Zone SDK's word): `pending`

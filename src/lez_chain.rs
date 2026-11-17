@@ -233,7 +233,7 @@ pub fn check_filler(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::lez::{Registered, RlnEvent};
+    use crate::lez::{ProgramEvent, Registered, RlnEvent};
 
     fn id(n: u8) -> [u8; 32] {
         let mut id = [0u8; 32];
@@ -241,18 +241,18 @@ mod test {
         id
     }
 
-    fn registered(n: u8, leaf_index: u64) -> RlnEvent {
-        RlnEvent::Registered(Registered {
+    fn registered(n: u8, leaf_index: u64) -> ProgramEvent {
+        ProgramEvent::from(RlnEvent::Registered(Registered {
             tree_id: [0; 32],
             id_commitment: id(n),
             rate_limit: 100,
             expiry_timestamp_ms: u64::MAX,
             leaf_index,
-        })
+        }))
     }
 
     /// Block `block_id` with hash `hash` chaining on hash `prev`.
-    fn block(block_id: u64, prev: u8, hash: u8, events: Vec<RlnEvent>) -> Block {
+    fn block(block_id: u64, prev: u8, hash: u8, events: Vec<ProgramEvent>) -> Block {
         Block {
             header: crate::lez::BlockHeader {
                 block_id,

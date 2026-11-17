@@ -31,30 +31,75 @@ pub fn selector_name(event: &RlnEvent) -> &'static str {
     }
 }
 
-/// A LEZ block as a reader sees it: LEZ's own header (id, hashes, the LEZ clock in ms) and
-/// Bedrock status, with the registration program's events (its `rln_layouts::events` types,
-/// RFC "LEZ Requirements / Events") in transaction order; the events of any other `tree_id`
-/// the program serves are dropped.
+/// One event of the registration program with the LEZ transaction that emitted it (its hash,
+/// what the LEZ Sequencer's `getTransaction` takes).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProgramEvent {
+    pub tx_hash: [u8; 32],
+    pub event: RlnEvent,
+}
+
+impl ProgramEvent {
+    /// For logs: `Registered(tx ab12cd34..)`.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}(tx {}..)",
+            selector_name(&self.event),
+            hex::encode(&self.tx_hash[..4])
+        )
+    }
+}
+
+/// An event without its transaction (tests): the hash is zero.
+impl From<RlnEvent> for ProgramEvent {
+    fn from(event: RlnEvent) -> Self {
+        Self {
+            tx_hash: [0; 32],
+            event,
+        }
+    }
+}
+
+/// The events of a block for one log line: `Registered(tx ab12cd34..), Slashed(tx ..)`.
+pub fn describe_events(events: &[ProgramEvent]) -> String {
+    events
+        .iter()
+        .map(ProgramEvent::describe)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A LEZ block as a reader sees it: LEZ's own header (id, hashes, the LEZ clock in ms), with
+/// the registration program's events (its `rln_layouts::events` types, RFC "LEZ Requirements /
+/// Events") in transaction order, each with the transaction that emitted it; the events of any
+/// other `tree_id` the program serves are dropped.
 #[derive(Debug, Clone)]
 pub struct Block {
     pub header: BlockHeader,
-    pub events: Vec<RlnEvent>,
+    pub events: Vec<ProgramEvent>,
     /// Privacy-preserving transactions with a public effect under the registration program.
     /// They carry no instruction and emit no event, so each changed the registry without this
     /// reader seeing what; the ones under other programs are not counted.
     pub private_transaction_count: u32,
 }
 
-/// A block as the tree store keeps the adopted ones: the header fields and the events in the
-/// program's own wire form (`selector`, `data`), hex.
+/// A block as `lez_view.json` keeps the adopted ones: the header fields and the events in the
+/// program's own wire form (`selector`, `data`) with their transaction hash, hex.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredBlock {
     block_id: u64,
     prev_block_hash: String,
     hash: String,
     timestamp: u64,
-    events: Vec<(String, String)>,
+    events: Vec<StoredEvent>,
     private_transaction_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredEvent {
+    tx_hash: String,
+    selector: String,
+    data: String,
 }
 
 impl Block {
@@ -68,8 +113,12 @@ impl Block {
                 .events
                 .iter()
                 .map(|event| {
-                    let (selector, data) = event.encode();
-                    (hex::encode(selector), hex::encode(data))
+                    let (selector, data) = event.event.encode();
+                    StoredEvent {
+                        tx_hash: hex::encode(event.tx_hash),
+                        selector: hex::encode(selector),
+                        data: hex::encode(data),
+                    }
                 })
                 .collect(),
             private_transaction_count: self.private_transaction_count,
@@ -80,15 +129,19 @@ impl Block {
         let events = stored
             .events
             .iter()
-            .map(|(selector, data)| {
-                let selector: [u8; 8] = hex::decode(selector)
+            .map(|stored| {
+                let selector: [u8; 8] = hex::decode(&stored.selector)
                     .ok()
                     .and_then(|s| s.try_into().ok())
                     .ok_or_else(|| anyhow!("stored event selector"))?;
-                let data = hex::decode(data).context("stored event data")?;
-                RlnEvent::decode(selector, &data)
+                let data = hex::decode(&stored.data).context("stored event data")?;
+                let event = RlnEvent::decode(selector, &data)
                     .ok_or_else(|| anyhow!("stored event with an unknown selector"))?
-                    .context("stored event")
+                    .context("stored event")?;
+                Ok(ProgramEvent {
+                    tx_hash: crate::reader::parse_32(&stored.tx_hash)?,
+                    event,
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
@@ -176,6 +229,12 @@ impl LezSequencer {
         )
     }
 
+    /// The newest block the LEZ Sequencer holds (`getLastBlockId`): produced, on Bedrock or
+    /// not.
+    pub async fn last_block_id(&self) -> Result<u64> {
+        self.rpc("getLastBlockId", json!([])).await
+    }
+
     /// The blocks `from..=to`, in order, with the program's events of each.
     ///
     /// A call asks for up to `MAX_BLOCK_RANGE_LEN` blocks; when the sequencer refuses the answer
@@ -226,7 +285,10 @@ impl LezSequencer {
                         continue;
                     }
                     match self.decode_instruction(&tx.message.instruction_data) {
-                        Ok(Some(event)) => events.push(event),
+                        Ok(Some(event)) => events.push(ProgramEvent {
+                            tx_hash: tx.hash(),
+                            event,
+                        }),
                         Ok(None) => {}
                         // The tree is then wrong until a restart with `--rebuild-tree`.
                         Err(e) => warn!(
@@ -594,8 +656,9 @@ mod test {
         assert_eq!(block.timestamp_ms(), 2_345);
         assert_eq!(block.private_transaction_count, 1);
         assert_eq!(block.events.len(), 1);
+        assert_ne!(block.events[0].tx_hash, [0; 32]);
         assert!(matches!(
-            block.events[0],
+            block.events[0].event,
             RlnEvent::Registered(Registered {
                 leaf_index: 0,
                 rate_limit: 100,
@@ -634,7 +697,7 @@ mod test {
             rate_limit,
             expiry_timestamp_ms,
             leaf_index,
-        }) = &block.events[0]
+        }) = &block.events[0].event
         else {
             panic!("expected Registered");
         };
