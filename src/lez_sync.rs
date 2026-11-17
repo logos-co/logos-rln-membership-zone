@@ -23,8 +23,10 @@ use crate::{
 };
 
 /// Pages of `FINALITY_SCAN_PAGE` finalized L1 slots read backwards from the LIB to find the
-/// newest LEZ inscription (LEZ inscribes a block every minute or two).
-pub const LEZ_INSCRIPTION_SCAN_PAGES: u64 = 60;
+/// newest LEZ inscription: LEZ inscribes a block every minute or two, so the first page has
+/// one as a rule; the scan goes on (a page per node call) through the hours a LEZ sequencer
+/// may have been down, and gives up after this many.
+pub const LEZ_INSCRIPTION_SCAN_PAGES: u64 = 2_000;
 
 /// The checkpoint the LEZ channel's reader starts from on a fresh store: at the node's LIB,
 /// on the newest LEZ inscription at or below it (found by reading the finalized L1 blocks
@@ -42,7 +44,14 @@ pub async fn lez_checkpoint_at_lib(
         .cryptarchia_info;
     let lib_slot = u64::from(info.lib_slot);
     let mut page_to = lib_slot;
-    for _ in 0..LEZ_INSCRIPTION_SCAN_PAGES {
+    for page in 0..LEZ_INSCRIPTION_SCAN_PAGES {
+        if page > 0 && page % 50 == 0 {
+            info!(
+                "no LEZ inscription in the {} finalized L1 slots below the LIB yet ({page_to}..\
+                 {lib_slot}); reading further back",
+                page * FINALITY_SCAN_PAGE
+            );
+        }
         let page_from = page_to.saturating_sub(FINALITY_SCAN_PAGE - 1);
         let blocks = node
             .immutable_blocks(Slot::from(page_from), Slot::from(page_to))
