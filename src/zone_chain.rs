@@ -457,7 +457,7 @@ impl ZoneChain {
     /// Entries that entered the view, on a channel update that dropped nothing.
     pub fn apply_extension(&mut self, adopted: Vec<ChannelEntry>, judge: Option<&dyn Judge>) {
         for entry in adopted {
-            // The sdk re-reports held entries after a restart.
+            // The Zone SDK re-reports held entries after a restart.
             if self.view.iter().any(|held| held.msg == entry.msg) {
                 continue;
             }

@@ -326,7 +326,7 @@ async fn main() -> Result<()> {
         stale_refund_slots: args.stale_refund_slots,
         ..SequencerConfig::new(funding)
     };
-    let mut sdk = ZoneSequencer::init_with_config(
+    let mut zone_sdk = ZoneSequencer::init_with_config(
         channel_id,
         signing_key,
         node.clone(),
@@ -443,7 +443,7 @@ async fn main() -> Result<()> {
     let mut ready = false;
     let mut lez_ready = false;
     let mut counters = TickCounters::default();
-    let channel_view = sdk.subscribe_channel_view();
+    let channel_view = zone_sdk.subscribe_channel_view();
     let mut last_publish_unix = now_unix();
     let mut tick = tokio::time::interval(Duration::from_secs(args.poll_sec.max(1)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -456,7 +456,7 @@ async fn main() -> Result<()> {
             // rustfmt does not reach into `select!`: every arm is one call, the work is in the
             // `on_*` functions above.
             tokio::select! {
-                event = sdk.next_event() => match event {
+                event = zone_sdk.next_event() => match event {
                     Event::Ready => {
                         if !ready {
                             info!("ready");
@@ -466,7 +466,7 @@ async fn main() -> Result<()> {
                     Event::BlocksProcessed { checkpoint, channel_update, finalized, .. } => {
                         let tip: [u8; 32] = channel_view.borrow().tip_message.into();
                         on_blocks_processed(
-                            &mut sdk,
+                            &mut zone_sdk,
                             &registry,
                             &zone_channel,
                             tip,
@@ -498,7 +498,7 @@ async fn main() -> Result<()> {
                 },
                 _ = tick.tick(), if ready && lez_ready => {
                     on_tick(
-                        &mut sdk,
+                        &mut zone_sdk,
                         &registry,
                         &source,
                         args.heartbeat_sec,

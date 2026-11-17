@@ -285,7 +285,7 @@ pub async fn reconcile_finality(
 /// entry) is ignored: the SDK also reports a pending entry it could not see mined as orphaned,
 /// and publishing it again would fork our own channel.
 pub async fn on_blocks_processed(
-    sdk: &mut ZoneSequencer<NodeHttpClient>,
+    zone_sdk: &mut ZoneSequencer<NodeHttpClient>,
     registry: &Shared,
     channel: &ZoneChannel,
     tip: [u8; 32],
@@ -362,7 +362,7 @@ pub async fn on_blocks_processed(
                 for entry in dropped {
                     let Some(batch) = entry.batch else { continue };
                     if publishes {
-                        republish(sdk, registry, entry.msg.into(), &batch).await?;
+                        republish(zone_sdk, registry, entry.msg.into(), &batch).await?;
                     } else {
                         info!(
                             "batch [{}..{}] msg {} left the view in a reorg; the sequencer \
@@ -414,14 +414,14 @@ pub fn warn_lineage_gap(registry: &Shared) {
 /// Publish `batch` again after a reorg orphaned its message `orphaned`: a new message, since
 /// its parent changed. A refusal by the SDK is logged and left to the next conflict or poll.
 pub async fn republish(
-    sdk: &mut ZoneSequencer<NodeHttpClient>,
+    zone_sdk: &mut ZoneSequencer<NodeHttpClient>,
     registry: &Shared,
     orphaned: [u8; 32],
     batch: &Batch,
 ) -> Result<()> {
     let inscription = Inscription::try_from(batch.encode_to_vec())
         .map_err(|e| anyhow!("payload too large: {e:?}"))?;
-    match sdk.handle().publish(inscription).await {
+    match zone_sdk.handle().publish(inscription).await {
         Ok((result, checkpoint)) => {
             let info = result.tx.inscription();
             let record = {
@@ -504,7 +504,7 @@ pub async fn refresh_preview(source: &LezSequencer, registry: &Shared, failed: &
 /// publishes one batch covering the adopted LEZ blocks not covered yet when changes wait or
 /// the heartbeat is due, with at most one batch in flight. `Err` only for the tree store.
 pub async fn on_tick(
-    sdk: &mut ZoneSequencer<NodeHttpClient>,
+    zone_sdk: &mut ZoneSequencer<NodeHttpClient>,
     registry: &Shared,
     source: &LezSequencer,
     heartbeat_sec: u64,
@@ -535,7 +535,7 @@ pub async fn on_tick(
         if due { registry.next_batch() } else { None }
     };
     let Some(batch) = batch else { return Ok(()) };
-    publish_batch(sdk, registry, &batch, last_publish_unix).await
+    publish_batch(zone_sdk, registry, &batch, last_publish_unix).await
 }
 
 /// The sequencer's own batches that LEZ now contradicts (the tree at `to_lez_block_id` has
@@ -563,7 +563,7 @@ pub fn warn_contradicted(registry: &Registry, contradicted_count: &mut usize) {
 /// inscription or a refusal by the SDK is logged and tried again next poll. A batch that
 /// would not apply on our own head is a bug: fatal before anything reaches Bedrock.
 pub async fn publish_batch(
-    sdk: &mut ZoneSequencer<NodeHttpClient>,
+    zone_sdk: &mut ZoneSequencer<NodeHttpClient>,
     registry: &Shared,
     batch: &Batch,
     last_publish_unix: &mut u64,
@@ -586,7 +586,7 @@ pub async fn publish_batch(
             return Ok(());
         }
     };
-    match sdk.handle().publish(inscription).await {
+    match zone_sdk.handle().publish(inscription).await {
         Ok((result, checkpoint)) => {
             let info = result.tx.inscription();
             let record = {
