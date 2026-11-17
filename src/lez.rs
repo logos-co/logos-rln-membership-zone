@@ -12,6 +12,7 @@ use common::{block::Block as LezBlock, transaction::LeeTransaction};
 use lee::AccountId;
 use rln::prelude::{Hasher, PoseidonHash};
 pub use rln_layouts::events::{Erased, Extended, Registered, RlnEvent, Slashed};
+use rln_layouts::{Instruction, expiry_ms, secs_to_millis};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::warn;
@@ -325,7 +326,6 @@ impl LezSequencer {
     /// travels in the instruction as a claim the chain asserts. An instruction for another
     /// registry (`tree_id`) is dropped.
     fn decode_instruction(&self, data: &[u8]) -> Result<Option<RlnEvent>> {
-        use rln_layouts::{Instruction, expiry_ms, secs_to_millis};
         let instruction: Instruction =
             borsh::from_slice(data).context("not an instruction of the program")?;
         let tree_id = match &instruction {
@@ -515,7 +515,7 @@ mod test {
     }
 
     fn register(leaf_index: u64, id: [u8; 32]) -> Vec<u8> {
-        borsh::to_vec(&rln_layouts::Instruction::Register {
+        borsh::to_vec(&Instruction::Register {
             tree_id: TREE,
             id_commitment: id,
             rate_limit: 100,
@@ -530,7 +530,6 @@ mod test {
 
     #[test]
     fn test_decode_every_instruction() {
-        use rln_layouts::Instruction;
         let lez = lez();
         let keys = rln::prelude::IdentityKeys::generate::<PoseidonHash, rand::rngs::ThreadRng>(
             &mut rand::thread_rng(),
