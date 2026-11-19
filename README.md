@@ -46,9 +46,11 @@ Module --Register / Extend / Erase / Slash--> LEZ registration program   (deposi
                                                    |
                                                    v  LEZ blocks, from the LEZ channel on Bedrock (adopted / finalized)
                           Zone sequencer --batch--> Bedrock              (changes + root_after)
-                                                   |
-                                                   v  batches: applied or parked
-   Module (no tree) <--roots, proof path, state-- Zone indexer           (registry access: a Zone node, Bedrock, or its own)
+                                |                  |
+                                |                  v  batches: applied or parked (hours later, at the finalized LEZ blocks)
+                                |                Zone indexer            (the watchdog; registry access for a node that trusts nobody)
+                                v
+   Module (no tree) <--roots, proof path, state-- (registry access: the Zone sequencer's API as a rule, or Bedrock, or an own indexer)
 ```
 
 1. The Module sends `Register` to the registration program on LEZ.

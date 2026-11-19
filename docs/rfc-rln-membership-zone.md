@@ -150,7 +150,7 @@ the following sections specify each part.
 | Registration program | LEZ | configuration account, escrow, membership accounts | runs when the LEZ Sequencer executes a transaction that calls it, directly or through a chained call |
 | Bedrock | Logos Blockchain nodes | the LEZ channel (LEZ blocks) and the Zone channel (batches), totally ordered and finalized up to the latest immutable block (LIB); the notes that pay Mantle Transaction fees | lets anyone read every channel; lets only accredited keys write to their channel |
 | Zone sequencer | the Zone operator's hosts, one per accredited key | the tree of the finalized LEZ blocks, the adopted ones folded over it, node wallet notes, the batch in flight | reads the LEZ blocks adopted on Bedrock from the LEZ channel; publishes batches to the Zone channel on Bedrock; takes no input from any Module |
-| Zone indexer | any node, local to a Module or as a service; holds no accredited key | the tree, the channel as a final tier and a view with the root `(root_after, to_lez_block_id)` of every applied batch, the parked batches and the first one that froze its final tier as evidence | reads the finalized LEZ blocks from the LEZ channel on Bedrock; follows the Zone channel on Bedrock and judges each batch against what it derived; serves roots, Merkle proof paths, membership state and the stall to Modules ([Zone Indexer](#zone-indexer)) |
+| Zone indexer | any node, local to a Module or as a service; holds no accredited key | the tree, the channel as a final tier and a view with the root `(root_after, to_lez_block_id)` of every applied batch, the parked batches and the first one that froze its final tier as evidence | reads the finalized LEZ blocks from the LEZ channel on Bedrock; follows the Zone channel on Bedrock and judges each batch against what it derived; serves roots, Merkle proof paths, membership state and the stall to Modules, hours after the Zone sequencer since it judges at the finalized LEZ blocks ([Zone Indexer](#zone-indexer)) |
 | Slasher | any host | a funded account on LEZ | gets `recovered_secret` from its Module; sends `Slash` to LEZ |
 
 The Module acts as proof generator when it calls `generate_proof`
@@ -193,11 +193,11 @@ flowchart LR
     LSEQ -->|"#nbsp;3. execute#nbsp;"| PROG["Registration<br/>program<br/>(LEZ)"]
     LSEQ -->|"#nbsp;4. inscribe#nbsp;"| LCH["LEZ channel<br/>(Bedrock)"]
     LCH -->|"#nbsp;5. adopted#nbsp;<br/>#nbsp;LEZ blocks#nbsp;"| ZSEQ["Zone<br/>sequencer<br/>(Zone)"]
-    LCH -->|"#nbsp;5. finalized#nbsp;<br/>#nbsp;LEZ blocks#nbsp;"| IDX["Zone indexer<br/>(registry access,<br/>one of three levels)"]
+    LCH -->|"#nbsp;5. finalized#nbsp;<br/>#nbsp;LEZ blocks#nbsp;"| IDX["Zone indexer<br/>(watchdog; registry access<br/>hours later, level 3)"]
     LSEQ -.->|"#nbsp;finalized history#nbsp;<br/>#nbsp;under the hash chain,#nbsp;<br/>#nbsp;preview#nbsp;"| ZSEQ
     ZSEQ -->|"#nbsp;6. publish#nbsp;<br/>#nbsp;batch#nbsp;"| ZCH["Zone channel<br/>(Bedrock)"]
     IDX -->|"#nbsp;7. check#nbsp;<br/>#nbsp;batches#nbsp;"| ZCH
-    IDX -->|"#nbsp;8. roots, proof path,#nbsp;<br/>#nbsp;membership state#nbsp;"| MOD
+    ZSEQ -->|"#nbsp;8. roots, proof path,#nbsp;<br/>#nbsp;membership state#nbsp;<br/>#nbsp;(registry access, level 1)#nbsp;"| MOD
     linkStyle default stroke-width:2.5px
 
     classDef ui fill:#1a2826,stroke:#9fbfb3,color:#ffffff
@@ -221,8 +221,8 @@ flowchart LR
     VAL -->|"#nbsp;11. recovered_secret#nbsp;"| SL["Slasher<br/>(any node)"]
     SL -->|"#nbsp;12. Slash#nbsp;"| PROG["Registration program<br/>(LEZ)"]
     PROG -->|"#nbsp;13. LEZ block with the Slash#nbsp;<br/>#nbsp;on Bedrock: every reader#nbsp;<br/>#nbsp;removes the leaf#nbsp;"| ZSEQ["Zone sequencer<br/>(Zone)"]
-    ZSEQ -->|"#nbsp;14. next batch: Remove#nbsp;"| IDX["Zone indexer<br/>(Zone)"]
-    IDX -->|"#nbsp;15. roots without the leaf#nbsp;"| VAL
+    ZSEQ -->|"#nbsp;14. next batch: Remove#nbsp;"| IDX["Zone indexer<br/>(checks it)"]
+    ZSEQ -->|"#nbsp;15. roots without the leaf#nbsp;"| VAL
     linkStyle default stroke-width:2.5px
 
     classDef user fill:#d6e4ff,stroke:#3b6fd8,color:#111111
@@ -242,7 +242,7 @@ flowchart LR
 | 5 | Every reader (the Zone sequencer, every Zone indexer) reads the LEZ block from the LEZ channel on Bedrock, derives the registration program's events from its transactions and applies the derivation rules. | The Zone sequencer once the block's inscription is adopted on Bedrock; a Zone indexer once it is finalized. |
 | 6 | The Zone sequencer publishes a batch with the changes and the root to the Zone channel. | On its turn to write, covering every LEZ block not yet covered. |
 | 7 | The Zone indexer reads the batch from the Zone channel, compares it with the changes and the root it derived at step 5, and applies it or parks it. | Once the batch is in a Bedrock block it is in the Zone indexer's view; it is judged once the finalized LEZ blocks reach its `to_lez_block_id`, and finality moves it to the final tier. |
-| 8 | The Module reads from its registry access (a Zone node's interface, the Zone channel through its own node, or its own Zone indexer: [Registry access](#registry-access)) the newest valid root (a batch root deep enough on Bedrock), its Merkle proof path at that root and its membership state; the membership is `MEMBERSHIP_ACTIVE` from here. | Once the batch is at the reference depth. |
+| 8 | The Module reads from its registry access the newest valid root (a batch root deep enough on Bedrock), its Merkle proof path at that root and its membership state; the membership is `MEMBERSHIP_ACTIVE` from here. The registry access is a Zone node's interface as a rule, the Zone sequencer's today (a Zone indexer serves the same hours later, once the LEZ blocks are finalized), or the Zone channel through the Module's own node, or a Zone indexer of its own ([Registry access](#registry-access)). | Once the batch is at the reference depth. |
 | 9 | A Module that starts, or lost its registry access, answers `RLN_ERR_NOT_READY` until its registry access serves a root recent enough. | At start, or after a disconnection. |
 | 10 | The sender's Module, as proof generator, sends a message with its RLN proof; another node's Module, as validator, checks it. | Every message. |
 | 11 | The validator detects a double-signal and hands `recovered_secret`, the identity secret, to a slasher, or sends the `Slash` itself. | When a nullifier repeats with a different `share_x`. |
@@ -467,8 +467,10 @@ What follows from the evidence is outside this document.
 
 ### Serving
 
-A Zone node, a Zone indexer or the Zone sequencer through the same interface, is the registry access of Modules
-([Module Requirements](#module-requirements)); at the second level it serves the path and the state only.
+A Zone node is the registry access of Modules ([Module Requirements](#module-requirements)):
+the Zone sequencer and a Zone indexer serve the same interface,
+the Zone sequencer minutes after a LEZ block is adopted, a Zone indexer once the LEZ blocks are finalized, hours later;
+at the second level a Zone node serves the path and the state only.
 It serves:
 
 - the valid roots: the `root_after` and `to_lez_block_id` of every applied batch no correction superseded,
