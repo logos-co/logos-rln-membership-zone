@@ -32,6 +32,11 @@ use crate::{
 pub const FINALITY_SCAN_SEC: u64 = 300;
 /// Bedrock slots per `immutable_blocks` page (the finality scan, the LEZ inscription scan).
 pub const FINALITY_SCAN_PAGE: u64 = 100;
+/// Seconds without a Bedrock block from a Zone SDK stream before the L1 watchdog warns (a
+/// Bedrock block comes every half minute or so).
+pub const L1_SILENCE_WARN_SEC: u64 = 600;
+/// Seconds the L1 watchdog gives the node's height to move before it calls the chain still.
+pub const L1_SILENCE_JUDGE_SEC: u64 = 180;
 
 /// Seconds since the Unix epoch, for the heartbeat.
 pub fn now_unix() -> u64 {
@@ -487,6 +492,119 @@ pub struct TickCounters {
     pub preview_failed: bool,
     pub publish_failed: bool,
     pub lineage_gap: Option<[u8; 32]>,
+    /// When the Zone SDK last reported a Bedrock block on the Zone channel, and on the LEZ
+    /// channel (Unix seconds).
+    pub zone_block_unix: u64,
+    pub lez_block_unix: u64,
+    /// The L1 watchdog's state: `None` while blocks flow (`watch_l1`).
+    pub l1_silence: Option<L1Silence>,
+}
+
+/// Where the L1 watchdog stands in a silence.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum L1Silence {
+    /// Warned at `unix`, the node's height then; the verdict waits for the height to move or
+    /// for `L1_SILENCE_JUDGE_SEC`.
+    Warned { unix: u64, height: Option<u64> },
+    /// The verdict is said; quiet until blocks flow again.
+    Judged,
+}
+
+/// The L1 watchdog, every tick. A Zone SDK stream that reports no Bedrock block for
+/// `L1_SILENCE_WARN_SEC` while the other does is dead (the SDK reconnects only when the node
+/// closes the stream, never on a stalled one): said once, restart the process. Both silent: warns
+/// once with the node's slot, height and LIB, then says once whether the node's height moves
+/// (Bedrock runs, both streams are dead: restart) or stands for `L1_SILENCE_JUDGE_SEC` (the
+/// node, or Bedrock, produces no block: the Zone waits). Quiet again once blocks flow.
+pub async fn watch_l1(node: &NodeHttpClient, counters: &mut TickCounters) {
+    let now = now_unix();
+    let zone = now.saturating_sub(counters.zone_block_unix);
+    let lez = now.saturating_sub(counters.lez_block_unix);
+    if zone.max(lez) < L1_SILENCE_WARN_SEC {
+        if counters.l1_silence.take().is_some() {
+            info!("Bedrock blocks reach both Zone SDK streams again");
+        }
+        return;
+    }
+    if counters.l1_silence == Some(L1Silence::Judged) {
+        return;
+    }
+    if zone.min(lez) < L1_SILENCE_WARN_SEC {
+        let (dead, alive) = if zone > lez {
+            ("Zone", "LEZ")
+        } else {
+            ("LEZ", "Zone")
+        };
+        warn!(
+            "the Zone SDK stream on the {dead} channel reported no Bedrock block for {} min while \
+             the {alive} channel's did: that stream is dead, restart this process; said once \
+             until blocks flow again",
+            zone.max(lez) / 60
+        );
+        counters.l1_silence = Some(L1Silence::Judged);
+        return;
+    }
+    let info = node.consensus_info().await.ok().map(|i| {
+        (
+            u64::from(i.cryptarchia_info.slot),
+            i.cryptarchia_info.height,
+            u64::from(i.cryptarchia_info.lib_slot),
+        )
+    });
+    match counters.l1_silence {
+        None => {
+            match info {
+                Some((slot, height, lib)) => warn!(
+                    "no Bedrock block from the Zone SDK for {} min on both channels; the node's \
+                     tip is at slot {slot}, height {height}, LIB slot {lib}; whether its height \
+                     moves is said within {} min",
+                    zone.min(lez) / 60,
+                    L1_SILENCE_JUDGE_SEC / 60
+                ),
+                None => warn!(
+                    "no Bedrock block from the Zone SDK for {} min on both channels, and the node \
+                     does not answer",
+                    zone.min(lez) / 60
+                ),
+            }
+            counters.l1_silence = Some(L1Silence::Warned {
+                unix: now,
+                height: info.map(|i| i.1),
+            });
+        }
+        Some(L1Silence::Warned { unix, height }) => {
+            let judged = match (height, info) {
+                (Some(first), Some((_, now_height, _))) if now_height > first => {
+                    warn!(
+                        "the node's height moved {first} -> {now_height} and the Zone SDK still \
+                         reports no block: Bedrock runs, both streams are dead, restart this \
+                         process; said once until blocks flow again"
+                    );
+                    true
+                }
+                _ if now.saturating_sub(unix) >= L1_SILENCE_JUDGE_SEC => {
+                    match info {
+                        Some((slot, now_height, _)) => warn!(
+                            "the node's height stands at {now_height} (tip slot {slot}) for {} \
+                             min: the node, or Bedrock, produces no block and the Zone waits; \
+                             said once until blocks flow again",
+                            L1_SILENCE_JUDGE_SEC / 60
+                        ),
+                        None => warn!(
+                            "the node does not answer; the Zone waits; said once until blocks \
+                             flow again"
+                        ),
+                    }
+                    true
+                }
+                _ => false,
+            };
+            if judged {
+                counters.l1_silence = Some(L1Silence::Judged);
+            }
+        }
+        Some(L1Silence::Judged) => {}
+    }
 }
 
 /// `PublishRecord` for a log line: nothing for the usual `Extended`, the record otherwise.

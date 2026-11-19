@@ -56,7 +56,7 @@ use crate::{
     zone_sync::{
         FINALITY_SCAN_SEC, TickCounters, ZoneBlocks, ZoneChannel, channel_on_chain,
         check_channel_on_chain, checkpoint_at_lib, now_unix, on_blocks_processed, on_tick,
-        reconcile_finality,
+        reconcile_finality, watch_l1,
     },
 };
 
@@ -466,7 +466,11 @@ async fn main() -> Result<()> {
     };
     let mut ready = false;
     let mut lez_ready = false;
-    let mut counters = TickCounters::default();
+    let mut counters = TickCounters {
+        zone_block_unix: now_unix(),
+        lez_block_unix: now_unix(),
+        ..TickCounters::default()
+    };
     let channel_view = zone_sdk.subscribe_channel_view();
     let mut last_publish_unix = now_unix();
     let mut tick = tokio::time::interval(Duration::from_secs(args.poll_sec.max(1)));
@@ -488,6 +492,7 @@ async fn main() -> Result<()> {
                         ready = true;
                     }
                     Event::BlocksProcessed { checkpoint, channel_update, finalized, .. } => {
+                        counters.zone_block_unix = now_unix();
                         let tip: [u8; 32] = channel_view.borrow().tip_message.into();
                         on_blocks_processed(
                             &mut zone_sdk,
@@ -508,6 +513,7 @@ async fn main() -> Result<()> {
                         lez_ready = true;
                     }
                     Event::BlocksProcessed { channel_update, finalized, .. } => {
+                        counters.lez_block_unix = now_unix();
                         on_lez_blocks_processed(
                             &source,
                             &registry,
@@ -519,6 +525,7 @@ async fn main() -> Result<()> {
                     _ => {}
                 },
                 _ = tick.tick(), if ready && lez_ready => {
+                    watch_l1(&node, &mut counters).await;
                     on_tick(
                         &mut zone_sdk,
                         &registry,

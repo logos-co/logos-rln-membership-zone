@@ -600,6 +600,18 @@ batch stays `in_flight` (block production and mempool propagation).
 - `LEZ Sequencer preview not read: ...; said once until it answers again` (WARN): the LEZ
   Sequencer RPC is down; `lez_preview` and `lez.sequencer_block_id` stop moving, nothing else
   does; `the LEZ Sequencer answers again` ends it.
+- `no Bedrock block from the Zone SDK for N min on both channels; the node's tip is at slot S,
+  height H, LIB slot L; whether its height moves is said within 3 min` (WARN, once): the L1
+  watchdog. Within 3 minutes one more line: `the node's height stands at H ... the node, or
+  Bedrock, produces no block and the Zone waits` (check the node, then the testnet: nothing to
+  do in the zone) or `the node's height moved A -> B and the Zone SDK still reports no block:
+  Bedrock runs, both streams are dead, restart this process` (the SDK reconnects only when the
+  node closes its stream, not when the stream stalls). One stream silent while the other
+  receives blocks: `the Zone SDK stream on the X channel reported no Bedrock block for N min
+  while the Y channel's did: that stream is dead, restart this process`. `Bedrock blocks reach
+  both Zone SDK streams again` ends any of them. Until then `/` stands still on every field,
+  and `data/zone.json` `checkpoint.lib_slot` equal to the node's `lib_slot` says the streams
+  followed the node to where it stopped.
 - WSL2: `ngrok http 3000` inside WSL; from a Windows browser `http://localhost:3000` works
   with the default localhost forwarding.
 
