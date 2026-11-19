@@ -253,8 +253,8 @@ flowchart LR
 
 The following sections specify the [Derivation Rules](#derivation-rules) every reader applies (steps 5 and 13),
 the [Zone Sequencer](#zone-sequencer) (steps 6 and 14) and the [Zone Indexer](#zone-indexer) (steps 7, 8 and 15),
-then [Failure Handling](#failure-handling): where the registry runs ahead of Bedrock finality,
-every case that can break it and how each is handled, in one table;
+then [Failure Handling](#failure-handling): where the registry runs ahead of Bedrock finality
+and every case that can break it, by layer, with how each is handled;
 then what the registry requires from LEZ ([LEZ Requirements](#lez-requirements), steps 2-4 and 12)
 and from the Module ([Module Requirements](#module-requirements), steps 1, 8-11 and 15).
 The [Decisions](#decisions), the [Parameters](#parameters) and what comes [Later](#later) follow.
@@ -507,147 +507,77 @@ by what finality shows:
    and until then the batch and every batch after it wait.
 3. A Module takes a root at its reference depth ([Parameters](#parameters)), not at finality.
 
+With nothing wrong: a LEZ block is adopted on Bedrock; the Zone sequencer folds it and publishes
+a batch; the batch lands in a Bedrock block and the Module takes its root at the reference depth;
+every Zone indexer folds the batch into its view and judges it once the finalized LEZ blocks reach
+it; finality moves it to the final tier.
+
 Everything a failure can touch is derived: the tree from LEZ, the channel from Bedrock,
 a Zone node's state from both. So no case below loses data or funds;
 what a failure costs is time, during which the roots trail LEZ,
 new memberships stay `MEMBERSHIP_PENDING` and removals wait at the validators.
-The pipeline below is the flow with nothing wrong (case 1), with the number of every other case
-at the component it strikes; the four patterns after it are everything the Zone does about them;
-the table maps each case to its pattern.
-Cases compose: a reorg that orphans a correction is case 10 applied to case 5,
+The cases are listed by the layer they strike, each with how the Zone handles it
+and what a Module sees meanwhile.
+Cases compose: a reorg that orphans a correction is handled as an orphaned batch,
 and the Zone sequencer takes every decision again at every poll against the channel's current tip.
 
-```mermaid
-%%{init: {"theme": "base", "flowchart": {"curve": "basis", "nodeSpacing": 30, "rankSpacing": 50, "padding": 6}, "themeVariables": {"lineColor": "#9aa0a6", "primaryTextColor": "#111111", "edgeLabelBackground": "#ffffff", "fontSize": "14px"}}}%%
-flowchart LR
-    LSEQ["LEZ Sequencer<br/>2 3 6 7 8"] -->|"inscribe"| LCH["LEZ channel<br/>(Bedrock)<br/>4 5"]
-    LCH -->|"adopted"| ZSEQ["Zone sequencer<br/>14 15 18"]
-    ZSEQ -->|"publish batch"| ZCH["Zone channel<br/>(Bedrock)<br/>9 10 11 12 13"]
-    ZCH -->|"adopted,<br/>finalized"| IDX["Zone indexer<br/>(watchdog)<br/>16 17"]
-    ZSEQ -->|"roots, proof path"| MOD["Module<br/>19 20 21"]
-    IDX -.->|"the same,<br/>hours later"| MOD
-    linkStyle default stroke-width:2.5px
+### LEZ
 
-    classDef user fill:#d6e4ff,stroke:#3b6fd8,color:#111111
-    classDef lez fill:#d4f5dd,stroke:#2e9b52,color:#111111
-    classDef l1 fill:#ffc98f,stroke:#c25e00,color:#111111
-    classDef zone fill:#fbcfe8,stroke:#be185d,color:#111111
-    classDef bad fill:#ffe0e0,stroke:#c62828,color:#111111
-    classDef ok fill:#e6e6e6,stroke:#8a8a8a,color:#111111
-    class LSEQ lez
-    class LCH,ZCH l1
-    class ZSEQ,IDX zone
-    class MOD user
-```
+What the LEZ Sequencer does or fails to do. Readers take LEZ blocks from the LEZ channel on
+Bedrock only, so most of it never reaches the tree.
 
-**Wait** (cases 2, 3, 6, 7, 15, 16, 17, 18, 19): nothing on Bedrock changed, or the node cannot judge yet,
-so nothing is folded and nothing published; the flow resumes from the channel's head
-([Outages](#outages)).
+| Case | The Zone | A Module meanwhile |
+| --- | --- | --- |
+| The LEZ Sequencer closed a block it has not inscribed yet. | Never an input: a Zone node shows it as a preview ([Assumptions](#assumptions)). | `MEMBERSHIP_PENDING`; the preview MAY be shown as such. |
+| The LEZ Sequencer restarts and produces an uninscribed block again, other contents, same `block_id`. | Nothing: the block was never an input. | Nothing. |
+| LEZ stops inscribing. | Nothing to publish: no LEZ block is adopted, so no batch, not even a heartbeat (an empty batch covers adopted LEZ blocks); registrations made meanwhile are previews. The batches resume with LEZ. | `MEMBERSHIP_PENDING`; no expiry either, since expiry runs on the LEZ blocks' `timestamp`. |
+| The LEZ Sequencer's RPC serves history that does not chain to a finalized inscription, or too large or too short an answer. | Dropped and asked again over a smaller range: only the hash chain is trusted. | Nothing. |
+| A transaction the program reverted, or a privacy-preserving one (LEZ v0.3.2: no events, no reverted marker). | A reverted `Register` reads as a success, a private transaction is skipped; every reader applies the same rule, so the trees agree; events settle it ([LEZ Requirements](#lez-requirements)). | A leaf the program refused can be live until events exist. |
 
-```mermaid
-%%{init: {"theme": "base", "flowchart": {"curve": "basis", "nodeSpacing": 30, "rankSpacing": 50, "padding": 6}, "themeVariables": {"lineColor": "#9aa0a6", "primaryTextColor": "#111111", "edgeLabelBackground": "#ffffff", "fontSize": "14px"}}}%%
-flowchart LR
-    A["LEZ silent or a preview only,<br/>a node restart, LEZ not finalized<br/>up to a batch yet"] --> B["nothing folded,<br/>no batch, no new root"]
-    B --> C["LEZ, Bedrock or the node<br/>moves again"] --> D["batches and judging resume<br/>from the channel's head"]
+### Bedrock, the LEZ channel
 
-    classDef user fill:#d6e4ff,stroke:#3b6fd8,color:#111111
-    classDef lez fill:#d4f5dd,stroke:#2e9b52,color:#111111
-    classDef l1 fill:#ffc98f,stroke:#c25e00,color:#111111
-    classDef zone fill:#fbcfe8,stroke:#be185d,color:#111111
-    classDef bad fill:#ffe0e0,stroke:#c62828,color:#111111
-    classDef ok fill:#e6e6e6,stroke:#8a8a8a,color:#111111
-    class A bad
-    class B,C ok
-    class D zone
-```
+A Bedrock reorg moves or drops the LEZ inscriptions a reader already folded.
 
-**Refold** (case 4): a Bedrock reorg changed the adopted LEZ blocks under a reader
-before any batch covered them.
+| Case | The Zone | A Module meanwhile |
+| --- | --- | --- |
+| A reorg orphans a LEZ inscription no batch covers. | Every reader folds the adopted LEZ blocks again over the finalized tree; the next batch covers the blocks adopted now. | Nothing; the root comes a little later. |
+| A reorg orphans a LEZ inscription a batch covers, and the LEZ Sequencer produces that block again with other contents. | The channel's tip root is not the tree's root at the tip's `to_lez_block_id`: a Zone indexer parks the batch once the finalized LEZ blocks reach it (the stall); the Zone sequencer publishes a correction, a batch from `first_lez_block_id` stating the whole tree, which applies on the frozen tip and supersedes every batch before it ([Corrections](#corrections)). | The roots before the correction leave the window; proofs are made again at the newest valid root. |
 
-```mermaid
-%%{init: {"theme": "base", "flowchart": {"curve": "basis", "nodeSpacing": 30, "rankSpacing": 50, "padding": 6}, "themeVariables": {"lineColor": "#9aa0a6", "primaryTextColor": "#111111", "edgeLabelBackground": "#ffffff", "fontSize": "14px"}}}%%
-flowchart LR
-    A["Bedrock reorg orphans a LEZ<br/>inscription no batch covers"] --> B["the adopted LEZ blocks are<br/>folded again over the finalized tree"] --> C["the next batch covers<br/>the blocks adopted now"]
+### Bedrock, the Zone channel
 
-    classDef user fill:#d6e4ff,stroke:#3b6fd8,color:#111111
-    classDef lez fill:#d4f5dd,stroke:#2e9b52,color:#111111
-    classDef l1 fill:#ffc98f,stroke:#c25e00,color:#111111
-    classDef zone fill:#fbcfe8,stroke:#be185d,color:#111111
-    classDef bad fill:#ffe0e0,stroke:#c62828,color:#111111
-    classDef ok fill:#e6e6e6,stroke:#8a8a8a,color:#111111
-    class A bad
-    class B lez
-    class C zone
-```
+What happens to the batches on their way to and on Bedrock. The tree is untouched by all of it,
+since every reader derives it from LEZ.
 
-**Republish** (cases 9, 10, 11, 12): a batch of the Zone's left the view, or never entered it;
-the tree is untouched, the batch goes out again unchanged
-([Batches lost on Bedrock](#batches-lost-on-bedrock)).
+| Case | The Zone | A Module meanwhile |
+| --- | --- | --- |
+| The mempool drops a batch before any Bedrock block holds it. | The Zone sequencer builds it again at the next poll. | Roots trail. |
+| A reorg orphans the Zone's batches. | The Zone sequencer publishes them again unchanged, in order, on the new tip (the same message id); one whose publish fails waits in a queue retried first at every poll. A Zone indexer's view follows the reorg; nothing parks ([Batches lost on Bedrock](#batches-lost-on-bedrock)). | Roots trail; the orphaned roots are out of the window until the batches are back. |
+| Finality lands on a lineage without the Zone's recent batches. | As above, seen from the finalized entries. | As above. |
+| A reorg orphaned the Zone's batches while the Zone sequencer was down. | At start: those batches are orphaned and queued, the Zone SDK checkpoint moves back to the tip, and they are published again. | As above. |
+| An accredited key publishes a batch the derivation refutes: a change omitted, invented or misordered, a wrong root. | Every Zone indexer parks it with its cause, the evidence; an honest Zone sequencer folds it, sees it parked, and publishes a correction ([Zone Indexer](#zone-indexer)). | The parked root is never valid; the roots before the correction leave the window. |
+| The changes of the adopted LEZ blocks exceed one inscription. | The batch stops at the last LEZ block whose changes fit; the next one continues ([Publishing](#publishing)). A single block that does not fit is listed under [Later](#later). | Roots arrive in more than one batch. |
 
-```mermaid
-%%{init: {"theme": "base", "flowchart": {"curve": "basis", "nodeSpacing": 30, "rankSpacing": 50, "padding": 6}, "themeVariables": {"lineColor": "#9aa0a6", "primaryTextColor": "#111111", "edgeLabelBackground": "#ffffff", "fontSize": "14px"}}}%%
-flowchart LR
-    A["a batch of ours is orphaned,<br/>dropped by the mempool, or missing<br/>after the channel tip at start"] --> B["published again, unchanged, in order,<br/>on the new tip: the same message id"]
-    B -->|"lands"| C["back in the view;<br/>indexers follow the reorg,<br/>nothing parks"]
-    B -->|"fails"| Q["queued: first thing<br/>at the next poll"] --> B
+### Zone node
 
-    classDef user fill:#d6e4ff,stroke:#3b6fd8,color:#111111
-    classDef lez fill:#d4f5dd,stroke:#2e9b52,color:#111111
-    classDef l1 fill:#ffc98f,stroke:#c25e00,color:#111111
-    classDef zone fill:#fbcfe8,stroke:#be185d,color:#111111
-    classDef bad fill:#ffe0e0,stroke:#c62828,color:#111111
-    classDef ok fill:#e6e6e6,stroke:#8a8a8a,color:#111111
-    class A bad
-    class B,Q zone
-    class C ok
-```
+A Zone sequencer or a Zone indexer, and the Bedrock node it reads.
 
-**Correction** (cases 5, 13): a batch on the channel claims a root LEZ contradicts,
-whether a reorg rewrote the LEZ block it covered or a Zone sequencer lied
-([Corrections](#corrections), [Zone Indexer](#zone-indexer)).
+| Case | The Zone | A Module meanwhile |
+| --- | --- | --- |
+| The Zone sequencer restarts, or crashes between two writes of its state. | It resumes from the final tier on Bedrock, the view it persisted and its checkpoint ([Outages](#outages)); the state files are written in a fixed order, so a crash between two writes loses nothing and a torn line heals. | Roots trail during the outage. |
+| A Zone indexer restarts or rebuilds its tree. | The tree is derived again from the finalized LEZ blocks, the channel is kept, the batches it had parked are judged again. | `RLN_ERR_NOT_READY` from that access until it serves. |
+| A batch's `to_lez_block_id` is past the LEZ blocks the Zone indexer has finalized. | The batch waits, every later one behind it, and is judged when they arrive: the normal flow at a Zone indexer. | That access serves the root hours after a Zone sequencer. |
+| The Bedrock node a Zone node reads stands still, or is catching up after a restart. | Nothing moves and nothing is wrong in the Zone: the Zone SDK reports no block, so the node waits; it does not start while the node catches up, and warns when no block has come for long, with the node's height, so a still node is told from a dead stream. | Roots trail at the Modules that read this node. |
+| Every Zone sequencer is down for long, or every accredited key is lost. | A long outage is a restart that comes late; the keys are governance ([Later](#later)). | `MEMBERSHIP_PENDING`; a slashed or expired leaf stays accepted until a batch carries its removal. |
 
-```mermaid
-%%{init: {"theme": "base", "flowchart": {"curve": "basis", "nodeSpacing": 30, "rankSpacing": 50, "padding": 6}, "themeVariables": {"lineColor": "#9aa0a6", "primaryTextColor": "#111111", "edgeLabelBackground": "#ffffff", "fontSize": "14px"}}}%%
-flowchart LR
-    A["the channel's tip root is not<br/>the tree's root at its to_lez_block_id"] --> P["Zone indexer: the batch parks,<br/>the tip freezes, the stall is evidence"]
-    A --> C["Zone sequencer: a correction,<br/>first_lez_block_id .. head,<br/>every leaf set"]
-    C --> D["applies on the frozen tip,<br/>supersedes every batch before it"]
-    D --> M["Module: the old roots leave the window,<br/>proofs are made again at the newest valid root"]
+### Module
 
-    classDef user fill:#d6e4ff,stroke:#3b6fd8,color:#111111
-    classDef lez fill:#d4f5dd,stroke:#2e9b52,color:#111111
-    classDef l1 fill:#ffc98f,stroke:#c25e00,color:#111111
-    classDef zone fill:#fbcfe8,stroke:#be185d,color:#111111
-    classDef bad fill:#ffe0e0,stroke:#c62828,color:#111111
-    classDef ok fill:#e6e6e6,stroke:#8a8a8a,color:#111111
-    class A bad
-    class P,C,D zone
-    class M user
-```
+Nothing for the Zone to do; what the Module does is in [Module Requirements](#module-requirements).
 
-| # | Case | Pattern | A Module meanwhile |
-| --- | --- | --- | --- |
-| 1 | Nothing wrong: LEZ block adopted, batch published and adopted, judged once LEZ is finalized up to it, final tier at finality. | the pipeline | takes the root at its reference depth: `MEMBERSHIP_ACTIVE` |
-| 2 | The LEZ Sequencer closed a block it has not inscribed yet (a preview). | Wait | `MEMBERSHIP_PENDING`; the preview MAY be shown as such |
-| 3 | The LEZ Sequencer restarts and produces an uninscribed block again, other contents, same `block_id`. | Wait (never an input) | nothing |
-| 4 | A Bedrock reorg orphans a LEZ inscription no batch covers. | Refold | nothing; the root comes a little later |
-| 5 | A Bedrock reorg orphans a LEZ inscription a batch covers; LEZ produces the block again with other contents. | Correction | the roots before it leave the window; proofs made again |
-| 6 | LEZ stops inscribing. No LEZ block is adopted, so no batch, not even a heartbeat; registrations are previews. | Wait | `MEMBERSHIP_PENDING`; no expiry either, expiry runs on LEZ `timestamp` |
-| 7 | The LEZ Sequencer's RPC serves history off the hash chain, or too large or too short an answer. | Wait (dropped, asked again over a smaller range) | nothing |
-| 8 | A reverted or privacy-preserving transaction (LEZ v0.3.2: no events, no reverted marker). | none: every reader applies the same rule, events settle it ([LEZ Requirements](#lez-requirements)) | a leaf the program refused can be live until events exist |
-| 9 | The mempool drops a batch before any Bedrock block holds it. | Republish (built again) | roots trail |
-| 10 | A Bedrock reorg orphans the Zone's batches. | Republish | roots trail; the orphaned roots are out of the window until back |
-| 11 | Finality lands on a lineage without the Zone's recent batches. | Republish (seen from the finalized entries) | as 10 |
-| 12 | A reorg orphaned the Zone's batches while the Zone sequencer was down. | Republish (at start: orphaned, queued, checkpoint back to the tip) | as 10 |
-| 13 | An accredited key publishes a batch the derivation refutes. | Correction, by an honest Zone sequencer | the parked root is never valid; the roots before the correction leave the window |
-| 14 | The changes of the adopted LEZ blocks exceed one inscription. | none: the batch stops at the last LEZ block that fits ([Publishing](#publishing)); one block too large is [Later](#later) | roots arrive in more than one batch |
-| 15 | The Zone sequencer restarts, or crashes between two writes of its state. | Wait (state files in a fixed write order, a torn line heals) | roots trail during the outage |
-| 16 | A Zone indexer restarts or rebuilds its tree. | Wait (tree derived again, channel kept, parked batches judged again) | `RLN_ERR_NOT_READY` from that access until it serves |
-| 17 | A batch's `to_lez_block_id` is past the LEZ blocks the Zone indexer has finalized. | Wait (judged when they arrive; case 1 at an indexer) | that access serves the root hours after a Zone sequencer |
-| 18 | Every Zone sequencer is down for long, or every accredited key is lost. | Wait; the keys are governance ([Later](#later)) | `MEMBERSHIP_PENDING`; a slashed or expired leaf stays accepted until a batch carries its removal |
-| 19 | The Module's registry access is down. | Wait | `RLN_ERR_NOT_READY` ([Module Requirements](#module-requirements)) |
-| 20 | A proof against a root no longer in the window (removal, correction, orphaned). | none: the validator refuses it | the prover makes it again at the newest valid root |
-| 21 | The Module's registry accesses disagree. | none: a disagreement is evidence | MUST stop ([Registry access](#registry-access)) |
+| Case | The Zone | A Module meanwhile |
+| --- | --- | --- |
+| The Module's registry access is down. | Nothing. | `RLN_ERR_NOT_READY`. |
+| A proof is made against a root no longer in the window: cut by a removal, superseded by a correction, or orphaned. | Nothing: the validator refuses it. | The prover makes it again at the newest valid root. |
+| The Module's registry accesses disagree. | Nothing: a disagreement is evidence. | MUST stop ([Registry access](#registry-access)). |
 
 ## LEZ Requirements
 
