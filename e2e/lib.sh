@@ -132,23 +132,23 @@ EOF
 # Integer compare beyond what bash carries (balances are u128).
 ge() { python3 -c 'import sys; sys.exit(0 if int(sys.argv[1]) >= int(sys.argv[2]) else 1)' "$1" "$2"; }
 
-# A lez-rln binary, debug build first, release second.
+# A lez-rln binary, release build first, debug second.
 lez_rln_bin() {
     local name="$1" candidate
-    for candidate in "$LEZ_RLN_CHECKOUT/lez-rln/target/debug/$name" \
-                     "$LEZ_RLN_CHECKOUT/lez-rln/target/release/$name"; do
+    for candidate in "$LEZ_RLN_CHECKOUT/lez-rln/target/release/$name" \
+                     "$LEZ_RLN_CHECKOUT/lez-rln/target/debug/$name"; do
         [ -x "$candidate" ] && { echo "$candidate"; return 0; }
     done
-    die "no $name under $LEZ_RLN_CHECKOUT/lez-rln/target: cargo build --bin $name there (LEZ_RLN_CHECKOUT)"
+    die "no $name under $LEZ_RLN_CHECKOUT/lez-rln/target: cargo build --release --bin $name there (LEZ_RLN_CHECKOUT)"
 }
 
-# A zone binary (`generate_proof`, `verify_proof`), debug build first, release second.
+# A zone binary (`generate_proof`, `verify_proof`), release build first, debug second.
 zone_bin() {
     local name="$1" candidate
-    for candidate in "$REPO_DIR/target/debug/$name" "$REPO_DIR/target/release/$name"; do
+    for candidate in "$REPO_DIR/target/release/$name" "$REPO_DIR/target/debug/$name"; do
         [ -x "$candidate" ] && { echo "$candidate"; return 0; }
     done
-    die "no $name under $REPO_DIR/target: cargo build --bins"
+    die "no $name under $REPO_DIR/target: cargo build --release --bins"
 }
 
 # The environment the lez-rln binaries read: wallet, payer, registry.

@@ -14,10 +14,13 @@ chain side. Everything that holds funds or state lives under `E2E_STATE` (defaul
 - The Zone node running as the sequencer (`docs/setup-rln-membership-zone.md`), its `.env`
   naming the same program and tree as the network env file; the scenarios read its API.
 - A `logos-lez-rln` checkout on branch `feat/rln-zone-events` (the deployed program) with
-  `mint_payer`, `register_member`, `slash_member` and `account_balance` built (`cargo build
-  --bin ...` in its `lez-rln/`; debug is fine). `LEZ_RLN_CHECKOUT` points to it, default `~/logos-lez-rln`.
+  `mint_payer`, `register_member` and `slash_member` built (`cargo build
+  --release --bin mint_payer --bin register_member --bin slash_member` in
+  its `lez-rln/`; a release build is found first, a debug one second). `LEZ_RLN_CHECKOUT`
+  points to it, default `~/logos-lez-rln`.
 - `curl`, `jq`, `python3`, `yq` (reads the node keystore).
-- The zone bins `generate_proof` and `verify_proof` built (`cargo build --bins`), for `proof.sh`.
+- The zone bins `generate_proof` and `verify_proof` built (`cargo build --release --bins`, the
+  same build as the node), for `proof.sh`.
 
 ## Testnet
 
