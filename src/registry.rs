@@ -703,17 +703,31 @@ impl Registry {
     /// Sets the Zone SDK checkpoint's `last_msg_id` to `tip`, the channel's tip on chain, when
     /// it differs: the SDK restores the channel's tip from the checkpoint alone (and from the
     /// pending publishes it holds), never from the node, so a checkpoint whose tip fell behind
-    /// would make it publish on a parent that is no longer the tip. Returns whether it changed.
-    pub fn align_checkpoint_tip(&mut self, tip: [u8; 32]) -> bool {
+    /// would make it publish on a parent that is no longer the tip. The pending publishes the
+    /// checkpoint holds take precedence over its tip at restore, so with nothing of ours in
+    /// flight they are dropped too (a stale publish of an earlier run would stand as the tip).
+    /// Returns whether the tip changed and how many pending publishes were dropped.
+    pub fn align_checkpoint_tip(&mut self, tip: [u8; 32]) -> (bool, usize) {
+        let idle = self.own_pending.is_empty();
         let Some(fields) = self.checkpoint.as_mut().and_then(Value::as_object_mut) else {
-            return false;
+            return (false, 0);
         };
         let wanted = serde_json::to_value(MsgId::from(tip)).expect("a message id serializes");
-        if fields.get("last_msg_id") == Some(&wanted) {
-            return false;
+        let tip_changed = fields.get("last_msg_id") != Some(&wanted);
+        if tip_changed {
+            fields.insert("last_msg_id".into(), wanted);
         }
-        fields.insert("last_msg_id".into(), wanted);
-        true
+        let pending = fields
+            .get("pending_txs")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let dropped = if idle && pending > 0 {
+            fields.insert("pending_txs".into(), json!([]));
+            pending
+        } else {
+            0
+        };
+        (tip_changed, dropped)
     }
 
     /// Entries that entered the view (`ChannelUpdate::Extension`).

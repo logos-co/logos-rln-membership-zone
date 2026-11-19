@@ -658,8 +658,9 @@ batch stays `in_flight` (block production and mempool propagation).
   service restarts it, the start corrects the checkpoint's tip from the chain (`the Zone SDK
   checkpoint's tip was not the channel's tip T.. on chain: corrected`, WARN) and drops any
   publish recorded in flight that never chained (`N publish(es) of ours recorded in flight
-  never chained on the channel (stale, from an earlier run): dropped`, WARN), and the next
-  tick publishes the batch again on the tip.
+  never chained on the channel (stale, from an earlier run): dropped` and `N pending
+  publish(es) in the Zone SDK checkpoint while nothing of ours is in flight ...: dropped`, both
+  WARN), and the next tick publishes the batch again on the tip.
 - WSL2: `ngrok http 3000` inside WSL; from a Windows browser `http://localhost:3000` works
   with the default localhost forwarding.
 

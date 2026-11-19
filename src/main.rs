@@ -322,7 +322,7 @@ async fn main() -> Result<()> {
                              the channel (stale, from an earlier run): dropped"
                         );
                     }
-                    let aligned = registry.align_checkpoint_tip(tip);
+                    let (aligned, pending_dropped) = registry.align_checkpoint_tip(tip);
                     if aligned {
                         warn!(
                             "the Zone SDK checkpoint's tip was not the channel's tip {} on chain: \
@@ -330,7 +330,13 @@ async fn main() -> Result<()> {
                             short(&tip)
                         );
                     }
-                    if dropped > 0 || aligned {
+                    if pending_dropped > 0 {
+                        warn!(
+                            "{pending_dropped} pending publish(es) in the Zone SDK checkpoint while \
+                             nothing of ours is in flight (stale, from an earlier run): dropped"
+                        );
+                    }
+                    if dropped > 0 || aligned || pending_dropped > 0 {
                         registry.save()?;
                     }
                     registry
