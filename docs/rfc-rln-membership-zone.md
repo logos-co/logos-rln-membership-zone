@@ -523,8 +523,9 @@ flowchart LR
     LSEQ["LEZ Sequencer<br/>2 3 6 7 8"] -->|"inscribe"| LCH["LEZ channel<br/>(Bedrock)<br/>4 5"]
     LCH -->|"adopted"| ZSEQ["Zone sequencer<br/>14 15 18"]
     ZSEQ -->|"publish batch"| ZCH["Zone channel<br/>(Bedrock)<br/>9 10 11 12 13"]
-    ZCH -->|"adopted,<br/>finalized"| IDX["Zone indexer<br/>16 17"]
-    IDX -->|"roots, proof path"| MOD["Module<br/>19 20 21"]
+    ZCH -->|"adopted,<br/>finalized"| IDX["Zone indexer<br/>(watchdog)<br/>16 17"]
+    ZSEQ -->|"roots, proof path"| MOD["Module<br/>19 20 21"]
+    IDX -.->|"the same,<br/>hours later"| MOD
     linkStyle default stroke-width:2.5px
 
     classDef user fill:#d6e4ff,stroke:#3b6fd8,color:#111111
