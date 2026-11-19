@@ -56,7 +56,7 @@ use crate::{
     zone_sync::{
         FINALITY_SCAN_SEC, TickCounters, ZoneBlocks, ZoneChannel, channel_on_chain,
         check_channel_on_chain, checkpoint_at_lib, now_unix, on_blocks_processed, on_tick,
-        reconcile_finality, watch_l1,
+        reconcile_finality, wait_for_following, watch_l1,
     },
 };
 
@@ -253,6 +253,7 @@ async fn main() -> Result<()> {
     });
     let node_url: Url = args.node_url.parse().context("invalid NODE_URL")?;
     let node = NodeHttpClient::new(CommonHttpClient::new(None), node_url.clone());
+    wait_for_following(&node).await?;
 
     // HTTP API, the same in both modes.
     let state = AppState {

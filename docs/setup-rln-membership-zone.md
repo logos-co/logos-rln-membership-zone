@@ -603,7 +603,9 @@ batch stays `in_flight` (block production and mempool propagation).
 - `no Bedrock block from the Zone SDK for N min on both channels; the node's tip is at slot S,
   height H, LIB slot L; whether its height moves is said within 3 min` (WARN, once): the L1
   watchdog, which runs from the start (a node that produces no block never makes the SDK
-  `ready`). Within 3 minutes one more line: `the node's height stands at H ... the node, or
+  `ready`); `phase` is the node's: `Following` is the normal one, `InitialBlockDownload` a
+  node catching up, during which the zone does not start (`the node is in InitialBlockDownload
+  (...); waiting until it follows the chain`, INFO, once per phase). Within 3 minutes one more line: `the node's height stands at H ... the node, or
   Bedrock, produces no block and the Zone waits` (check the node, then the testnet: nothing to
   do in the zone) or `the node's height moved A -> B and the Zone SDK still reports no block:
   Bedrock runs, both streams are dead, restart this process` (the SDK reconnects only when the

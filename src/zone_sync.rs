@@ -510,6 +510,35 @@ pub enum L1Silence {
     Judged,
 }
 
+/// Waits until the node follows the chain in real time (`phase` Following): a node in its
+/// initial block download serves a tip and a LIB that move by hundreds of slots a minute, and
+/// the start-up scans and the Zone SDK checkpoints would be taken on them. Says once per phase
+/// what the node is doing; polls every 10 seconds.
+pub async fn wait_for_following(node: &NodeHttpClient) -> Result<()> {
+    let mut said = String::new();
+    loop {
+        let info = node
+            .consensus_info()
+            .await
+            .map_err(|e| anyhow!("consensus info: {e}"))?;
+        let phase = format!("{:?}", info.phase);
+        if phase == "Following" {
+            return Ok(());
+        }
+        if phase != said {
+            info!(
+                "the node is in {phase} (tip height {}, slot {}, LIB slot {}); waiting until it \
+                 follows the chain",
+                info.cryptarchia_info.height,
+                u64::from(info.cryptarchia_info.slot),
+                u64::from(info.cryptarchia_info.lib_slot)
+            );
+            said = phase;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    }
+}
+
 /// The L1 watchdog, every tick. A Zone SDK stream that reports no Bedrock block for
 /// `L1_SILENCE_WARN_SEC` while the other does is dead (the SDK reconnects only when the node
 /// closes the stream, never on a stalled one): said once, restart the process. Both silent: warns
@@ -549,15 +578,16 @@ pub async fn watch_l1(node: &NodeHttpClient, counters: &mut TickCounters) {
             u64::from(i.cryptarchia_info.slot),
             i.cryptarchia_info.height,
             u64::from(i.cryptarchia_info.lib_slot),
+            format!("{:?}", i.phase),
         )
     });
     match counters.l1_silence {
         None => {
-            match info {
-                Some((slot, height, lib)) => warn!(
+            match &info {
+                Some((slot, height, lib, phase)) => warn!(
                     "no Bedrock block from the Zone SDK for {} min on both channels; the node's \
-                     tip is at slot {slot}, height {height}, LIB slot {lib}; whether its height \
-                     moves is said within {} min",
+                     tip is at slot {slot}, height {height}, LIB slot {lib}, phase {phase}; \
+                     whether its height moves is said within {} min",
                     zone.min(lez) / 60,
                     L1_SILENCE_JUDGE_SEC / 60
                 ),
@@ -573,8 +603,8 @@ pub async fn watch_l1(node: &NodeHttpClient, counters: &mut TickCounters) {
             });
         }
         Some(L1Silence::Warned { unix, height }) => {
-            let judged = match (height, info) {
-                (Some(first), Some((_, now_height, _))) if now_height > first => {
+            let judged = match (height, info.as_ref()) {
+                (Some(first), Some((_, now_height, _, _))) if *now_height > first => {
                     warn!(
                         "the node's height moved {first} -> {now_height} and the Zone SDK still \
                          reports no block: Bedrock runs, both streams are dead, restart this \
@@ -583,11 +613,11 @@ pub async fn watch_l1(node: &NodeHttpClient, counters: &mut TickCounters) {
                     true
                 }
                 _ if now.saturating_sub(unix) >= L1_SILENCE_JUDGE_SEC => {
-                    match info {
-                        Some((slot, now_height, _)) => warn!(
-                            "the node's height stands at {now_height} (tip slot {slot}) for {} \
-                             min: the node, or Bedrock, produces no block and the Zone waits; \
-                             said once until blocks flow again",
+                    match &info {
+                        Some((slot, now_height, _, phase)) => warn!(
+                            "the node's height stands at {now_height} (tip slot {slot}, phase \
+                             {phase}) for {} min: the node, or Bedrock, produces no block and the \
+                             Zone waits; said once until blocks flow again",
                             L1_SILENCE_JUDGE_SEC / 60
                         ),
                         None => warn!(
