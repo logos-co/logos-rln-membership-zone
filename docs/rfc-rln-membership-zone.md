@@ -193,11 +193,11 @@ flowchart LR
     LSEQ -->|"#nbsp;3. execute#nbsp;"| PROG["Registration<br/>program<br/>(LEZ)"]
     LSEQ -->|"#nbsp;4. inscribe#nbsp;"| LCH["LEZ channel<br/>(Bedrock)"]
     LCH -->|"#nbsp;5. adopted#nbsp;<br/>#nbsp;LEZ blocks#nbsp;"| ZSEQ["Zone<br/>sequencer<br/>(Zone)"]
-    LCH -->|"#nbsp;5. finalized#nbsp;<br/>#nbsp;LEZ blocks#nbsp;"| IDX["Zone indexer<br/>(watchdog; registry access<br/>hours later, level 3)"]
+    LCH -->|"#nbsp;5. finalized#nbsp;<br/>#nbsp;LEZ blocks#nbsp;"| IDX["Zone indexer<br/>(watchdog; registry access<br/>hours later)"]
     LSEQ -.->|"#nbsp;finalized history#nbsp;<br/>#nbsp;under the hash chain,#nbsp;<br/>#nbsp;preview#nbsp;"| ZSEQ
     ZSEQ -->|"#nbsp;6. publish#nbsp;<br/>#nbsp;batch#nbsp;"| ZCH["Zone channel<br/>(Bedrock)"]
     IDX -->|"#nbsp;7. check#nbsp;<br/>#nbsp;batches#nbsp;"| ZCH
-    ZSEQ -->|"#nbsp;8. roots, proof path,#nbsp;<br/>#nbsp;membership state#nbsp;<br/>#nbsp;(registry access, level 1)#nbsp;"| MOD
+    ZSEQ -->|"#nbsp;8. roots, proof path,#nbsp;<br/>#nbsp;membership state#nbsp;<br/>#nbsp;(registry access)#nbsp;"| MOD
     linkStyle default stroke-width:2.5px
 
     classDef ui fill:#1a2826,stroke:#9fbfb3,color:#ffffff
@@ -360,7 +360,7 @@ A batch carries only what changes the tree; each leaf's expiry and the reason fo
   `posting_timeout` passes a missed turn to the next one.
   On its turn, a Zone sequencer SHOULD publish one batch covering every LEZ block adopted on Bedrock
   that no applied or in-flight batch has covered, when there are changes,
-  and an empty batch once `heartbeat_ms` have passed without a batch
+  and an empty batch once the heartbeat interval has passed without a batch
   (Zone sequencer configuration, like the poll interval and the fee cap of its node wallet).
   It publishes at the next poll after the batch in flight lands;
   a slow Zone sequencer shows publicly in how far the batches trail LEZ, and nothing else enforces it.
@@ -793,7 +793,8 @@ flowchart LR
   before any proof leaves it, and a wrong state only misreports.
   Three levels of registry access exist; which one a Module uses is its deployment choice:
   1. **A Zone node's interface.** The Module reads everything from a Zone sequencer or a Zone indexer it is configured with,
-     and trusts its operator for the roots. The simplest; the choice for a Module whose operator runs the Zone, or trusts who does.
+     and trusts its operator for the roots; the Zone sequencer answers minutes after a LEZ block is adopted,
+     a Zone indexer hours later, at the finalized LEZ blocks. The simplest; the choice for a Module whose operator runs the Zone, or trusts who does.
   2. **Roots from Bedrock.** The Module's own node is a Bedrock node, so the Module reads the Zone channel itself
      and folds the batches as a Zone indexer does without the tree (the replay of the changes, signed by the accredited key):
      the valid roots come from Bedrock, a Zone node serves only the path and the state, and the path is checked against those roots.
@@ -900,7 +901,7 @@ A Module trusts what it reads the registry through, and two accesses can disagre
 Decision: the three levels of [Module Requirements](#module-requirements).
 Only the roots need trust, and the roots are on Bedrock, so a Module that wants to check them reads the Zone channel
 through its own node (level 2) at no more cost than reading its own chain;
-a Module that trusts the Zone operator reads a Zone node (level 1);
+a Module that trusts the Zone operator reads a Zone node (level 1), the Zone sequencer's interface for the fastest roots;
 a Module that trusts nobody, or must not reveal its leaf, runs its own Zone indexer (level 3), the costly one,
 which is also how anyone watches the Zone.
 Accesses that disagree stop the Module; a majority was rejected, since a majority can be wrong against Bedrock.
@@ -966,7 +967,7 @@ Work that builds on the design above without changing it.
   prices and rate-limit bounds never touch an open membership).
 - **The scaling tree** in the readers, the Zone node's interface and the Module: one valid-root window per tree.
 - **Events from the LEZ Sequencer** (`getEvents`) in place of the derivation from the program's transactions;
-  chained calls and reverted transactions then count.
+  chained calls and reverted transactions then count (the reverted marker of LEZ v0.4 settles the latter alone).
 - **A single LEZ block whose changes exceed one inscription.**
 - **The snapshot format** for a Zone indexer that syncs from another ([Serving](#serving)).
 - **A Bedrock depth before batching**, to make corrections rarer ([Corrections](#corrections)).
@@ -989,8 +990,8 @@ Copyright and related rights waived via [CC0](https://creativecommons.org/public
 - [Storage Markets](https://lip.logos.co/blockchain/raw/storage-markets.html)
 - [Execution Market](https://lip.logos.co/blockchain/raw/execution-market.html)
 - [LEE v0.3 specification](https://lip.logos.co/blockchain/raw/lez/lee-v0.3-specifications.html)
-- [Zone SDK](https://github.com/logos-blockchain/logos-blockchain/tree/0.3.0/zone-sdk)
-- [LEZ](https://github.com/logos-blockchain/logos-execution-zone/tree/v0.3.1): `ProgramEvent`, the sequencer and indexer RPCs
+- [Zone SDK](https://github.com/logos-blockchain/logos-blockchain/tree/0.3.2/zone-sdk)
+- [LEZ](https://github.com/logos-blockchain/logos-execution-zone/tree/v0.3.2): `ProgramEvent`, the sequencer and indexer RPCs
 
 ### Informative (draft only)
 
