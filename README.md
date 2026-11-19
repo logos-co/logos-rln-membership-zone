@@ -48,7 +48,7 @@ Module --Register / Extend / Erase / Slash--> LEZ registration program   (deposi
                           Zone sequencer --batch--> Bedrock              (changes + root_after)
                                                    |
                                                    v  batches: applied or parked
-   Module (no tree) <--roots, proof path, state-- Zone indexer           (own node, or a service)
+   Module (no tree) <--roots, proof path, state-- Zone indexer           (registry access: a Zone node, Bedrock, or its own)
 ```
 
 1. The Module sends `Register` to the registration program on LEZ.
@@ -60,7 +60,8 @@ Module --Register / Extend / Erase / Slash--> LEZ registration program   (deposi
    `Batch{from_lez_block_id, to_lez_block_id, changes, root_after}` inscription.
    Every Zone indexer recomputes each batch from LEZ and parks any that omits, invents or misorders a change;
    a parked batch's root is never a valid root.
-4. The Module reads its registry access, a Zone indexer: the valid roots (the applied batches
+4. The Module reads its registry access (a Zone node's API, the Zone channel through its own
+   node, or its own Zone indexer): the valid roots (the applied batches
    from the last removal on), its Merkle proof path at the newest one, its membership state and
    the LEZ clock. It proves against the newest valid root and accepts proofs against any root in
    that window, as RLN-API specifies. A node that wants to trust nobody runs its own Zone
