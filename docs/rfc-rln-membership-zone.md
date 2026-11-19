@@ -102,42 +102,25 @@ the following sections specify each part.
 
 ### Assumptions
 
-- Bedrock totally orders and finalizes channel inscriptions and keeps them available.
-- LEZ blocks are inscribed on Bedrock in the LEZ channel.
-  A LEZ block has no finality of its own: it is final once the Bedrock block holding its inscription is.
-- A LEZ block is on Bedrock once the Bedrock block holding its inscription is adopted on the current branch,
-  and certain once that block is finalized.
+What the design relies on from Bedrock, LEZ and Mantle.
+
+- Bedrock totally orders and finalizes channel inscriptions and keeps them available;
+  only accredited keys write to a channel
+  ([Mantle channel operations](https://lip.logos.co/blockchain/raw/bedrock-v1.1-mantle-specification.html)),
+  anyone reads it.
+- LEZ blocks are inscribed on Bedrock in the LEZ channel, one block per inscription.
+  A LEZ block has no finality of its own: it is on Bedrock once the Bedrock block holding its
+  inscription is adopted on the current branch, and final once that block is finalized.
   A block the LEZ Sequencer has closed but not inscribed yet is its own statement:
-  a restart produces it again, possibly with other contents under the same `block_id`
-  (the LEZ Sequencer itself rebuilds from the LEZ channel on Bedrock after a restart).
-  Every reader therefore takes LEZ blocks from the LEZ channel on Bedrock, not from the LEZ Sequencer's word:
-  the Zone sequencer the adopted blocks (minutes behind the LEZ Sequencer), so it never publishes a statement
-  about a block that is not on Bedrock; every Zone indexer the finalized blocks only, so its tree can never be rewritten under it.
-  A Bedrock reorg that drops a LEZ inscription is handled as any reorg: the reader refolds the adopted blocks over the finalized ones.
-  The LEZ Sequencer's RPC serves finalized history fast, pinned by the hash chain to a finalized inscription.
-  A LEZ block holds its transactions only; the events a program emits come from executing them,
+  a restart produces it again, possibly with other contents under the same `block_id`.
+  Every reader therefore takes LEZ blocks from the LEZ channel on Bedrock, never from the LEZ
+  Sequencer's word.
+- A LEZ block holds its transactions only; the events a program emits come from executing them,
   are not covered by the block hash nor inscribed on Bedrock, and are served by whoever executed the block.
-- The Zone sequencers are not trusted: every Zone indexer derives the tree itself
-  and checks each batch by recomputation once it is in a Bedrock block, and Bedrock finality later confirms it.
-  A dishonest Zone sequencer is caught by any Zone indexer, not prevented.
 - Each LEZ block carries a `timestamp` in Unix-epoch milliseconds,
   which the clock program writes to the clock accounts.
   This is the registry's time base, as the `logos` namespace binding that RLN-API requires;
   the registry takes LEZ time as it comes, since the program and every reader expire a membership on the same clock.
-- Rate commitments are `poseidon(id_commitment, rate_limit)`,
-  with Poseidon or Poseidon2 over BN254 as in the Zerokit-API;
-  the hash is a parameter of the registry, Poseidon for the registry deployed today.
-- The membership set is a Merkle tree of depth 20, append-only in leaf indices:
-  a removed leaf is set to the empty value and its index is never reused,
-  so the leaf capacity is 2^20 memberships over the registry's lifetime.
-- Only accredited keys write to the Zone channel
-  ([Mantle channel operations](https://lip.logos.co/blockchain/raw/bedrock-v1.1-mantle-specification.html));
-  anyone reads it.
-- A Module holds no tree and reads the registry through its registry access, as RLN-API states:
-  a Zone node's interface, the Zone channel through its own node, or a Zone indexer of its own
-  ([Registry access](#registry-access)).
-  A node that wants to trust nobody runs its own Zone indexer:
-  a few megabytes of tree at today's membership counts, about 64 MB at the leaf capacity.
 
 ### Components
 
@@ -275,6 +258,10 @@ which the events settle.
 A change is an `Insert{leaf_index, rate_commitment}` or a `Remove{leaf_index}`,
 the two operations the current LEZ Merkle program performs;
 this design moves them from LEZ into the readers.
+The membership set is a Merkle tree of depth 20, append-only in leaf indices
+(a removed leaf is set to the empty value and its index is never reused, [Leaf capacity](#leaf-capacity));
+a rate commitment is `poseidon(id_commitment, rate_limit)`, Poseidon or Poseidon2 over BN254 as in the Zerokit-API,
+the hash being a parameter of the registry, Poseidon for the registry deployed today.
 
 Every event carries the `tree_id` of its registry; a reader takes the events of its registry only.
 For every LEZ block, in order,
@@ -435,6 +422,9 @@ The loss of all accredited keys is a governance case ([Later](#later)).
 
 ## Zone Indexer
 
+The Zone sequencers are not trusted: every Zone indexer derives the tree itself and checks each batch
+by recomputation once it is in a Bedrock block, and Bedrock finality later confirms it;
+a dishonest Zone sequencer is caught by any Zone indexer, not prevented.
 A Zone indexer derives the membership set with the Derivation Rules
 from the LEZ blocks finalized on Bedrock, read from the LEZ channel,
 and folds every batch of the Zone channel the way LEZ folds a block of its own channel,
@@ -732,7 +722,8 @@ flowchart LR
      This trusts the Zone operator's key as every reader does, and nobody for the roots it holds.
   3. **A Zone indexer of its own.** The node runs a Zone indexer, derives the tree from LEZ and judges every batch:
      it trusts nobody, holds the registry at the finalized LEZ blocks (hours behind), and can take part in watching the Zone.
-     The most costly; the choice for a Module that must not reveal which leaf is its own, or that audits.
+     The most costly (a few megabytes of tree at today's membership counts, about 64 MB at the leaf capacity);
+     the choice for a Module that must not reveal which leaf is its own, or that audits.
   A Module configured with several accesses that disagree (a root for the same `to_lez_block_id`, a path, a state)
   MUST stop generating and validating and report, rather than follow a majority: a majority can be wrong against Bedrock.
 - **Writes to LEZ.** The Module sends `Register` from the funded account, `Extend` and `Erase` from `holder`,
