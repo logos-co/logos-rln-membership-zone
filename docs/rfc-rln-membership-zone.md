@@ -307,7 +307,7 @@ flowchart LR
 A reader applies a LEZ block, with its events, once its inscription is on Bedrock:
 adopted for the Zone sequencer, finalized for a Zone indexer ([Zone Indexer](#zone-indexer));
 a block the LEZ Sequencer has only produced is a preview, never an input.
-A LEZ block that leaves Bedrock in a reorg leaves the reader's tree with it ([Corrections](#corrections)).
+A LEZ block that leaves Bedrock in a reorg leaves the reader's tree with it ([Failure Handling](#failure-handling)).
 
 ## Zone Sequencer
 
@@ -347,7 +347,7 @@ A batch carries only what changes the tree; each leaf's expiry and the reason fo
   `posting_timeout` passes a missed turn to the next one.
   On its turn, a Zone sequencer SHOULD publish one batch covering every LEZ block adopted on Bedrock
   that no applied or in-flight batch has covered, when there are changes,
-  and an empty batch once the heartbeat interval has passed without a batch
+  and an empty batch over the LEZ blocks adopted since once the heartbeat interval has passed without a batch
   (Zone sequencer configuration, like the poll interval and the fee cap of its node wallet).
   It publishes at the next poll after the batch in flight lands;
   a slow Zone sequencer shows publicly in how far the batches trail LEZ, and nothing else enforces it.
@@ -472,7 +472,7 @@ It serves:
   (live or removed, and how it was removed, `leaf_index`, `rate_limit`, `expiry_timestamp_ms`,
   the LEZ blocks and transactions of its registration and removal)
   and the latest LEZ `timestamp`;
-  `holder` and `ConfigState` live in LEZ accounts and are served by a Zone indexer with account access.
+  `holder` and `ConfigState` live in LEZ accounts and are served by a Zone node with account access.
 
 A request for a path or a state names a leaf; a Module that must not reveal its leaf runs its own Zone indexer.
 A Zone indexer that starts either replays the registration program's events from `first_lez_block_id`
