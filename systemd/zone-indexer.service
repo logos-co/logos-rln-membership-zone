@@ -1,0 +1,23 @@
+# A Zone indexer beside the sequencer as a systemd user service (systemctl --user). Install
+# and operation: docs/setup-rln-membership-zone.md, "Run as a service". Reads the same .env,
+# then indexer.env, which overrides MODE, DATA_DIR and HTTP_ADDR.
+
+[Unit]
+Description=RLN Membership Zone indexer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/logos-rln-membership-zone
+EnvironmentFile=%h/logos-rln-membership-zone/.env
+EnvironmentFile=%h/logos-rln-membership-zone/systemd/indexer.env
+Environment=RUST_LOG=warn,zone=info,logos_blockchain=info
+ExecStart=%h/logos-rln-membership-zone/target/release/zone
+# The node stops on SIGINT (Ctrl-C) and closes its store; stop it the same way.
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,23 @@
+# The Zone sequencer as a systemd user service (systemctl --user). Install and operation:
+# docs/setup-rln-membership-zone.md, "Run as a service". The repository is expected at
+# ~/logos-rln-membership-zone with a release build and a .env; adjust the three paths otherwise.
+
+[Unit]
+Description=RLN Membership Zone sequencer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/logos-rln-membership-zone
+# The node's configuration, KEY=VALUE lines (.env.example documents every variable).
+EnvironmentFile=%h/logos-rln-membership-zone/.env
+Environment=RUST_LOG=warn,zone=info,logos_blockchain=info
+ExecStart=%h/logos-rln-membership-zone/target/release/zone
+# The node stops on SIGINT (Ctrl-C) and closes its store; stop it the same way.
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

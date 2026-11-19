@@ -242,6 +242,40 @@ LEZ finality reaches it, and a missed inscription cannot stick as a wrong outcom
 `parked` for a finalized batch that failed, with the error). After `REBUILD_TREE=true` an
 indexer judges again the finalized batches its old tree parked, once the new tree reaches them.
 
+### Run as a service
+
+`systemd/` holds user units (`systemctl --user`, no root) for the sequencer and an indexer
+beside it. They run the release binary from `~/logos-rln-membership-zone`, read `.env` as the
+environment (the indexer then `systemd/indexer.env`, which overrides `MODE`, `DATA_DIR` and
+`HTTP_ADDR`), log to the journal, stop the node with SIGINT so it closes its store, and restart
+it 30 s after a failure. The node starts only once the Bedrock node follows the chain, so no
+ordering against the node's own service is needed.
+
+```bash
+cd ~/logos-rln-membership-zone
+cargo build --release --bins
+mkdir -p ~/.config/systemd/user
+cp systemd/zone-sequencer.service systemd/zone-indexer.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now zone-sequencer zone-indexer
+loginctl enable-linger "$USER"        # keep them running after logout; once
+```
+
+Day to day:
+
+```bash
+systemctl --user status zone-sequencer zone-indexer
+journalctl --user -u zone-sequencer -f            # the live log (-u zone-indexer for the other)
+journalctl --user -u zone-sequencer --since -2h   # a slice; --since today, -o cat for bare lines
+systemctl --user restart zone-sequencer           # after a config change
+git pull && cargo build --release --bins && systemctl --user restart zone-sequencer zone-indexer
+systemctl --user stop zone-indexer                # before a rm -rf data-indexer
+```
+
+A one-off start with another setting keeps working from a shell, with the service stopped:
+`systemctl --user stop zone-sequencer`, then `REBUILD_TREE=true target/release/zone` under
+`set -a; . ./.env; set +a`.
+
 ### HTTP API
 
 ```bash

@@ -92,6 +92,7 @@ src/                              the Zone node: sequencer and indexer (MODE), H
   src/bin/verify_proof.rs         the proof against the Zone's /roots window (the validator side)
 e2e/                              testnet scenarios: provision a LEZ payer, register, slash, prove (lib.sh, testnet.env, scenarios/)
 lez-sequencer/                    config template to run your own LEZ sequencer for the finalized history
+systemd/                          user units to run the sequencer and an indexer as services (setup doc, Run as a service)
 docs/setup-rln-membership-zone.md setup, operation, monitoring, troubleshooting, cleanup
 .env.example                      the node's configuration, every env var with its default
 ```
