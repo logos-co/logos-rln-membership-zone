@@ -477,6 +477,10 @@ async fn main() -> Result<()> {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut finality_tick = tokio::time::interval(Duration::from_secs(FINALITY_SCAN_SEC));
     finality_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The L1 watchdog runs from the start, before the SDK is ready: a node that produces no
+    // block never makes it ready.
+    let mut watchdog_tick = tokio::time::interval(Duration::from_secs(args.poll_sec.max(1)));
+    watchdog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // The store is closed whatever ends the loop: Ctrl-C, or an error out of an arm.
     let outcome: Result<()> = async {
@@ -525,7 +529,6 @@ async fn main() -> Result<()> {
                     _ => {}
                 },
                 _ = tick.tick(), if ready && lez_ready => {
-                    watch_l1(&node, &mut counters).await;
                     on_tick(
                         &mut zone_sdk,
                         &registry,
@@ -536,6 +539,7 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                 }
+                _ = watchdog_tick.tick() => watch_l1(&node, &mut counters).await,
                 _ = finality_tick.tick(), if ready => {
                     match reconcile_finality(&node, channel_id, &registry).await {
                         Ok(0) => {}
