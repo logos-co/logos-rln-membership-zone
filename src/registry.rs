@@ -682,11 +682,38 @@ impl Registry {
         };
         let judge = self.indexer.then_some(&self.lez as &dyn Judge);
         let record = self.zone.record_publish(entry, judge);
-        if record != PublishRecord::AlreadyInView {
+        // A stale publish chained on a pin the view moved past: no Bedrock block will ever
+        // hold it, so nothing waits for it.
+        if matches!(record, PublishRecord::Extended | PublishRecord::Skipped) {
             self.own_pending.push(msg.into());
         }
         self.trim_pending();
         record
+    }
+
+    /// Drops the publishes of ours recorded in flight that the view does not hold (a stale
+    /// publish of an earlier run, which no Bedrock block will ever hold). Returns how many.
+    pub fn drop_pending_not_in_view(&mut self) -> usize {
+        let held: HashSet<[u8; 32]> = self.zone.view().iter().map(|e| e.msg.into()).collect();
+        let before = self.own_pending.len();
+        self.own_pending.retain(|m| held.contains(m));
+        before - self.own_pending.len()
+    }
+
+    /// Sets the Zone SDK checkpoint's `last_msg_id` to `tip`, the channel's tip on chain, when
+    /// it differs: the SDK restores the channel's tip from the checkpoint alone (and from the
+    /// pending publishes it holds), never from the node, so a checkpoint whose tip fell behind
+    /// would make it publish on a parent that is no longer the tip. Returns whether it changed.
+    pub fn align_checkpoint_tip(&mut self, tip: [u8; 32]) -> bool {
+        let Some(fields) = self.checkpoint.as_mut().and_then(Value::as_object_mut) else {
+            return false;
+        };
+        let wanted = serde_json::to_value(MsgId::from(tip)).expect("a message id serializes");
+        if fields.get("last_msg_id") == Some(&wanted) {
+            return false;
+        }
+        fields.insert("last_msg_id".into(), wanted);
+        true
     }
 
     /// Entries that entered the view (`ChannelUpdate::Extension`).

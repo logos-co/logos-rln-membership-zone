@@ -435,6 +435,43 @@ pub fn warn_lineage_gap(registry: &Shared, last_said: &mut Option<[u8; 32]>) {
     }
 }
 
+/// Records a publish the SDK accepted and keeps the checkpoint it handed back. A stale one,
+/// chained on a pin the view moved past (the SDK's tip fell behind the channel's: it takes the
+/// tip from its checkpoint and its own publishes, never from the node), can never land: it is
+/// left out of `own_pending`, dropped from the checkpoint's pending publishes, and the
+/// checkpoint's tip is set to our pin, so the restart the caller forces (`stale_publish`) starts
+/// clean; the SDK itself keeps the stale publish in memory until then.
+fn record_published(
+    registry: &Shared,
+    info: &InscriptionInfo,
+    mut checkpoint: SequencerCheckpoint,
+    batch: &Batch,
+) -> Result<PublishRecord> {
+    let mut registry = registry.write().expect("registry lock");
+    let record = registry.record_publish(info.this_msg, info.parent_msg, batch);
+    if record == PublishRecord::Stale {
+        checkpoint
+            .pending_txs
+            .retain(|(hash, _)| *hash != info.tx_hash);
+        checkpoint.last_msg_id = registry.zone.pin();
+    }
+    registry.set_checkpoint(serde_json::to_value(&checkpoint)?);
+    registry.save()?;
+    Ok(record)
+}
+
+/// The error that stops the process after a stale publish (`record_published`).
+fn stale_publish(registry: &Registry, info: &InscriptionInfo) -> anyhow::Error {
+    anyhow!(
+        "the Zone SDK published msg {} on parent {} but the channel's tip is {}: the SDK's tip \
+         is stale and it keeps that publish in memory; the checkpoint is corrected, a restart \
+         publishes on the tip",
+        short(&info.this_msg.into()),
+        short(&info.parent_msg.into()),
+        short(&registry.zone.pin().into())
+    )
+}
+
 /// Publish `batch` again after a reorg orphaned its message `orphaned` (the same message when
 /// its parent is unchanged, a new one otherwise). A refusal by the SDK is logged and the batch
 /// queued: the tick publishes it before any new batch, since its changes left `pending_changes`
@@ -450,13 +487,7 @@ pub async fn republish(
     match zone_sdk.handle().publish(inscription).await {
         Ok((result, checkpoint)) => {
             let info = result.tx.inscription();
-            let record = {
-                let mut registry = registry.write().expect("registry lock");
-                let record = registry.record_publish(info.this_msg, info.parent_msg, batch);
-                registry.set_checkpoint(serde_json::to_value(&checkpoint)?);
-                registry.save()?;
-                record
-            };
+            let record = record_published(registry, info, checkpoint, batch)?;
             info!(
                 "batch [{}..{}] msg {} orphaned by a reorg, published again as msg {}{}",
                 batch.from_lez_block_id,
@@ -465,6 +496,12 @@ pub async fn republish(
                 short(&info.this_msg.into()),
                 describe_record(record)
             );
+            if record == PublishRecord::Stale {
+                let mut registry = registry.write().expect("registry lock");
+                registry.queue_republish(batch.clone());
+                registry.save()?;
+                return Err(stale_publish(&registry, info));
+            }
         }
         Err(e) => {
             warn!(
@@ -824,13 +861,7 @@ pub async fn publish_batch(
     match zone_sdk.handle().publish(inscription).await {
         Ok((result, checkpoint)) => {
             let info = result.tx.inscription();
-            let record = {
-                let mut registry = registry.write().expect("registry lock");
-                let record = registry.record_publish(info.this_msg, info.parent_msg, batch);
-                registry.set_checkpoint(serde_json::to_value(&checkpoint)?);
-                registry.save()?;
-                record
-            };
+            let record = record_published(registry, info, checkpoint, batch)?;
             *last_publish_unix = now_unix();
             *failed = false;
             let described: Vec<_> = batch.changes.iter().map(|c| c.describe()).collect();
@@ -848,6 +879,12 @@ pub async fn publish_batch(
                 },
                 describe_record(record)
             );
+            if record == PublishRecord::Stale {
+                return Err(stale_publish(
+                    &registry.read().expect("registry lock"),
+                    info,
+                ));
+            }
             // Checked above; a disagreement here means the head moved under the publish.
             if record == PublishRecord::Skipped {
                 let error = registry

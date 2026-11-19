@@ -649,6 +649,17 @@ batch stays `in_flight` (block production and mempool propagation).
   both Zone SDK streams again` ends any of them. Until then `/` stands still on every field,
   and `data/zone.json` `checkpoint.lib_slot` equal to the node's `lib_slot` says the streams
   followed the node to where it stopped.
+- `the Zone SDK published msg X.. on parent P.. but the channel's tip is T..: the SDK's tip is
+  stale ...; the checkpoint is corrected, a restart publishes on the tip` (fatal, the log line
+  before it ends with `(stale: the pin moved)`): the Zone SDK restores the channel's tip from
+  its checkpoint and its own pending publishes only, never from the node, and that tip had
+  fallen behind the channel's; its publish chained on a parent that is no longer the tip and
+  can never land. The process stops on purpose (the SDK keeps the publish in memory); the
+  service restarts it, the start corrects the checkpoint's tip from the chain (`the Zone SDK
+  checkpoint's tip was not the channel's tip T.. on chain: corrected`, WARN) and drops any
+  publish recorded in flight that never chained (`N publish(es) of ours recorded in flight
+  never chained on the channel (stale, from an earlier run): dropped`, WARN), and the next
+  tick publishes the batch again on the tip.
 - WSL2: `ngrok http 3000` inside WSL; from a Windows browser `http://localhost:3000` works
   with the default localhost forwarding.
 

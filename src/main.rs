@@ -311,7 +311,33 @@ async fn main() -> Result<()> {
                     resumed,
                 )?;
                 if after == 0 {
-                    checkpoint
+                    // The chain's tip is the parent of the next publish; the SDK takes it from
+                    // the checkpoint alone, so the checkpoint says what the chain says.
+                    let tip = parse_32(&channel.tip_message, "channel tip")?;
+                    let mut registry = registry.write().expect("registry lock");
+                    let dropped = registry.drop_pending_not_in_view();
+                    if dropped > 0 {
+                        warn!(
+                            "{dropped} publish(es) of ours recorded in flight never chained on \
+                             the channel (stale, from an earlier run): dropped"
+                        );
+                    }
+                    let aligned = registry.align_checkpoint_tip(tip);
+                    if aligned {
+                        warn!(
+                            "the Zone SDK checkpoint's tip was not the channel's tip {} on chain: \
+                             corrected, the next batch chains on the tip",
+                            short(&tip)
+                        );
+                    }
+                    if dropped > 0 || aligned {
+                        registry.save()?;
+                    }
+                    registry
+                        .checkpoint()
+                        .map(|c| serde_json::from_value(c.clone()))
+                        .transpose()
+                        .context("Zone SDK checkpoint after the tip check")?
                 } else {
                     // Entries of ours the chain does not hold any more: orphaned, published
                     // again by the tick; the SDK checkpoint moves back to the tip.
