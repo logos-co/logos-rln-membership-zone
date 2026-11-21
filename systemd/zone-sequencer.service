@@ -1,5 +1,5 @@
 # The Zone sequencer as a systemd user service (systemctl --user). Install and operation:
-# docs/setup-rln-membership-zone.md, "Run as a service". The repository is expected at
+# README.md, "As a service". The repository is expected at
 # ~/logos-rln-membership-zone with a release build and a .env; adjust the three paths otherwise.
 
 [Unit]

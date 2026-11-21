@@ -1,7 +1,8 @@
-# e2e: the Zone end to end
+# End-to-end scenarios on the testnet
 
-Bash + curl + jq + python3, one network env file per target, the lez-rln binaries for the
-chain side. Everything that holds funds or state lives under `E2E_STATE` (default
+Scripts that drive the whole stack as a user would: a LEZ payer, a registration, a slash, a
+proof against the Zone's roots. Bash + curl + jq + python3, one network env file per target, the
+lez-rln binaries for the chain side. Everything that holds funds or state lives under `E2E_STATE` (default
 `e2e/state/<network>`, gitignored): the payer wallet holds real funds, back it up.
 
 | Target | Bedrock | LEZ | Program | Zone | Use |
@@ -11,7 +12,7 @@ chain side. Everything that holds funds or state lives under `E2E_STATE` (defaul
 
 ## Prerequisites
 
-- The Zone node running as the sequencer (`docs/setup-rln-membership-zone.md`), its `.env`
+- The Zone node running as the sequencer (the README, "Run it"), its `.env`
   naming the same program and tree as the network env file; the scenarios read its API.
 - A `logos-lez-rln` checkout on branch `feat/rln-zone-events` (the deployed program) with
   `mint_payer`, `register_member` and `slash_member` built (`cargo build

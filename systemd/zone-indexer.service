@@ -1,5 +1,5 @@
 # A Zone indexer beside the sequencer as a systemd user service (systemctl --user). Install
-# and operation: docs/setup-rln-membership-zone.md, "Run as a service". Reads the same .env,
+# and operation: README.md, "As a service". Reads the same .env,
 # then indexer.env, which overrides MODE, DATA_DIR and HTTP_ADDR.
 
 [Unit]

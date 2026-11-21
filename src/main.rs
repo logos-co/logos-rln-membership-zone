@@ -1,4 +1,4 @@
-//! The RLN Membership Zone node (`docs/rfc-rln-membership-zone.md`), on the Logos testnet:
+//! The RLN Membership Zone node (the RLN Membership Zone LIP in logos-lips), on the Logos testnet:
 //! one binary, two modes.
 //!
 //! Both follow two channels on Bedrock through the Zone SDK, each kept as a final tier plus a

@@ -1479,7 +1479,7 @@ mod test {
     /// batched (the LEZ Sequencer produced it again with other contents): the batch on the
     /// channel claims a root the canonical lineage contradicts. The sequencer reports it and
     /// refuses to publish on top of it (`would_apply` fails on its own head), instead of
-    /// publishing a root the channel replay cannot reach; the correction is RFC Q6.
+    /// publishing a root the channel replay cannot reach; the correction is RFC "Corrections".
     #[test]
     fn test_a_lez_reorg_contradicting_a_published_batch_is_reported_and_stops_the_batches() {
         let mut registry = Registry::open_temporary(1, false).unwrap();
