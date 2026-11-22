@@ -474,7 +474,8 @@ folded over the finalized tree, a reorg refolding them, finality moving them), t
 (final tier, view, parked and waiting batches, orphaned batches published again, corrections),
 the HTTP answers and the decoding of LEZ blocks and the program's instructions, including a real
 testnet block. They are the last unit tests written: from here the logic is exercised end to
-end on the testnet (`e2e/`).
+end (`e2e/`): on the testnet, or on a local stack that `e2e/local-stack.sh` builds (a Bedrock
+dev node in docker, a LEZ sequencer on it, the program deployed, the Zone), see `e2e/README.md`.
 
 ## References
 

@@ -8,7 +8,7 @@ lez-rln binaries for the chain side. Everything that holds funds or state lives 
 | Target | Bedrock | LEZ | Program | Zone | Use |
 | --- | --- | --- | --- | --- | --- |
 | `testnet` | the node on the box (synced, `Online`) | `https://testnet.lez.logos.co` | deployed | the sequencer on the box | by hand, before a release; real LGO |
-| `local` | (to come) LEZ dev node | own sequencer | own deploy | own, fresh | every change; free |
+| `local` | a dev node in docker (the LEZ checkout's `bedrock/`) | a sequencer built from the LEZ checkout, on that node | deployed by `local-stack.sh` | own, fresh | every change; free; finality in seconds |
 
 ## Prerequisites
 
@@ -19,7 +19,9 @@ lez-rln binaries for the chain side. Everything that holds funds or state lives 
   --release --bin mint_payer --bin register_member --bin slash_member` in
   its `lez-rln/`; a release build is found first, a debug one second). `LEZ_RLN_CHECKOUT`
   points to it, default `~/logos-lez-rln`.
-- `curl`, `jq`, `python3`, `yq` (reads the node keystore).
+- `curl`, `jq`, `python3`, `yq` (reads the node keystore; testnet only).
+- For the `local` target: docker, `lsof`, the LEZ checkout at v0.3.2 and lez-rln's `run_setup`
+  with the guest binary (section Local).
 - The zone bins `generate_proof` and `verify_proof` built (`cargo build --release --bins`, the
   same build as the node), for `proof.sh`.
 
@@ -42,6 +44,29 @@ then watches `/merkle_proof/<id_commitment>` for the leaf with the claimed index
 `adopted` first, `finalized` hours later;
 a verifier trusts every root a batch carries unless it asks for finalized ones only). The
 scripts say the minutes spent while they wait.
+
+## Local
+
+The whole stack on one machine, built and run by `local-stack.sh` from the two checkouts
+(`LEZ_CHECKOUT`, default `~/logos-execution-zone` at v0.3.2, and `LEZ_RLN_CHECKOUT`); docker
+for the Bedrock dev node, `run_setup` of lez-rln built and its guest binary staged
+(`cargo risczero build --manifest-path methods/guest/Cargo.toml` in `lez-rln/`, docker). The
+dev node finalizes in seconds (`security_param` 5, 1 s slots), the LEZ sequencer closes a block
+every 2 s and inscribes each one, the payer is funded at the LEZ genesis, so nothing waits for
+hours and nothing costs real LGO.
+
+```bash
+bash e2e/local-stack.sh all          # check, bedrock (docker), payer, lez (builds, long once), program, zone-env
+set -a; . e2e/state/local/zone.env; set +a; cargo run           # the Zone sequencer, in another shell
+bash e2e/scenarios/register.sh e2e/local.env                    # then slash.sh, proof.sh the same way
+bash e2e/local-stack.sh status
+bash e2e/local-stack.sh down         # stop; `down -v` wipes the chain, the sequencer home, the payer and state.json
+```
+
+Every step resumes: a dev node that answers, a payer on record, a sequencer on its port or a
+program in `state.json` is kept. `down -v` then `all` starts a fresh chain (the Zone's
+`data-local` must go too). The LEZ sequencer runs in the background with its log under
+`e2e/state/local/`; the first `lez` step builds it from the checkout, which takes long.
 
 ## Scenarios
 

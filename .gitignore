@@ -38,6 +38,9 @@ checkpoint*.json
 /data/
 # Zone indexer run beside it (MODE=indexer DATA_DIR=data-indexer)
 /data-indexer/
+# The local stack's Zone node and indexer (e2e/local-stack.sh zone-env)
+/data-local/
+/data-local-indexer/
 # Own LEZ sequencer: its home (RocksDB, keys)
 /lez-sequencer/home/
 # e2e: per-network state (the LEZ payer wallet, pending deposit)
