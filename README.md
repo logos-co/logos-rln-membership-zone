@@ -22,7 +22,7 @@ it. The Module side is not written.
   ([`docs/anoncomms/raw/rln-membership-zone.md`](https://github.com/logos-co/logos-lips/blob/docs/rln-membership-zone/docs/anoncomms/raw/rln-membership-zone.md)
   on the branch; `https://lip.logos.co/anoncomms/raw/rln-membership-zone.html` once merged):
   the design, its decisions, the deployment parameters and what comes later.
-- **Zone node** (`src/`, bin `zone`): one binary, two modes, the same HTTP registry API. Both
+- **Reader** (`src/`, bin `zone`): one binary, two modes, the same HTTP registry API. Both
   read the LEZ blocks from the LEZ channel on Bedrock through the Zone SDK, never from a LEZ
   Sequencer's word alone. The **sequencer** derives the tree from the LEZ blocks adopted on
   Bedrock, publishes batches on its channel through the Zone SDK and follows them to finality.
@@ -51,7 +51,7 @@ Module --Register / Extend / Erase / Slash--> LEZ registration program   (deposi
 3. The Zone sequencer publishes `Batch{from_lez_block_id, to_lez_block_id, changes, root_after}`
    as one inscription. Every Zone indexer recomputes each batch from LEZ and parks any that
    omits, invents or misorders a change; a parked batch's root is never a valid root.
-4. The Module reads its registry access (a Zone node's API, the Zone channel through its own
+4. The Module reads its registry access (a reader's API, the Zone channel through its own
    node, or its own Zone indexer): the valid roots, its Merkle proof path at the newest one, its
    membership state and the LEZ clock. It proves against the newest valid root and accepts
    proofs against any root in the window, as RLN-API specifies.
@@ -62,7 +62,7 @@ that only pauses the registry at the Zone indexers until a correct batch arrives
 ## Repository layout
 
 ```text
-src/                              the Zone node: sequencer and indexer (MODE), HTTP registry API; src/bin/ the proof tools
+src/                              the reader: sequencer and indexer (MODE), HTTP registry API; src/bin/ the proof tools
   src/lez.rs                      LEZ blocks (LEZ's own `common` types) and the program's events, derived from its transactions (rln-layouts)
   src/reader.rs                   a reader: derivation rules over the events and the tree (sled-backed PmTree)
   src/lez_chain.rs                the LEZ chain as the node keeps it: the finalized tree on disk, the adopted blocks folded over it

@@ -1,4 +1,4 @@
-//! The RLN Membership Zone node (the RLN Membership Zone LIP in logos-lips), on the Logos testnet:
+//! The RLN Membership Zone reader (the RLN Membership Zone LIP in logos-lips), on the Logos testnet:
 //! one binary, two modes.
 //!
 //! Both follow two channels on Bedrock through the Zone SDK, each kept as a final tier plus a
@@ -82,7 +82,7 @@ enum Mode {
 }
 
 #[derive(Parser, Debug)]
-#[command(about = "RLN Membership Zone node: sequencer or indexer, with an HTTP registry API")]
+#[command(about = "RLN Membership Zone reader: sequencer or indexer, with an HTTP registry API")]
 struct Args {
     /// `sequencer` publishes the batches, `indexer` reads and judges them.
     #[arg(long, value_enum, default_value_t = Mode::Sequencer, env = "MODE")]
