@@ -767,11 +767,13 @@ pub async fn on_tick(
             (true, Some(batch))
         } else if let Some(batch) = registry.correction_batch() {
             // LEZ contradicts the channel (a Bedrock reorg replaced a LEZ block a batch of
-            // ours covered): the correction restates the tree from the first wrong batch on.
+            // ours covered, or a key published a wrong batch): the correction restates the
+            // tree from the first wrong batch on.
             let tip = registry.zone.head_tip().expect("a tip to correct");
             warn!(
                 "the channel's root {} at LEZ block {} is not the tree's {}: correction batch \
-                 [{}..{}] restates the tree ({} leaves), every root before it is superseded",
+                 [{}..{}] restates the tree from there ({} changes), every root it re-covers \
+                 is superseded",
                 short(&tip.root),
                 tip.to_lez_block_id,
                 short(&registry.head().root()),

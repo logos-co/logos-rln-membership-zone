@@ -185,8 +185,9 @@ the Zone SDK at work. What happens:
    covered, `HEARTBEAT_SEC` passed, or nothing published yet), at most one batch in flight, each
    batch folded on its own head first so nothing it would park reaches Bedrock. A reorg that
    orphans a batch has it published again, the same message id; LEZ contradicting a batch
-   already on Bedrock gets a correction batch (every leaf, from `FIRST_LEZ_BLOCK_ID`) that every
-   reader applies and that supersedes every root before it. A finality scan every 5 minutes
+   already on Bedrock gets a correction batch (from the first wrong batch's block, the changes
+   since the tree before it) that every reader applies and that supersedes every root it
+   re-covers. A finality scan every 5 minutes
    applies what the stream may have missed; an L1 watchdog says once when no Bedrock block has
    come for 10 minutes and whether the node stands still or the streams are dead.
 
@@ -416,10 +417,12 @@ While running:
   it (`curl localhost:8080/cryptarchia/transaction/<tx hash>` says whether it was mined), or
   the node's `height` does not move (stuck node).
 - `the channel's root R.. at LEZ block N is not the tree's S..: correction batch [F..H] restates
-  the tree (K leaves), every root before it is superseded` (WARN) after `LEZ channel reorg on
-  Bedrock ...` and `batch msg M.. claims root R.. ..., LEZ now gives S..`: a Bedrock reorg
-  replaced a LEZ block a batch covered; the correction applies on every reader, moves a frozen
-  tip, and the roots before it leave `/roots` (`superseded_count`). No restart, no new channel.
+  the tree from there (K changes), every root it re-covers is superseded` (WARN) after `LEZ
+  channel reorg on Bedrock ...` and `batch msg M.. claims root R.. ..., LEZ now gives S..`: a
+  Bedrock reorg replaced a LEZ block a batch covered; the correction applies on every reader
+  (to an indexer whose tip froze before the wrong batch it is the next batch), moves the frozen
+  tip, and the roots it re-covers leave `/roots` (`superseded_count`). No restart, no new
+  channel.
 - `the final tier is frozen at batch msg M.. (Bedrock slot S): ...` (WARN) or a batch `parked`:
   a finalized batch did not apply (its error says which check), `/` shows it as `stall`; on the
   indexer that is the evidence it holds until the correction applies.

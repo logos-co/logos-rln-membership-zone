@@ -579,8 +579,8 @@ mod test {
     }
 
     /// A LEZ reorg contradicts the in-flight heartbeat over block 3 (the canonical block 3
-    /// registers a leaf); the correction supersedes it: the API drops its root from `/roots`
-    /// and marks the entry.
+    /// registers a leaf); the correction, from block 3 on the tree before it, supersedes that
+    /// heartbeat alone: the API drops its root from `/roots` and marks the entry.
     #[test]
     fn test_a_superseded_batch_leaves_the_roots() {
         let state = state();
@@ -599,20 +599,21 @@ mod test {
         let correction = registry.correction_batch().unwrap();
         assert_eq!(
             (correction.from_lez_block_id, correction.to_lez_block_id),
-            (1, 3)
+            (3, 3)
         );
-        assert_eq!(correction.changes.len(), 2);
+        assert_eq!(correction.changes.len(), 1);
         registry.record_publish(MsgId::from([4; 32]), MsgId::from([3; 32]), &correction);
-        // Every batch before the correction is superseded, finalized or not.
+        // The batch the correction re-covers is superseded, the ones before it stand.
         let all = entries(&registry);
         assert_eq!(all.len(), 4);
         assert_eq!(
             all.iter().map(|e| e.superseded).collect::<Vec<_>>(),
-            vec![true, true, true, false]
+            vec![false, false, true, false]
         );
-        assert!(!all[0].applied());
+        assert!(all[0].applied());
+        assert!(!all[2].applied());
         let roots = roots_of(&registry, 5);
-        assert_eq!(roots.len(), 1);
+        assert_eq!(roots.len(), 2);
         assert_eq!(roots[0].produced_by().msg_id, hex::encode([4; 32]));
         assert_eq!(
             roots[0].produced_by().root,

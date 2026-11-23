@@ -11,7 +11,7 @@
 //! view and the reader (what the LEZ channel reports again from the LIB).
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs,
     io::Write as _,
     path::{Path, PathBuf},
@@ -72,6 +72,7 @@ pub enum BedrockStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Contradicted {
     pub msg: [u8; 32],
+    pub from_lez_block_id: u64,
     pub to_lez_block_id: u64,
     pub claimed: [u8; 32],
     pub derived: [u8; 32],
@@ -598,6 +599,7 @@ impl Registry {
                 let derived = self.head().root_at(batch.to_lez_block_id)?;
                 (derived != claimed).then_some(Contradicted {
                     msg,
+                    from_lez_block_id: batch.from_lez_block_id,
                     to_lez_block_id: batch.to_lez_block_id,
                     claimed,
                     derived,
@@ -607,23 +609,27 @@ impl Registry {
     }
 
     /// The correction the channel needs, if any: the head tip's root is not the tree's root at
-    /// its block (a Bedrock reorg replaced a LEZ block a batch covered), so a batch from the
-    /// registry's first block restates the tree (every leaf set, on the empty tree) up to the
-    /// head. `None` while the channel's statements hold.
+    /// its block (a Bedrock reorg replaced a LEZ block a batch covered, or a key published a
+    /// wrong batch), so a batch from the first contradicted batch's block restates the tree
+    /// from there up to the head: its changes take the tree the channel states before that
+    /// batch to the head's tree. `None` while the channel's statements hold.
     pub fn correction_batch(&self) -> Option<Batch> {
         let tip = self.zone.head_tip()?;
         if self.head().root_at(tip.to_lez_block_id)? == tip.root {
             return None;
         }
+        let from = self.contradicted().first()?.from_lez_block_id;
+        let before = self.zone.state_before(from, false)?;
         let head = self.head();
+        let target: BTreeMap<u64, [u8; 32]> = head
+            .active_leaves()
+            .iter()
+            .map(|(_, m)| (m.leaf_index, m.rate_commitment))
+            .collect();
         Some(Batch {
-            from_lez_block_id: self.first_lez_block_id,
+            from_lez_block_id: from,
             to_lez_block_id: head.lez_block_id,
-            changes: head
-                .active_leaves()
-                .iter()
-                .map(|(_, m)| Change::insert(m.leaf_index, m.rate_commitment.to_vec()))
-                .collect(),
+            changes: before.changes_to(&target),
             root_after: head.root().to_vec(),
         })
     }
@@ -1479,19 +1485,26 @@ mod test {
     /// batched (the LEZ Sequencer produced it again with other contents): the batch on the
     /// channel claims a root the canonical lineage contradicts. The sequencer reports it and
     /// refuses to publish on top of it (`would_apply` fails on its own head), instead of
-    /// publishing a root the channel replay cannot reach; the correction is RFC "Corrections".
+    /// publishing a root the channel replay cannot reach; the correction is RFC "Failure
+    /// Handling": from the contradicted batch's block, on the tree the batch before it left.
     #[test]
     fn test_a_lez_reorg_contradicting_a_published_batch_is_reported_and_stops_the_batches() {
         let mut registry = Registry::open_temporary(1, false).unwrap();
         registry
             .apply_lez_adopted(&block(1, vec![registered(1, 0)]))
             .unwrap();
+        let first = registry.next_batch().unwrap();
+        assert_eq!(
+            registry.record_publish(msg(1), MsgId::root(), &first),
+            PublishRecord::Extended
+        );
         registry
             .apply_lez_adopted(&block(2, vec![registered(2, 1)]))
             .unwrap();
         let batch = registry.next_batch().unwrap();
+        assert_eq!((batch.from_lez_block_id, batch.to_lez_block_id), (2, 2));
         assert_eq!(
-            registry.record_publish(msg(1), MsgId::root(), &batch),
+            registry.record_publish(msg(2), msg(1), &batch),
             PublishRecord::Extended
         );
         assert!(registry.contradicted().is_empty());
@@ -1505,12 +1518,19 @@ mod test {
         registry
             .apply_lez_adopted(&block(2, vec![registered(3, 1)]))
             .unwrap();
-        // Block 2 is covered by the batch, so its changes are not pending again; the batch's
-        // root is not the tree's root at block 2 any more.
+        // Block 2 is covered by the second batch, so its changes are not pending again; that
+        // batch's root is not the tree's root at block 2 any more, the first batch stands.
         assert!(registry.pending_changes.is_empty());
         let contradicted = registry.contradicted();
         assert_eq!(contradicted.len(), 1);
-        assert_eq!(contradicted[0].to_lez_block_id, 2);
+        assert_eq!(contradicted[0].msg, [2; 32]);
+        assert_eq!(
+            (
+                contradicted[0].from_lez_block_id,
+                contradicted[0].to_lez_block_id
+            ),
+            (2, 2)
+        );
         assert_eq!(contradicted[0].claimed, Tip::from(&batch).root);
         assert_eq!(contradicted[0].derived, registry.head().root());
         assert!(registry.next_batch().is_none());
@@ -1524,24 +1544,31 @@ mod test {
             registry.would_apply(&next),
             Err(BatchIngestError::HashMismatch { .. })
         ));
-        // The correction: from the contradicted batch's first block to the head, every leaf
-        // set (0, 1, 2) on the empty tree. It applies, supersedes the wrong batch, and the
-        // channel's statements hold again.
+        // The correction: from the contradicted batch's block to the head, on the tree the
+        // first batch left: leaf 1 as LEZ has it now, and leaf 2. It applies, supersedes the
+        // wrong batch alone, and the channel's statements hold again.
         let correction = registry.correction_batch().unwrap();
         assert_eq!(
             (correction.from_lez_block_id, correction.to_lez_block_id),
-            (1, 3)
+            (2, 3)
         );
-        assert_eq!(correction.changes.len(), 3);
+        let leaf = |index: u64| registry.head().member_at(index).unwrap().1.rate_commitment;
+        assert_eq!(
+            correction.changes,
+            vec![
+                Change::insert(1, leaf(1).to_vec()),
+                Change::insert(2, leaf(2).to_vec()),
+            ]
+        );
         assert_eq!(correction.root_after, registry.head().root().to_vec());
         assert!(registry.would_apply(&correction).is_ok());
         assert_eq!(
-            registry.record_publish(msg(2), msg(1), &correction),
+            registry.record_publish(msg(3), msg(2), &correction),
             PublishRecord::Extended
         );
         assert_eq!(
             registry.zone.superseded(),
-            std::collections::HashSet::from([[1; 32]])
+            std::collections::HashSet::from([[2; 32]])
         );
         assert!(registry.contradicted().is_empty());
         assert!(registry.correction_batch().is_none());
@@ -1808,7 +1835,8 @@ mod test {
 
     /// A frozen final tier (a parked batch, one parked after it) and the correction that ends
     /// the stall come back the same from disk: the stall is derived from the entries, the
-    /// correction replays on the empty tree, the roots exclude the parked and the superseded.
+    /// correction (one from the registry's first block, replayed on the empty tree) supersedes
+    /// the first batch, the roots exclude the parked and the superseded.
     #[test]
     fn test_reopen_restores_a_frozen_final_tier_and_its_correction() {
         let dir = dir("frozen");

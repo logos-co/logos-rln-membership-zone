@@ -8,14 +8,17 @@
 //! judge (the indexer's own tree derived from LEZ) must agree with that root. A batch that
 //! fails parks: the tip freezes and every later entry parks after it, the LEZ semantics.
 //!
-//! A correction (RFC "Zone Sequencer") is a batch that starts at the registry's first LEZ
-//! block again while the channel has a tip: the sequencer says the channel's statements were
-//! wrong (a Bedrock reorg replaced a LEZ block it had batched) and restates the tree, its
-//! changes being every leaf set, replayed on the empty tree, which is what a batch covering the
-//! whole registry means. It applies under the same checks (replay, judge), moves a frozen tip
-//! too, and supersedes every batch before it: their roots are not valid any more.
+//! A correction (RFC "Failure Handling") is a batch that starts inside the span the channel
+//! already covers: the sequencer says the channel's statements from that block on were wrong
+//! (a Bedrock reorg replaced a LEZ block it had batched, or a key published a wrong batch) and
+//! restates the tree from there. It must start right after a batch the channel still stands
+//! by (one that ends at `from - 1` in the effective lineage, or the registry's first block,
+//! where the tree is empty), its changes replay on that batch's tree, and it may not end
+//! before the tip. It applies under the same checks (replay, judge), moves a frozen tip too,
+//! and supersedes every applied batch whose span it re-covers: their roots are not valid any
+//! more. Its size is the changes since the first wrong batch, not the whole tree.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -147,28 +150,35 @@ pub trait Judge {
     fn root_at(&self, to_lez_block_id: u64) -> Option<[u8; 32]>;
 }
 
-/// Whether `batch` corrects a channel whose tip is `tip`: it starts at the registry's first
-/// block again.
-pub fn is_correction(first_lez_block_id: u64, tip: Option<&Tip>, batch: &Batch) -> bool {
-    tip.is_some() && batch.from_lez_block_id == first_lez_block_id
+/// Whether `batch` corrects a channel whose tip is `tip`: it starts inside the covered span.
+pub fn is_correction(tip: Option<&Tip>, batch: &Batch) -> bool {
+    tip.is_some_and(|tip| batch.from_lez_block_id <= tip.to_lez_block_id)
 }
 
-/// `tree` after `batch` when it chains on `tip` (the first batch on `first_lez_block_id`), or
-/// the tree `batch` restates when it is a correction (replayed on the empty tree; it may not
-/// end before the tip), and the judge, if any, agrees.
+/// `base` after `batch`, and the judge, if any, agrees. `base` is the tree the batch replays
+/// on: the tree at `tip` for a batch that chains on it (the empty tree for the first batch, on
+/// `first_lez_block_id`), the tree the channel states at `from - 1` for a correction
+/// (`None` when no applied batch ends there: the correction does not chain). A batch may not
+/// end before it starts or before the tip.
 fn apply_batch(
     first_lez_block_id: u64,
     tip: Option<&Tip>,
     batch: &Batch,
-    tree: &ReplayTree,
+    base: Option<&ReplayTree>,
     judge: Option<&dyn Judge>,
 ) -> Result<ReplayTree, BatchIngestError> {
     let expected = tip.map_or(first_lez_block_id, |tip| tip.to_lez_block_id + 1);
     let (from, to) = (batch.from_lez_block_id, batch.to_lez_block_id);
-    let correction = is_correction(first_lez_block_id, tip, batch);
-    // A gap, a start inside the covered span that is not a correction, a span that ends before
-    // it starts or before the tip.
-    if (from != expected && !correction) || to < from || to + 1 < expected {
+    let correction = is_correction(tip, batch);
+    // A gap, a correction after no batch the channel stands by, a span that ends before it
+    // starts or before the tip.
+    let Some(base) = base.filter(|_| from == expected || correction) else {
+        return Err(BatchIngestError::UnexpectedBlockId {
+            expected,
+            got: from,
+        });
+    };
+    if to < from || to + 1 < expected {
         return Err(BatchIngestError::UnexpectedBlockId {
             expected,
             got: from,
@@ -181,11 +191,7 @@ fn apply_batch(
         )));
     }
     let claimed = Tip::from(batch).root;
-    let mut next = if correction {
-        ReplayTree::empty()
-    } else {
-        tree.clone()
-    };
+    let mut next = base.clone();
     next.apply(&batch.changes)
         .map_err(|e| BatchIngestError::Deserialize(format!("{e:#}")))?;
     let computed = next.root();
@@ -216,24 +222,30 @@ fn apply_batch(
 
 /// The tree the batches replay to: in memory, replayed from the final tier on start. The tree
 /// at the newest applied batch is the one a Module proves against (its root is a valid root).
+/// The leaves set are kept by index, so a correction can state the difference between two
+/// trees.
 #[derive(Clone)]
-pub struct ReplayTree(OptimalMerkleTree<PoseidonHash>);
+pub struct ReplayTree {
+    tree: OptimalMerkleTree<PoseidonHash>,
+    leaves: BTreeMap<u64, [u8; 32]>,
+}
 
 impl ReplayTree {
     /// The empty tree, what every registry starts from.
     pub fn empty() -> Self {
-        Self(
-            OptimalMerkleTree::<PoseidonHash>::new(
+        Self {
+            tree: OptimalMerkleTree::<PoseidonHash>::new(
                 TREE_DEPTH,
                 Fr::default(),
                 OptimalMerkleConfig::default(),
             )
             .expect("an in-memory tree of depth 20"),
-        )
+            leaves: BTreeMap::new(),
+        }
     }
 
     pub fn root(&self) -> [u8; 32] {
-        fr_to_bytes_le(&self.0.root())
+        fr_to_bytes_le(&self.tree.root())
     }
 
     /// Apply a batch's changes: an insert sets the leaf, a removal empties it.
@@ -247,24 +259,45 @@ impl ReplayTree {
                         .try_into()
                         .context("a leaf that is not 32 bytes")?;
                     let leaf = fr_from_bytes_le(&bytes)?;
-                    self.0
+                    self.tree
                         .set(insert.leaf_index as usize, leaf)
                         .with_context(|| format!("insert leaf {}", insert.leaf_index))?;
+                    self.leaves.insert(insert.leaf_index, bytes);
                 }
-                Some(Kind::Remove(remove)) => self
-                    .0
-                    .delete(remove.leaf_index as usize)
-                    .with_context(|| format!("remove leaf {}", remove.leaf_index))?,
+                Some(Kind::Remove(remove)) => {
+                    self.tree
+                        .delete(remove.leaf_index as usize)
+                        .with_context(|| format!("remove leaf {}", remove.leaf_index))?;
+                    self.leaves.remove(&remove.leaf_index);
+                }
                 None => bail!("a change has no kind"),
             }
         }
         Ok(())
     }
 
+    /// The changes that take this tree to one whose leaves are `target`: removals of the
+    /// leaves `target` lacks, then insertions of the leaves it sets differently, by index.
+    pub fn changes_to(&self, target: &BTreeMap<u64, [u8; 32]>) -> Vec<Change> {
+        let mut changes: Vec<Change> = self
+            .leaves
+            .keys()
+            .filter(|index| !target.contains_key(index))
+            .map(|index| Change::remove(*index))
+            .collect();
+        changes.extend(
+            target
+                .iter()
+                .filter(|(index, leaf)| self.leaves.get(index) != Some(leaf))
+                .map(|(index, leaf)| Change::insert(*index, leaf.to_vec())),
+        );
+        changes
+    }
+
     /// The Merkle proof path of the leaf at `leaf_index` at this tree's root, if the leaf is
     /// set (RLN-API form).
     pub fn proof_path(&self, leaf_index: u64) -> Option<ProofPath> {
-        proof_path_at(&self.0, leaf_index)
+        proof_path_at(&self.tree, leaf_index)
     }
 }
 
@@ -367,11 +400,12 @@ impl ZoneChain {
             if let Some(batch) = entry.batch() {
                 match &entry.error {
                     None => {
+                        let base = chain.base_for(&batch, true);
                         chain.final_state = apply_batch(
                             first_lez_block_id,
                             chain.final_tip.as_ref(),
                             &batch,
-                            &chain.final_state,
+                            base.as_ref(),
                             None,
                         )
                         .map_err(|e| anyhow!("final batch msg {}: {e}", short(&entry.msg)))?;
@@ -472,6 +506,112 @@ impl ZoneChain {
             applied.push((msg, batch));
         }
         superseded
+    }
+
+    /// The tree the channel states at LEZ block `from - 1`, for a batch starting at `from`:
+    /// the empty tree for the registry's first block, else the tree after the applied batch
+    /// ending at `from - 1` in the effective lineage (the applied batches less the ones a
+    /// later correction re-covered); `None` when no batch ends there. Over the final tier
+    /// and the folds so far, or the final tier alone (`final_only`, for a batch finalizing).
+    /// A boundary inside the final tier replays the tier from the empty tree: a correction
+    /// that far back is rare (a batch finalized hours ago), the view holds its tree otherwise.
+    pub fn state_before(&self, from: u64, final_only: bool) -> Option<ReplayTree> {
+        if from == self.first_lez_block_id {
+            return Some(ReplayTree::empty());
+        }
+        enum Held {
+            Final,
+            View(usize),
+        }
+        let final_batches = self
+            .final_entries
+            .iter()
+            .filter(|f| f.error.is_none())
+            .filter_map(|f| Some((Held::Final, f.batch()?)));
+        let view_batches = self
+            .view
+            .iter()
+            .zip(&self.folds)
+            .enumerate()
+            .filter(|(_, (_, fold))| fold.outcome.is_ok())
+            .filter_map(|(i, (e, _))| Some((Held::View(i), e.batch.clone()?)));
+        let mut effective: Vec<(Held, Batch)> = vec![];
+        let applied: Vec<(Held, Batch)> = if final_only {
+            final_batches.collect()
+        } else {
+            final_batches.chain(view_batches).collect()
+        };
+        for (held, batch) in applied {
+            while effective
+                .last()
+                .is_some_and(|(_, e)| e.to_lez_block_id >= batch.from_lez_block_id)
+            {
+                effective.pop();
+            }
+            effective.push((held, batch));
+        }
+        while effective
+            .last()
+            .is_some_and(|(_, e)| e.to_lez_block_id >= from)
+        {
+            effective.pop();
+        }
+        let (held, last) = effective.last()?;
+        if last.to_lez_block_id + 1 != from {
+            return None;
+        }
+        match held {
+            Held::View(i) => Some(self.folds[*i].state.clone()),
+            Held::Final if effective.len() == self.final_effective_len() => {
+                Some(self.final_state.clone())
+            }
+            Held::Final => {
+                let mut tree = ReplayTree::empty();
+                for (_, batch) in &effective {
+                    tree.apply(&batch.changes).ok()?;
+                }
+                Some(tree)
+            }
+        }
+    }
+
+    /// How many applied final batches the effective lineage of the final tier holds.
+    fn final_effective_len(&self) -> usize {
+        let mut effective: Vec<Batch> = vec![];
+        for batch in self
+            .final_entries
+            .iter()
+            .filter(|f| f.error.is_none())
+            .filter_map(FinalEntry::batch)
+        {
+            while effective
+                .last()
+                .is_some_and(|e| e.to_lez_block_id >= batch.from_lez_block_id)
+            {
+                effective.pop();
+            }
+            effective.push(batch);
+        }
+        effective.len()
+    }
+
+    /// The tree `batch` replays on when it reaches the tip: the tip's tree for a batch that
+    /// chains on it, the tree the channel states at `from - 1` for a correction.
+    fn base_for(&self, batch: &Batch, final_only: bool) -> Option<ReplayTree> {
+        let (state, tip) = if final_only {
+            (&self.final_state, self.final_tip.as_ref())
+        } else {
+            self.folds
+                .last()
+                .map_or((&self.final_state, self.final_tip.as_ref()), |fold| {
+                    (&fold.state, fold.tip.as_ref())
+                })
+        };
+        if is_correction(tip, batch) {
+            self.state_before(batch.from_lez_block_id, final_only)
+        } else {
+            Some(state.clone())
+        }
     }
 
     /// Parent the next inscription must chain on: the view's last entry.
@@ -589,13 +729,9 @@ impl ZoneChain {
         batch: &Batch,
         judge: Option<&dyn Judge>,
     ) -> Result<(), BatchIngestError> {
-        let (state, tip) = self
-            .folds
-            .last()
-            .map_or((&self.final_state, self.final_tip.as_ref()), |fold| {
-                (&fold.state, fold.tip.as_ref())
-            });
-        apply_batch(self.first_lez_block_id, tip, batch, state, judge).map(|_| ())
+        let tip = self.head_tip();
+        let base = self.base_for(batch, false);
+        apply_batch(self.first_lez_block_id, tip, batch, base.as_ref(), judge).map(|_| ())
     }
 
     /// Records an inscription of ours, which chains on the pin it was built on.
@@ -714,11 +850,12 @@ impl ZoneChain {
         l1_slot: u64,
         judge: Option<&dyn Judge>,
     ) -> Result<Vec<Change>, BatchIngestError> {
+        let base = self.base_for(batch, true);
         match apply_batch(
             self.first_lez_block_id,
             self.final_tip.as_ref(),
             batch,
-            &self.final_state,
+            base.as_ref(),
             judge,
         ) {
             Ok(state) => {
@@ -843,8 +980,11 @@ impl ZoneChain {
             Some(batch) if waiting => Err(BatchIngestError::LezNotRead {
                 to: batch.to_lez_block_id,
             }),
-            Some(batch) => apply_batch(self.first_lez_block_id, tip, batch, state, judge)
-                .map(|next| (next, Tip::from(batch), batch.changes.clone())),
+            Some(batch) => {
+                let base = self.base_for(batch, false);
+                apply_batch(self.first_lez_block_id, tip, batch, base.as_ref(), judge)
+                    .map(|next| (next, Tip::from(batch), batch.changes.clone()))
+            }
             None => Err(BatchIngestError::Deserialize(
                 "the inscription is not a batch".into(),
             )),
@@ -1177,9 +1317,12 @@ mod test {
         assert_eq!(chain.final_msg(), msg(1));
     }
 
-    /// A correction (a batch starting at or before the tip) restates the tree on the empty
-    /// tree: on the final tier it moves a tip frozen by a parked batch (the judge decides it as
-    /// any batch); in the view it supersedes the applied batches whose span it re-covers.
+    /// A correction (a batch starting inside the covered span) restates the tree from the
+    /// first wrong batch on, replayed on the tree the channel states before it: on the final
+    /// tier of an indexer, whose tip the wrong batch never moved, it is the next batch (the
+    /// judge decides it as any batch); in the sequencer's view it supersedes the applied
+    /// batches whose span it re-covers, replaying on the tree before them wherever that tree
+    /// is: a fold, the final state, or inside the final tier.
     #[test]
     fn test_a_correction_moves_a_frozen_tip_and_supersedes_the_batches_it_re_covers() {
         let empty = ReplayTree::empty();
@@ -1214,15 +1357,11 @@ mod test {
         ));
         assert_eq!(chain.stall().unwrap().orphans_since, 1);
         assert_eq!(chain.final_tip().unwrap().to_lez_block_id, 1);
-        // The correction: every leaf set, from the first block to 3, on the empty tree.
-        let correction = batch(
-            1,
-            3,
-            vec![Change::insert(0, leaf(1)), Change::insert(1, leaf(3))],
-            &empty,
-        );
+        // The correction: from the wrong batch's block to 3, on the tree the first batch
+        // left. For the indexer it is the next batch: its tip never moved past the first.
+        let correction = batch(2, 3, vec![Change::insert(1, leaf(3))], &one);
         assert_eq!(correction.root_after, truth.root().to_vec());
-        assert!(is_correction(1, chain.final_tip(), &correction));
+        assert!(!is_correction(chain.final_tip(), &correction));
         assert!(matches!(
             chain.apply_finalized(entry(4, 3, Some(correction.clone())), 40, Some(&oracle)),
             Some(AcceptOutcome::Applied(_))
@@ -1230,11 +1369,11 @@ mod test {
         assert!(chain.stall().is_none());
         assert_eq!(chain.final_tip().unwrap().to_lez_block_id, 3);
         assert_eq!(chain.final_tip().unwrap().root, truth.root());
-        // The parked ones stay parked (never valid), the first batch is superseded; the tier
+        // The parked ones stay parked (never valid), the first batch stands; the tier
         // continues after the correction.
         assert!(chain.final_entries()[1].error.is_some());
         assert!(chain.final_entries()[2].error.is_some());
-        assert_eq!(chain.superseded(), HashSet::from([[1; 32]]));
+        assert_eq!(chain.superseded(), HashSet::new());
         let b4 = batch(4, 4, vec![Change::insert(2, leaf(4))], &truth);
         let mut oracle = oracle;
         oracle.roots.push((4, Tip::from(&b4).root));
@@ -1251,13 +1390,14 @@ mod test {
             judged.apply_finalized(entry(2, 1, Some(liar)), 20, Some(&oracle)),
             Some(AcceptOutcome::Parked(BatchIngestError::HashMismatch { .. }))
         ));
-        // The sequencer's own view (no judge): the wrong batch applied; the correction
-        // supersedes everything before it, the head is the restated tree, and a correction may
-        // not end before the tip.
+        // The sequencer's own view (no judge): the wrong batch applied; the correction starts
+        // inside the covered span, replays on the tree after the first batch and supersedes
+        // the wrong one; the head is the restated tree. A correction may not end before the
+        // tip.
         let mut view = ZoneChain::new(1);
-        view.record_publish(entry(1, 0, Some(b1)), None);
+        view.record_publish(entry(1, 0, Some(b1.clone())), None);
         assert_eq!(
-            view.record_publish(entry(2, 1, Some(wrong)), None),
+            view.record_publish(entry(2, 1, Some(wrong.clone())), None),
             PublishRecord::Extended
         );
         assert_eq!(view.head_root(), wrong_root(&one));
@@ -1266,17 +1406,102 @@ mod test {
             view.record_publish(entry(3, 2, Some(short)), None),
             PublishRecord::Skipped
         );
+        assert!(is_correction(view.head_tip(), &correction));
         assert_eq!(
             view.record_publish(entry(4, 3, Some(correction)), None),
             PublishRecord::Extended
         );
         assert_eq!(view.head_root(), truth.root());
         assert_eq!(view.head_tip().unwrap().to_lez_block_id, 3);
-        assert_eq!(view.superseded(), HashSet::from([[1; 32], [2; 32]]));
-        // A batch starting inside the covered span that is not a correction parks.
+        assert_eq!(view.superseded(), HashSet::from([[2; 32]]));
+        // A correction after no batch the channel stands by parks: the correction covers
+        // block 2 now, so no applied batch ends there.
+        let unchained = batch(3, 4, vec![], &truth);
+        assert_eq!(
+            view.record_publish(entry(5, 4, Some(unchained)), None),
+            PublishRecord::Skipped
+        );
+        // A batch starting inside the covered span whose changes do not reach its root parks.
         let inside = batch(2, 4, vec![], &truth);
         assert_eq!(
-            view.record_publish(entry(5, 4, Some(inside)), None),
+            view.record_publish(entry(6, 5, Some(inside)), None),
+            PublishRecord::Skipped
+        );
+        // One from the registry's first block replays on the empty tree and supersedes every
+        // batch before it.
+        let whole = batch(
+            1,
+            4,
+            vec![Change::insert(0, leaf(1)), Change::insert(1, leaf(3))],
+            &empty,
+        );
+        assert_eq!(
+            view.record_publish(entry(7, 6, Some(whole)), None),
+            PublishRecord::Extended
+        );
+        assert_eq!(view.head_root(), truth.root());
+        assert_eq!(
+            view.superseded(),
+            HashSet::from([[1; 32], [2; 32], [4; 32]])
+        );
+        // A correction whose boundary lies in the final tier (the sequencer's own view: the
+        // wrong batch finalized before the contradiction showed) replays on the tier's tree
+        // before that batch; one whose boundary is the final tip replays on the final state.
+        let mut two = one.clone();
+        two.apply(&wrong.changes).unwrap();
+        let b3 = batch(3, 3, vec![Change::insert(2, leaf(4))], &two);
+        let mut tier = ZoneChain::new(1);
+        for (n, b) in [(1, &b1), (2, &wrong), (3, &b3)] {
+            assert!(matches!(
+                tier.apply_finalized(entry(n, n - 1, Some(b.clone())), 10 * n as u64, None),
+                Some(AcceptOutcome::Applied(_))
+            ));
+        }
+        assert_eq!(tier.final_tip().unwrap().to_lez_block_id, 3);
+        // Block 2 came back with leaf(3): the correction from 2 replays on the tree after the
+        // first batch, inside the tier, and supersedes the second and third.
+        let mut restated = one.clone();
+        restated
+            .apply(&[Change::insert(1, leaf(3)), Change::insert(2, leaf(4))])
+            .unwrap();
+        let correction = batch(
+            2,
+            4,
+            vec![Change::insert(1, leaf(3)), Change::insert(2, leaf(4))],
+            &one,
+        );
+        assert_eq!(
+            tier.record_publish(entry(4, 3, Some(correction)), None),
+            PublishRecord::Extended
+        );
+        assert_eq!(tier.head_root(), restated.root());
+        assert_eq!(tier.superseded(), HashSet::from([[2; 32], [3; 32]]));
+        // One from the final tip's block replays on the final state.
+        let mut other = ZoneChain::new(1);
+        for (n, b) in [(1, &b1), (2, &wrong)] {
+            other.apply_finalized(entry(n, n - 1, Some(b.clone())), 10 * n as u64, None);
+        }
+        let again = batch(2, 2, vec![Change::insert(1, leaf(3))], &one);
+        assert_eq!(
+            other.record_publish(entry(3, 2, Some(again.clone())), None),
+            PublishRecord::Extended
+        );
+        assert_eq!(other.superseded(), HashSet::from([[2; 32]]));
+        let from_tip = batch(
+            3,
+            3,
+            vec![Change::insert(2, leaf(4))],
+            &other.head_state().clone(),
+        );
+        assert_eq!(
+            other.record_publish(entry(4, 3, Some(from_tip)), None),
+            PublishRecord::Extended
+        );
+        let back = batch(3, 3, vec![], &other.head_state().clone());
+        // A correction from 3 replays on the tree after `again`: an empty one restates the
+        // same root as `again`, so it does not reach the tip's root and parks.
+        assert_eq!(
+            other.record_publish(entry(5, 4, Some(back)), None),
             PublishRecord::Skipped
         );
     }
@@ -1367,7 +1592,7 @@ mod test {
         assert!(held.view().is_empty());
         assert_eq!(held.final_tip().unwrap().to_lez_block_id, 3);
         // No tip, no correction: the first batch is a first batch.
-        assert!(!is_correction(1, None, &b1));
+        assert!(!is_correction(None, &b1));
     }
 
     /// A correction in the view behind a final tier the judge has still to decide waits with
