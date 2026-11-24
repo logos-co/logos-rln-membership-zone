@@ -483,6 +483,24 @@ impl ZoneChain {
         self.head_state().root()
     }
 
+    /// The batches this reader parked, judged wrong and standing: in the final tier (the stall
+    /// and the ones parked after it, and the ones a correction since answered) and in the view.
+    /// A reader that applied the same batch unjudged counts it superseded instead, once a
+    /// correction re-covers it; both leave its root out.
+    pub fn parked(&self) -> usize {
+        let final_parked = self
+            .final_entries
+            .iter()
+            .filter(|f| f.error.as_ref().is_some_and(|e| !e.is_retryable()))
+            .count();
+        let view_parked = self
+            .folds
+            .iter()
+            .filter(|fold| fold.outcome.as_ref().is_err_and(|e| !e.is_retryable()))
+            .count();
+        final_parked + view_parked
+    }
+
     /// The entries whose batch a later correction re-covered: applied once, their roots are not
     /// valid any more (final tier first, then the view, lineage order).
     pub fn superseded(&self) -> HashSet<[u8; 32]> {

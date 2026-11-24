@@ -243,7 +243,9 @@ impl Registry {
     /// `first_lez_block_id`. With `rebuild`, the tree, the reader's state and the adopted
     /// LEZ blocks are dropped and read again from LEZ, while the Zone channel state is kept;
     /// an indexer then judges again the finalized batches the old tree parked, once the new
-    /// tree reaches them.
+    /// tree reaches them. A parked batch that a later applied batch (a correction) already
+    /// answered stays parked: the chain moved past it, judging it again could only fail on
+    /// its range.
     pub fn open(
         data_dir: &Path,
         tree_id: [u8; 32],
@@ -268,7 +270,12 @@ impl Registry {
         let final_reader = Reader::open(data_dir, tree_id, first_lez_block_id.saturating_sub(1))?;
         let mut files = StateFiles::read(data_dir)?;
         if rebuild && indexer {
-            for entry in &mut files.final_entries {
+            let answered = files
+                .final_entries
+                .iter()
+                .rposition(|entry| entry.error.is_none() && entry.batch.is_some())
+                .map_or(0, |last_applied| last_applied + 1);
+            for entry in files.final_entries.iter_mut().skip(answered) {
                 if let Some(error) = &entry.error
                     && !error.is_retryable()
                     && let Some(batch) = entry.batch()

@@ -18,36 +18,12 @@ ENV_FILE="${1:?usage: register.sh <network.env>}"
 # shellcheck source=/dev/null
 . "$ROOT/lib.sh"
 
-register_member=$(lez_rln_bin register_member)
 lez_rln_env
 [ -n "$LEZ_RLN_PAYER" ] || die "no payer: run provision-$NETWORK.sh first"
-ge "$(lez_balance "$LEZ_RLN_PAYER")" "$PAYER_MIN" || die "payer $LEZ_RLN_PAYER holds less than $PAYER_MIN"
-
-before=$(lez_balance "$LEZ_RLN_PAYER")
-say "registering from $LEZ_RLN_PAYER (balance $before)"
-out=$("$register_member") || die "register_member failed"
-after=$(lez_balance "$LEZ_RLN_PAYER")
-say "payer balance $before -> $after: the registration cost $((before - after)) atomic (price + fee)"
-printf '%s\n' "$out" >&2
-id_commitment=$(printf '%s\n' "$out" | sed -n 's/^ID_COMMITMENT=//p')
-leaf_index=$(printf '%s\n' "$out" | sed -n 's/^LEAF_INDEX=//p')
-identity_secret=$(printf '%s\n' "$out" | sed -n 's/^IDENTITY_SECRET_HASH=//p')
-[ -n "$id_commitment" ] && [ -n "$leaf_index" ] || die "register_member printed no ID_COMMITMENT / LEAF_INDEX"
-# On record for slash.sh and proof.sh.
-membership_set "$leaf_index" "$id_commitment" "$identity_secret"
+read -r leaf_index id_commitment <<< "$(register_submit)"
 
 say "waiting for the zone to apply leaf $leaf_index and a batch to carry it: the LEZ block must be adopted on Bedrock first"
-for i in $(seq 1 120); do
-    answer=$(zone "/merkle_proof/$id_commitment" 2>/dev/null) || answer=""
-    if [ "$(printf '%s' "$answer" | jq -r '.active and .proof != null' 2>/dev/null)" = "true" ]; then
-        membership="$answer"
-        break
-    fi
-    membership=""
-    [ $((i % 6)) -eq 0 ] && say "  $((i / 6)) min: $(membership_status "$answer")"
-    sleep 10
-done
-[ -n "$membership" ] || die "the zone did not apply and batch the registration within 20 minutes: $(membership_status "$answer")"
+membership=$(membership_wait_batched "$id_commitment" 1200)
 [ "$(printf '%s' "$membership" | jq -r '.leaf_index')" = "$leaf_index" ] \
     || die "leaf index mismatch: claimed $leaf_index, zone $(printf '%s' "$membership" | jq -r '.leaf_index')"
 [ "$(printf '%s' "$membership" | jq -r '.proof.path_elements | length')" = "20" ] \

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# e2e/local-stack.sh: the whole stack on one machine, the `local` e2e target.
+# e2e/local/stack.sh: the whole stack on one machine, the `local` e2e target.
 #
-#   bash e2e/local-stack.sh [check|bedrock|payer|lez|program|zone-env|all|status|down [-v]]
+#   bash e2e/local/stack.sh [check|bedrock|payer|lez|program|zone-env|all|status|down [-v]]
 #
 # The stack: a Bedrock dev node in docker (the LEZ checkout's bedrock/: one validator, 1 s
 # slots, finality in seconds with security_param 5, the API on 18080, a funded wallet key),
@@ -9,7 +9,7 @@
 # the debug config with the payer funded at genesis and a short block time), the lez-rln
 # registration program deployed on it, and the Zone node reading all of it. Every step checks
 # before it acts, so a re-run resumes; the scenarios (register.sh, slash.sh, proof.sh) then
-# take e2e/local.env like any target.
+# take e2e/local/local.env like any target.
 #
 # Steps, in order (`all` runs the first six):
 #   check     the tools, the LEZ checkout (v0.3.2, bedrock/, tools/run_sequencer.sh), the
@@ -30,7 +30,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 . "$ROOT/local.env"
 # shellcheck source=/dev/null
-. "$ROOT/lib.sh"
+. "$ROOT/../lib.sh"
 
 STEP="${1:-all}"
 shift || true
@@ -118,18 +118,25 @@ cfg["bedrock_config"]["channel_id"] = channel
 json.dump(cfg, open(dst, "w"), indent=2)
 PY
         mkdir -p "$LEZ_HOME"
+        # Default features only (as the LEZ devnet compose): `prove` pulls the risc0 Metal
+        # kernels on macOS, which need Xcode; RISC0_DEV_MODE=1 skips proving anyway. `rpc`
+        # is the default feature, named here because run_sequencer.sh expands an empty
+        # features array, which bash 3.2 (macOS) rejects under `set -u`.
         say "lez: starting the sequencer from $LEZ_CHECKOUT (home $LEZ_HOME, log $LEZ_LOG); the first run builds it"
+        # `;` not `&&` before nohup: `cd && cmd &` backgrounds the whole list, and that
+        # list's shell would wait for the sequencer forever, holding this script's pipes.
         (
-            cd "$LEZ_CHECKOUT" \
-            && LEZ_CONFIG="$LEZ_CONFIG" LEZ_NODE="http://$BEDROCK_HTTP" LEZ_SEQUENCER="$LEZ_SEQUENCER_URL" \
-               LEZ_FEATURES="${LEZ_FEATURES:-prove}" RISC0_DEV_MODE="${RISC0_DEV_MODE:-1}" \
+            cd "$LEZ_CHECKOUT" || exit 1
+            LEZ_CONFIG="$LEZ_CONFIG" LEZ_NODE="http://$BEDROCK_HTTP" LEZ_SEQUENCER="$LEZ_SEQUENCER_URL" \
+               LEZ_FEATURES="${LEZ_FEATURES:-rpc}" RISC0_DEV_MODE="${RISC0_DEV_MODE:-1}" \
                RUST_LOG="${LEZ_RUST_LOG:-warn,sequencer_service=info}" \
-               nohup bash tools/run_sequencer.sh "$LEZ_HOME" >> "$LEZ_LOG" 2>&1 &
+               nohup bash tools/run_sequencer.sh "$LEZ_HOME" >> "$LEZ_LOG" 2>&1 < /dev/null &
         )
     fi
     local i
     for i in $(seq 1 360); do
         [ -n "$(lez_last_block)" ] && break
+        pgrep -f "tools/run_sequencer.sh $LEZ_HOME" >/dev/null || die "the LEZ sequencer exited: see $LEZ_LOG"
         [ $((i % 12)) -eq 0 ] && say "  waiting for the sequencer RPC ($i x 10 s; building on the first run): $(tail -n 1 "$LEZ_LOG" 2>/dev/null | cut -c1-100)"
         sleep 10
     done
@@ -183,13 +190,12 @@ step_zone_env() {
     program=$(state_get program_account_id); tree=$(state_get tree_id); first=$(state_get first_lez_block_id)
     [ -n "$program" ] && [ -n "$tree" ] && [ -n "$first" ] || die "no program on record: run the program step"
     cat > "$ZONE_ENV" <<EOF
-# The Zone node on the local stack, written by e2e/local-stack.sh zone-env.
+# The Zone node on the local stack, written by e2e/local/stack.sh zone-env.
 MODE=sequencer
 NODE_URL=http://$BEDROCK_HTTP
 FUNDING_PK=$NODE_WALLET_PK
 MAX_TX_FEE=1000000
 PRIORITY_FEE_PERCENT=12
-STALE_REFUND_SLOTS=0
 CHANNEL_NAME=rln-membership-zone:local
 LEZ_CHANNEL_ID=$LEZ_CHANNEL_ID
 LEZ_SEQUENCER_URL=$LEZ_SEQUENCER_URL
@@ -204,7 +210,7 @@ EOF
     say "zone-env: $ZONE_ENV"
     say "run the Zone sequencer:  set -a; . $ZONE_ENV; set +a; cargo run"
     say "and an indexer beside it: MODE=indexer DATA_DIR=data-local-indexer HTTP_ADDR=127.0.0.1:3001 cargo run"
-    say "then the scenarios:       bash e2e/scenarios/register.sh e2e/local.env"
+    say "then the scenarios:       bash e2e/scenarios/register.sh e2e/local/local.env (or bash e2e/local/run.sh scenarios)"
 }
 
 step_status() {
@@ -218,7 +224,8 @@ step_status() {
 
 step_down() {
     local pids
-    pids=$(lsof -ti tcp:3040 2>/dev/null || true)
+    pids="$(pgrep -f "tools/run_sequencer.sh $LEZ_HOME" || true) $(lsof -ti tcp:3040 2>/dev/null || true)"
+    pids="${pids## }"; pids="${pids%% }"
     if [ -n "$pids" ]; then
         say "down: stopping the LEZ sequencer (pids $pids)"
         # shellcheck disable=SC2086

@@ -319,6 +319,7 @@ async fn summary(State(state): State<AppState>) -> Json<Value> {
         },
         "orphaned_count": registry.orphaned_count(),
         "superseded_count": registry.zone.superseded().len(),
+        "parked_count": registry.zone.parked(),
         "newest_published": root_ref(newest(&registry, false)),
         "newest_finalized": root_ref(newest(&registry, true)),
         "endpoints": [

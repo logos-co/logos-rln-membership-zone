@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# e2e/provision-testnet.sh: give the testnet target a funded LEZ payer.
+# e2e/testnet/provision.sh: give the testnet target a funded LEZ payer.
 #
-#   bash e2e/provision-testnet.sh [all|payer|fund|status]
+#   bash e2e/testnet/provision.sh [all|payer|fund|status]
 #
 # The testnet has no LEZ faucet. Native balance reaches a LEZ account one way only: a note
 # the Bedrock node's wallet holds (mined PoW rewards on the PoWClaim key) is deposited into
@@ -18,7 +18,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 . "$ROOT/testnet.env"
 # shellcheck source=/dev/null
-. "$ROOT/lib.sh"
+. "$ROOT/../lib.sh"
 
 STEP="${1:-all}"
 

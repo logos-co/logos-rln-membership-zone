@@ -75,7 +75,9 @@ src/                              the reader: sequencer and indexer (MODE), HTTP
   src/main.rs                     configuration, the two Zone SDK readers, the event loop
   src/bin/generate_proof.rs       an RLN proof over the Zone's /merkle_proof answer (the Module's prover side)
   src/bin/verify_proof.rs         the proof against the Zone's /roots window (the validator side)
-e2e/                              testnet scenarios: provision a LEZ payer, register, slash, prove (lib.sh, testnet.env, scenarios/)
+e2e/                              end to end: lib.sh and the flow scenarios (register, prove, slash) shared by two targets
+  e2e/testnet/                    the Logos testnet: testnet.env, provision.sh (a funded LEZ payer)
+  e2e/local/                      the whole stack on one machine: run.sh (one command), stack.sh, ctl.sh, local.env, scenarios/ (the failure cases); clones, state, logs land here, gitignored
 systemd/                          user units to run the sequencer and an indexer as services
 lez-sequencer/                    config template to run your own LEZ sequencer for the finalized history
 .env.example                      the node's configuration, every env var with its default
@@ -149,7 +151,7 @@ Every key is also a flag (`cargo run -- --help`):
 | `REBUILD_TREE` | false | Drop the tree and read it again from LEZ, keeping the Zone channel state and its checkpoint (after a decoder fix); one start |
 | `POLL_SEC` | 10 | Seconds between publish checks (the sequencer) or judgments (the indexer) |
 | `HEARTBEAT_SEC` | 3600 | Publish an empty batch over the LEZ blocks adopted since after this long without one |
-| `STALE_REFUND_SLOTS` | 0 | LIB slots an unmined batch waits before the Zone SDK re-funds it under a new transaction; off, since a re-funded transaction goes to the back of the FIFO mempool |
+| `STALE_REFUND_SLOTS` | 300 | LIB slots an unmined batch waits before the Zone SDK re-funds it under a new transaction (same message id): Bedrock re-prices storage gas at every epoch rotation and drops the transactions that paid the old price, so a batch pending across a rotation lands only re-funded; 0 disables |
 | `DATA_DIR` | `data` | `key.hex` (the channel key, the sequencer only), the tree store `tree/` and the state files beside it. Gitignored: copy `key.hex` outside the checkout after the first start |
 | `HTTP_ADDR` | `127.0.0.1:3000` | HTTP API bind address |
 
@@ -294,7 +296,10 @@ absent.
   `finalized_block_id`, `adopted_block_count`, `sequencer_block_id`, `not_on_bedrock`: LEZ blocks
   produced and not adopted yet; hundreds mean LEZ stopped inscribing), `orphaned_count`
   (publishes of ours a reorg orphaned, published again; cumulative), `superseded_count`
-  (batches a correction superseded), `newest_published`, `newest_finalized`, `endpoints`.
+  (batches a correction superseded), `parked_count` (batches this reader judged wrong and keeps
+  parked; a wrong batch is parked on the indexer that judged it and superseded on the sequencer
+  that applied it unjudged, so `superseded_count + parked_count` is what the two readers share),
+  `newest_published`, `newest_finalized`, `endpoints`.
 - `/roots` lists the roots batches carry, newest first, one entry per run of batches carrying
   the same root: `root`, `from_lez_block_id`, `to_lez_block_id`, and `batches` (the producing
   one first), each with `msg_id`, `parent_msg`, the range, `root`, `changes` (`kind` `insert`
@@ -368,7 +373,7 @@ public one.
 ## Monitoring
 
 ```bash
-curl -s localhost:3000/ | jq '{in_flight, batch_count, pending_change_count, stall, orphaned_count, superseded_count, lez, head, newest_published}'
+curl -s localhost:3000/ | jq '{in_flight, batch_count, pending_change_count, stall, orphaned_count, superseded_count, parked_count, lez, head, newest_published}'
 watch -n 10 'curl -s localhost:3000/roots/3 | jq -c ".roots[] | {root, to_lez_block_id, batches: [.batches[] | {bedrock_status, l1_slot}]}"'
 curl -s localhost:8080/cryptarchia/info | jq '.cryptarchia_info | {slot, height, lib_slot, state}'   # height must move
 curl -s localhost:8080/wallet/$(yq .public_keys.PoWClaim ~/keystore.yaml)/balance | jq
@@ -461,6 +466,7 @@ rm -rf data/tree data/*.json data/*.jsonl    # the sequencer's state, the key st
 rm -rf data-indexer                          # the indexer's: nothing to keep
 rm -rf data data-indexer target              # everything, key and build included
 rm -rf lez-sequencer/home ~/logos-execution-zone/target   # an own LEZ sequencer
+bash e2e/local/run.sh purge                  # the local e2e stack: chain, state, clones and builds (logs stay)
 ```
 
 ## Tests
@@ -477,8 +483,11 @@ folded over the finalized tree, a reorg refolding them, finality moving them), t
 (final tier, view, parked and waiting batches, orphaned batches published again, corrections),
 the HTTP answers and the decoding of LEZ blocks and the program's instructions, including a real
 testnet block. They are the last unit tests written: from here the logic is exercised end to
-end (`e2e/`): on the testnet, or on a local stack that `e2e/local-stack.sh` builds (a Bedrock
-dev node in docker, a LEZ sequencer on it, the program deployed, the Zone), see `e2e/README.md`.
+end (`e2e/`): on the testnet (`e2e/testnet/`), or on a local stack (`e2e/local/`: a Bedrock
+dev node in docker, a LEZ sequencer on it, the program deployed, the Zone and an indexer).
+`bash e2e/local/run.sh all` does the whole local run in one command, clones and builds
+included, the flow and every failure case, and leaves every component's log under
+`e2e/local/logs/`; see `e2e/README.md`.
 
 ## References
 

@@ -149,10 +149,13 @@ struct Args {
     #[arg(long, default_value_t = 3_600, env = "HEARTBEAT_SEC")]
     heartbeat_sec: u64,
     /// LIB slots a published transaction may stay unmined before the Zone SDK re-funds it
-    /// under a new transaction hash (same message id); 0 disables. Off by default: the
-    /// mempool is FIFO with a 9 h TTL, and a re-funded transaction goes to the back of the
-    /// queue, while a resubmit of the same transaction keeps its place.
-    #[arg(long, default_value_t = 0, env = "STALE_REFUND_SLOTS")]
+    /// under a new transaction hash (same message id); 0 disables. 300 like the LEZ sequencer:
+    /// Bedrock re-prices storage gas at every epoch rotation and a transaction pays the price
+    /// of the epoch that mines it, so a batch pending across a rotation is dropped for good
+    /// and only a re-funded one lands; a slow one re-funded by mistake is harmless (both claim
+    /// the same lineage slot, the first to land wins). The mempool is FIFO with a 9 h TTL, so
+    /// the window costs a re-funded batch its place in the queue, nothing else.
+    #[arg(long, default_value_t = 300, env = "STALE_REFUND_SLOTS")]
     stale_refund_slots: u64,
 }
 

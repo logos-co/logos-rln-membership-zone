@@ -2,7 +2,7 @@
 # e2e/lib.sh: shared by the e2e scripts (bash only). Source it after reading a network env file.
 #
 # Needs: curl, jq, python3. State and secrets live under E2E_STATE (default
-# e2e/state/<NETWORK>, gitignored): the payer wallet, state.json.
+# e2e/<NETWORK>/state, gitignored): the payer wallet, state.json.
 
 set -euo pipefail
 
@@ -13,7 +13,7 @@ die() { say "error: $*"; exit 1; }
 E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REPO_DIR="$(cd "$E2E_DIR/.." && pwd)"
 
-E2E_STATE="${E2E_STATE:-$E2E_DIR/state/${NETWORK:?NETWORK unset}}"
+E2E_STATE="${E2E_STATE:-$E2E_DIR/${NETWORK:?NETWORK unset}/state}"
 STATE_JSON="$E2E_STATE/state.json"
 PAYER_WALLET="$E2E_STATE/payer-wallet"
 mkdir -p "$E2E_STATE"
@@ -51,6 +51,42 @@ membership_pick() {
     else
         jq -r '.memberships // {} | to_entries | map(select(.value.slashed == false)) | sort_by(.key | tonumber) | last | select(. != null) | "\(.key) \(.value.id_commitment) \(.value.identity_secret)"' "$STATE_JSON"
     fi
+}
+
+# register_submit: one registration from the payer (lez-rln `register_member`), on record for
+# slash.sh and proof.sh; prints "<leaf> <id_commitment>". Needs lez_rln_env.
+register_submit() {
+    local register_member out id_commitment leaf_index identity_secret before after
+    register_member=$(lez_rln_bin register_member)
+    ge "$(lez_balance "$LEZ_RLN_PAYER")" "$PAYER_MIN" || die "payer $LEZ_RLN_PAYER holds less than $PAYER_MIN"
+    before=$(lez_balance "$LEZ_RLN_PAYER")
+    say "registering from $LEZ_RLN_PAYER (balance $before)"
+    out=$("$register_member") || die "register_member failed"
+    after=$(lez_balance "$LEZ_RLN_PAYER")
+    say "payer balance $before -> $after: the registration cost $((before - after)) atomic (price + fee)"
+    printf '%s\n' "$out" >&2
+    id_commitment=$(printf '%s\n' "$out" | sed -n 's/^ID_COMMITMENT=//p')
+    leaf_index=$(printf '%s\n' "$out" | sed -n 's/^LEAF_INDEX=//p')
+    identity_secret=$(printf '%s\n' "$out" | sed -n 's/^IDENTITY_SECRET_HASH=//p')
+    [ -n "$id_commitment" ] && [ -n "$leaf_index" ] || die "register_member printed no ID_COMMITMENT / LEAF_INDEX"
+    membership_set "$leaf_index" "$id_commitment" "$identity_secret"
+    echo "$leaf_index $id_commitment"
+}
+
+# membership_wait_batched <id_commitment> [seconds]: polls the zone at ZONE_HTTP until the
+# membership is active with a proof path (a batch carries its root); prints that answer.
+membership_wait_batched() {
+    local id_commitment="$1" limit="${2:-1200}" i answer
+    for i in $(seq 1 $((limit / 10))); do
+        answer=$(zone "/merkle_proof/$id_commitment" 2>/dev/null) || answer=""
+        if [ "$(printf '%s' "$answer" | jq -r '.active and .proof != null' 2>/dev/null)" = "true" ]; then
+            printf '%s' "$answer"
+            return 0
+        fi
+        [ $((i % 6)) -eq 0 ] && say "  $((i / 6)) min: $(membership_status "$answer")"
+        sleep 10
+    done
+    die "the zone at $ZONE_HTTP did not apply and batch $id_commitment within $limit s: $(membership_status "$answer")"
 }
 
 # ---- chain reads ---------------------------------------------------------------------------
