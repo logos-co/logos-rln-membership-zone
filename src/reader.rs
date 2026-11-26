@@ -169,6 +169,7 @@ impl Member {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Stats {
+    /// `Registered` applied; also the next leaf index the program gives, as this reader knows it.
     pub registered: u64,
     pub extended: u64,
     pub slashed: u64,
@@ -494,36 +495,38 @@ impl Reader {
                     expiry_timestamp_ms,
                     leaf_index,
                 }) => {
-                    // The program's `Registered` events of a registry carry 0, 1, 2.. in block
-                    // order (its `events` module); a jump means a block this reader missed or
-                    // a program change. Said by each reader that applies the block (the head,
-                    // then the final reader).
-                    if *leaf_index != self.stats.registered {
+                    // Without events a reverted `Register` reads as a success (LEZ v0.3.2 keeps
+                    // it in the block without a marker). Two kinds are certain, since the
+                    // program's next index never goes back and an open membership never
+                    // registers again: skipped, or they would overwrite a leaf. Said by each
+                    // reader that applies the block (the head, then the final reader).
+                    if *leaf_index < self.stats.registered {
                         warn!(
                             "Registered carries leaf_index {leaf_index} after {} Registered \
-                             applied: following the event",
+                             applied: a reverted Register, skipped",
                             self.stats.registered
                         );
+                        continue;
                     }
-                    self.stats.registered += 1;
-                    // The program forbids a second registration of an open membership; should
-                    // one come, the new leaf replaces the old one, which leaves the tree so
-                    // the tree holds exactly the active leaves.
                     if let Some(old) = self.members.get(id_commitment).filter(|m| !m.ended()) {
                         warn!(
-                            "Registered {} again while its membership is not over; the new \
-                             leaf {leaf_index} replaces leaf {}",
+                            "Registered {} again while its membership is not over (leaf {}): a \
+                             reverted Register, skipped",
                             short(id_commitment),
                             old.leaf_index
                         );
-                        if old.active && old.leaf_index != *leaf_index {
-                            let old_leaf_index = old.leaf_index;
-                            self.tree
-                                .delete(old_leaf_index as usize)
-                                .with_context(|| format!("delete leaf {old_leaf_index}"))?;
-                            changes.push(Change::remove(old_leaf_index));
-                        }
+                        continue;
                     }
+                    // A jump forward is a `Register` this reader cannot see, a private
+                    // transaction: the program is ahead, follow it.
+                    if *leaf_index > self.stats.registered {
+                        warn!(
+                            "Registered carries leaf_index {leaf_index} after {} Registered \
+                             applied: following the program",
+                            self.stats.registered
+                        );
+                    }
+                    self.stats.registered = leaf_index + 1;
                     let leaf = rate_commitment(id_commitment, *rate_limit)?;
                     self.tree
                         .set(*leaf_index as usize, leaf)
@@ -1020,30 +1023,37 @@ mod test {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A second `Registered` for a membership that is not over replaces it: the old leaf leaves
-    /// the tree (so the tree holds exactly the active leaves and a clone of the reader matches
-    /// the store), the new one is the membership.
+    /// Without events a reverted `Register` reads as a success. A `Registered` for a membership
+    /// that is not over, or at a leaf index already given, is one and is skipped: the tree keeps
+    /// its leaves. A jump forward is a `Register` the reader cannot see: followed, and the next
+    /// index moves with it.
     #[test]
-    fn test_registered_again_while_active_removes_the_old_leaf() {
+    fn test_a_registered_the_program_reverted_is_skipped() {
         let mut reader = Reader::open_temporary([0; 32], 0).unwrap();
         reader
             .apply_block(&block(1, 1_000, vec![registered(1, 0, 9_000)]))
             .unwrap();
-        let changes = reader
-            .apply_block(&block(2, 2_000, vec![registered(1, 1, 9_000)]))
+        // Member 1 again at the next index, and member 2 at the index member 1 holds.
+        let none = reader
+            .apply_block(&block(
+                2,
+                2_000,
+                vec![registered(1, 1, 9_000), registered(2, 0, 9_000)],
+            ))
             .unwrap();
-        let member = reader.member(&id(1)).unwrap();
-        assert_eq!(
-            changes,
-            vec![
-                Change::remove(0),
-                Change::insert(1, member.rate_commitment.to_vec())
-            ]
-        );
+        assert!(none.is_empty());
         assert_eq!(reader.active_count(), 1);
-        assert_eq!(member.leaf_index, 1);
-        assert!(reader.proof_path(0).is_none());
-        assert!(reader.proof_path(1).is_some());
+        assert_eq!(reader.member(&id(1)).unwrap().leaf_index, 0);
+        assert!(reader.member(&id(2)).is_none());
+        assert!(reader.proof_path(1).is_none());
+        assert_eq!(reader.stats.registered, 1);
+        // Leaf 1 went to a `Register` this reader cannot see: member 3 lands at 2, and 3 is next.
+        let changes = reader
+            .apply_block(&block(3, 3_000, vec![registered(3, 2, 9_000)]))
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(reader.member(&id(3)).unwrap().leaf_index, 2);
+        assert_eq!(reader.stats.registered, 3);
         assert!(reader.clone_temporary().is_ok());
     }
 
@@ -1124,7 +1134,7 @@ mod test {
             .apply_block(&block(
                 1,
                 1_000,
-                vec![registered(2, 1, 5_000), registered(1, 0, 5_000)],
+                vec![registered(1, 0, 5_000), registered(2, 1, 5_000)],
             ))
             .unwrap();
         let expired = reader.apply_block(&block(2, 5_000, vec![])).unwrap();
